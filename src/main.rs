@@ -15,9 +15,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show info about a .torrent file
     Info { file: PathBuf },
-    /// List peers from a .torrent file's trackers
     Peers {
         file: PathBuf,
         #[arg(long, default_value_t = 6881)]
@@ -25,8 +23,17 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         numwant: i32,
     },
-    /// Download a torrent (Phase 4)
-    Download { file: PathBuf },
+    Download {
+        file: PathBuf,
+        #[arg(short, long, default_value = ".")]
+        output: PathBuf,
+        #[arg(long, default_value_t = 6881)]
+        port: u16,
+        #[arg(long)]
+        peer: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        no_tracker: bool,
+    },
 }
 
 #[tokio::main]
@@ -41,7 +48,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Info { file } => cmd_info(file).await,
         Commands::Peers { file, port, numwant } => cmd_peers(file, port, numwant).await,
-        Commands::Download { .. } => anyhow::bail!("download: Phase 4"),
+        Commands::Download { file, output, port, peer, no_tracker } => {
+            cmd_download(file, output, port, peer, no_tracker).await
+        }
     }
 }
 
@@ -49,10 +58,7 @@ fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = bytes as f64;
     let mut unit = 0usize;
-    while v >= 1024.0 && unit < UNITS.len() - 1 {
-        v /= 1024.0;
-        unit += 1;
-    }
+    while v >= 1024.0 && unit < UNITS.len() - 1 { v /= 1024.0; unit += 1; }
     if unit == 0 { format!("{bytes} B") } else { format!("{v:.2} {}", UNITS[unit]) }
 }
 
@@ -91,14 +97,8 @@ async fn cmd_peers(path: PathBuf, port: u16, numwant: i32) -> Result<()> {
     let t = TorrentFile::from_bytes(&raw)?;
     let peer_id = rustytorrent::peer_id::generate();
     let req = tracker::AnnounceRequest {
-        info_hash: t.info_hash,
-        peer_id,
-        port,
-        uploaded: 0,
-        downloaded: 0,
-        left: t.total_length(),
-        event: tracker::Event::Started,
-        num_want: numwant,
+        info_hash: t.info_hash, peer_id, port, uploaded: 0, downloaded: 0,
+        left: t.total_length(), event: tracker::Event::Started, num_want: numwant,
     };
     let (used, resp) = tracker::announce_with_fallback(&t.announce_list, t.announce.as_deref(), &req, None).await?;
     println!("Tracker:  {used}");
@@ -107,5 +107,34 @@ async fn cmd_peers(path: PathBuf, port: u16, numwant: i32) -> Result<()> {
     if let Some(l) = resp.leechers { println!("Leechers: {l}"); }
     println!("Found {} peers:", resp.peers.len());
     for p in &resp.peers { println!("  {p}"); }
+    Ok(())
+}
+
+async fn cmd_download(
+    path: PathBuf, output: PathBuf, port: u16, extra_peers: Vec<String>, no_tracker: bool,
+) -> Result<()> {
+    let raw = tokio::fs::read(&path).await.with_context(|| format!("read {}", path.display()))?;
+    let t = TorrentFile::from_bytes(&raw)?;
+    println!("Downloading {} ({})", t.info.name, format_size(t.total_length()));
+    println!("Info hash:  {}", hex(&t.info_hash));
+    println!("Output dir: {}", output.display());
+
+    let mut parsed_peers = Vec::new();
+    for s in &extra_peers {
+        let addr: std::net::SocketAddr = s.parse().with_context(|| format!("invalid peer address: {s}"))?;
+        parsed_peers.push(addr);
+    }
+
+    let peer_id = rustytorrent::peer_id::generate();
+    let cfg = rustytorrent::engine::EngineConfig {
+        output_dir: output,
+        listen_port: port,
+        seed_peers: parsed_peers,
+        no_tracker,
+        ..Default::default()
+    };
+    let engine = rustytorrent::engine::TorrentEngine::new(t, peer_id, cfg);
+    engine.run().await?;
+    println!("Done.");
     Ok(())
 }
