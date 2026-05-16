@@ -342,9 +342,38 @@ These are findings from studying libtorrent, Transmission, cratetorrent, and ari
 ## Verification Checklist (run before calling a phase complete)
 
 - [ ] `cargo test` passes with zero failures
-- [ ] `cargo clippy -- -D warnings` passes
-- [ ] `cargo fmt --check` passes
+- [ ] `cargo clippy --all-targets -- -D warnings` passes
+- [ ] `cargo fmt --all -- --check` passes
 - [ ] The phase's milestone command works on a real `.torrent` file
 - [ ] No `unwrap()` or `expect()` in non-test code (search: `grep -r "\.unwrap()" src/`)
-- [ ] All new public functions have a `tracing` call
+- [ ] All new public functions that do I/O or async work have a `tracing` call
 - [ ] `docs/TASKS.md` tasks for this phase are marked `[x]`
+
+---
+
+## Reproducing the self-test
+
+Public swarms tend to be encrypted-only (no MSE on this client → "early eof"
+during handshake). To verify the protocol works end-to-end without depending on
+internet seeders, use the bundled helper to build a torrent for a local file,
+then run two `rustytorrent` instances against each other:
+
+```bash
+# Build a 32 MiB random payload + .torrent for it.
+head -c 33554432 /dev/urandom > /tmp/seed/big.bin
+python3 tests/make_test_torrent.py /tmp/seed/big.bin /tmp/big.torrent 262144
+
+# Seeder: lives at port 6900, has the file, will resume-scan and seed.
+rustytorrent download /tmp/big.torrent --output /tmp/seed --port 6900 --no-tracker &
+
+# Leecher: empty output dir, dials the seeder directly.
+mkdir /tmp/leech
+rustytorrent download /tmp/big.torrent --output /tmp/leech --port 6901 \
+    --no-tracker --peer 127.0.0.1:6900
+
+# Verify byte-identical:
+md5 /tmp/seed/big.bin /tmp/leech/big.bin
+```
+
+Expected: download finishes in seconds (localhost), the leecher process exits
+cleanly, and both MD5s match.
