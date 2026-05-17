@@ -10,7 +10,9 @@ use tokio::time::{timeout, Instant};
 use crate::error::{Error, Result};
 use crate::peer::handshake::Handshake;
 use crate::peer::message::{read_frame, write_frame, Message, BLOCK_SIZE};
+use crate::peer::mse;
 use crate::peer_id::PeerId;
+use crate::socks5::{self, ProxyConfig};
 
 pub const MAX_FRAME_LEN: u32 = (BLOCK_SIZE + 1024) * 2; // covers a 16 KiB piece + headroom
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
