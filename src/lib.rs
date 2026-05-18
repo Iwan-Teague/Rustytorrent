@@ -1,3 +1,4 @@
+pub mod dht;
 pub mod engine;
 pub mod error;
 pub mod metainfo;
