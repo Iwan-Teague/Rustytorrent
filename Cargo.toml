@@ -1,0 +1,26 @@
+[package]
+name = "rustytorrent"
+version = "0.1.0"
+edition = "2021"
+description = "A BitTorrent client built in Rust"
+license = "MIT"
+
+[dependencies]
+tokio        = { version = "1", features = ["full"] }
+reqwest      = { version = "0.12", features = ["rustls-tls"], default-features = false }
+serde        = { version = "1", features = ["derive"] }
+serde-bencode = "0.2"
+sha1         = "0.10"
+bitvec       = "1"
+clap         = { version = "4", features = ["derive"] }
+thiserror    = "1"
+anyhow       = "1"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand         = "0.8"
+lru          = "0.12"
+toml         = "0.8"
+urlencoding  = "2"
+
+[dev-dependencies]
+tokio-test   = "0.4"
