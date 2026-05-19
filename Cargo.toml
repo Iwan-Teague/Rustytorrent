@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 tokio        = { version = "1", features = ["full"] }
-reqwest      = { version = "0.12", features = ["rustls-tls"], default-features = false }
+reqwest      = { version = "0.12", features = ["rustls-tls", "socks"], default-features = false }
 sha1         = "0.10"
 bitvec       = "1"
 clap         = { version = "4", features = ["derive"] }
