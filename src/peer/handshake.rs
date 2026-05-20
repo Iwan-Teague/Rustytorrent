@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -8,6 +10,45 @@ pub const PSTR: &[u8; 19] = b"BitTorrent protocol";
 pub const PSTRLEN: u8 = 19;
 pub const HANDSHAKE_LEN: usize = 1 + 19 + 8 + 20 + 20; // 68 bytes
 
+/// Reserved bits the local engine wants to advertise on every handshake.
+/// Set once at engine startup from the runtime config (DHT enabled, etc.);
+/// before that, every handshake goes out as all-zero (the conservative
+/// "I support nothing" pattern).
+///
+/// B5 — fingerprint reduction: we advertise the bits we actually support
+/// rather than always emitting `[0; 8]`. The latter is itself a recognisable
+/// fingerprint (modern clients almost universally set the DHT bit + the
+/// BEP 10 extension-protocol bit), so the right move is to set the bits
+/// our feature set really implements. We only set DHT today; the extension
+/// protocol bit will join when BEP 10 lands.
+static EXTENSION_BYTES: OnceLock<[u8; 8]> = OnceLock::new();
+
+/// BEP 5 (DHT) advertises support via byte 7 bit 0 — value `0x01`.
+const RESERVED_BIT_DHT: u8 = 0x01;
+
+/// Install the reserved-bytes pattern for the rest of the process. Idempotent
+/// (first call wins); the engine calls this once during `run()`. Subsequent
+/// callers see the original value — fine, since the engine is the single
+/// owner of this decision.
+pub fn set_extension_bytes(bytes: [u8; 8]) {
+    let _ = EXTENSION_BYTES.set(bytes);
+}
+
+/// Build the reserved-bytes byte string from a flag set. Kept separate from
+/// `set_extension_bytes` so tests can exercise the bit layout without
+/// touching the global.
+pub fn extension_bytes_from(dht_enabled: bool) -> [u8; 8] {
+    let mut r = [0u8; 8];
+    if dht_enabled {
+        r[7] |= RESERVED_BIT_DHT;
+    }
+    r
+}
+
+fn current_extension_bytes() -> [u8; 8] {
+    EXTENSION_BYTES.get().copied().unwrap_or([0u8; 8])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handshake {
     pub reserved: [u8; 8],
@@ -17,9 +58,11 @@ pub struct Handshake {
 
 impl Handshake {
     pub fn new(info_hash: [u8; 20], peer_id: PeerId) -> Self {
-        // No reserved bits set by default — extensions enabled per-feature.
+        // Reserved-byte pattern comes from the once-set engine config so
+        // every handshake (outgoing AND incoming, plain AND MSE) advertises
+        // the same capability set.
         Self {
-            reserved: [0u8; 8],
+            reserved: current_extension_bytes(),
             info_hash,
             peer_id,
         }
@@ -132,6 +175,22 @@ mod tests {
         assert_eq!(&buf[1..20], b"BitTorrent protocol");
         let decoded = Handshake::decode(&buf).unwrap();
         assert_eq!(decoded, h);
+    }
+
+    #[test]
+    fn extension_bytes_dht_off_is_all_zero() {
+        assert_eq!(extension_bytes_from(false), [0u8; 8]);
+    }
+
+    #[test]
+    fn extension_bytes_dht_on_sets_last_byte_bit_zero() {
+        let bytes = extension_bytes_from(true);
+        assert_eq!(bytes[0..7], [0u8; 7]);
+        assert_eq!(
+            bytes[7] & 0x01,
+            0x01,
+            "DHT bit (byte 7, value 0x01) must be set"
+        );
     }
 
     #[test]

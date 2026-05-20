@@ -17,6 +17,9 @@ pub enum Error {
 
     #[error("network error: {0}")]
     Network(String),
+
+    #[error("crypto error: {0}")]
+    Crypto(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

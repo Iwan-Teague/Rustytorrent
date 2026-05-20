@@ -91,6 +91,15 @@ rustytorrent download <file> [OPTIONS]
   --anonymous               strict bundle (requires --socks5; DHT/listener off)
   --bind-iface IFACE        VPN kill switch — bind outgoing sockets to IFACE
   --tor-isolation           per-peer SOCKS5 username so each dial gets its own Tor circuit
+  --paranoid                write encrypted spool only; plaintext never on disk
+  --passphrase P            passphrase for --paranoid (or RUSTYTORRENT_PASSPHRASE env)
+  --spool PATH              override the spool file path
+
+rustytorrent decrypt <file> [OPTIONS]      # extract a --paranoid spool afterwards
+
+  --output DIR              destination directory (default: ".")
+  --spool PATH              encrypted spool to read
+  --passphrase P            same passphrase used to produce the spool
 ```
 
 ## Documentation

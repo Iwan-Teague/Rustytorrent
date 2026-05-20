@@ -78,6 +78,40 @@ enum Commands {
         /// avoid on commercial VPNs that require real auth.
         #[arg(long, default_value_t = false, requires = "socks5")]
         tor_isolation: bool,
+        /// Paranoid storage: write every piece into an AES-256-GCM encrypted
+        /// spool file under a passphrase-derived key. Plaintext never
+        /// touches disk during the session. Run `rustytorrent decrypt`
+        /// afterwards with the same passphrase to extract.
+        #[arg(long, default_value_t = false)]
+        paranoid: bool,
+        /// Passphrase for paranoid mode. If unset, read from the
+        /// `RUSTYTORRENT_PASSPHRASE` environment variable. Required
+        /// when --paranoid is set.
+        #[arg(long)]
+        passphrase: Option<String>,
+        /// Override the spool file path. Defaults to
+        /// `<output>/<torrent-name>.rustytorrent-spool`.
+        #[arg(long)]
+        spool: Option<PathBuf>,
+    },
+    /// Decrypt a `--paranoid` spool into the real file layout using the
+    /// same passphrase that produced it. Pieces that don't hash-match
+    /// (e.g. half-written or under a different key) are skipped.
+    Decrypt {
+        /// The `.torrent` that the spool was produced from. Provides
+        /// piece hashes, piece length, and the file layout to write into.
+        file: PathBuf,
+        /// Destination directory for the decrypted files (created if
+        /// missing).
+        #[arg(short, long, default_value = ".")]
+        output: PathBuf,
+        /// Path to the encrypted spool. Defaults to
+        /// `<output>/<torrent-name>.rustytorrent-spool`.
+        #[arg(long)]
+        spool: Option<PathBuf>,
+        /// Passphrase. If unset, read from `RUSTYTORRENT_PASSPHRASE`.
+        #[arg(long)]
+        passphrase: Option<String>,
     },
 }
 
@@ -111,6 +145,9 @@ async fn main() -> Result<()> {
             anonymous,
             bind_iface,
             tor_isolation,
+            paranoid,
+            passphrase,
+            spool,
         } => {
             cmd_download(
                 file,
@@ -126,9 +163,18 @@ async fn main() -> Result<()> {
                 anonymous,
                 bind_iface,
                 tor_isolation,
+                paranoid,
+                passphrase,
+                spool,
             )
             .await
         }
+        Commands::Decrypt {
+            file,
+            output,
+            spool,
+            passphrase,
+        } => cmd_decrypt(file, output, spool, passphrase).await,
     }
 }
 
@@ -242,6 +288,9 @@ async fn cmd_download(
     anonymous: bool,
     bind_iface: Option<String>,
     tor_isolation: bool,
+    paranoid: bool,
+    passphrase: Option<String>,
+    spool: Option<PathBuf>,
 ) -> Result<()> {
     let raw = tokio::fs::read(&path)
         .await
@@ -311,6 +360,15 @@ async fn cmd_download(
         println!("Bound to:   {iface} (VPN kill switch)");
     }
 
+    let resolved_passphrase = if paranoid {
+        Some(resolve_passphrase(passphrase)?)
+    } else {
+        None
+    };
+    if paranoid {
+        println!("Paranoid:   on (encrypted spool, plaintext never written)");
+    }
+
     let cfg = rustytorrent::engine::EngineConfig {
         output_dir: output,
         listen_port: port,
@@ -321,6 +379,9 @@ async fn cmd_download(
         proxy,
         anonymous,
         bind_iface,
+        paranoid,
+        passphrase: resolved_passphrase,
+        spool_path: spool,
         ..Default::default()
     };
     let engine = rustytorrent::engine::TorrentEngine::new(t, peer_id, cfg);
@@ -328,6 +389,83 @@ async fn cmd_download(
     // The engine handles ctrl-c internally and performs an orderly shutdown
     // (tracker stopped event, storage flush, DHT routing-table save).
     engine.run().await?;
+    println!("Done.");
+    Ok(())
+}
+
+/// Resolve the paranoid-mode passphrase from CLI flag → env var → error.
+/// We never log it; just pass it to the engine to derive the spool key.
+fn resolve_passphrase(flag: Option<String>) -> Result<String> {
+    if let Some(p) = flag {
+        return Ok(p);
+    }
+    if let Ok(p) = std::env::var("RUSTYTORRENT_PASSPHRASE") {
+        if !p.is_empty() {
+            return Ok(p);
+        }
+    }
+    anyhow::bail!("--paranoid requires --passphrase or RUSTYTORRENT_PASSPHRASE (non-empty)")
+}
+
+async fn cmd_decrypt(
+    torrent_path: PathBuf,
+    output: PathBuf,
+    spool: Option<PathBuf>,
+    passphrase: Option<String>,
+) -> Result<()> {
+    let raw = tokio::fs::read(&torrent_path)
+        .await
+        .with_context(|| format!("read {}", torrent_path.display()))?;
+    let t = TorrentFile::from_bytes(&raw)?;
+    let layout = rustytorrent::storage::Layout::from_torrent(output.clone(), &t);
+    let spool_path = spool.unwrap_or_else(|| {
+        let mut p = output.clone();
+        p.push(format!("{}.rustytorrent-spool", t.info.name));
+        p
+    });
+    let passphrase = resolve_passphrase(passphrase)?;
+    println!("Decrypting: {}", spool_path.display());
+    println!("Into:       {}", output.display());
+
+    let pieces = rustytorrent::storage::decrypt_all_pieces(
+        &spool_path,
+        &passphrase,
+        &layout,
+        &t.info.piece_hashes,
+    )
+    .await?;
+    println!("Recovered:  {} / {} pieces", pieces.len(), t.num_pieces());
+
+    // Write the recovered pieces into the real file layout via the regular
+    // storage task — reuses all the multi-file offset math.
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(64);
+    let handle = rustytorrent::storage::spawn_storage_task(layout, cmd_rx, ev_tx);
+
+    let total_written = pieces.len();
+    for (index, data) in pieces {
+        cmd_tx
+            .send(rustytorrent::storage::StorageCommand::Write { index, data })
+            .await
+            .context("send Write to storage task")?;
+    }
+    // Drain confirmations so we wait for every write to flush.
+    let mut acked = 0usize;
+    while acked < total_written {
+        match ev_rx.recv().await {
+            Some(rustytorrent::storage::StorageEvent::Written { .. }) => acked += 1,
+            Some(rustytorrent::storage::StorageEvent::Error { index, msg }) => {
+                anyhow::bail!("storage error on piece {index:?}: {msg}");
+            }
+            None => break,
+        }
+    }
+    cmd_tx
+        .send(rustytorrent::storage::StorageCommand::Shutdown)
+        .await
+        .ok();
+    let _ = handle.await;
+
     println!("Done.");
     Ok(())
 }

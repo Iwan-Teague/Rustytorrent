@@ -22,6 +22,8 @@ lru          = "0.12"
 zeroize      = { version = "1.8", features = ["derive"] }  # wipe crypto secrets on drop
 subtle       = "2"                                          # constant-time byte comparisons
 socket2      = "0.6"                                        # interface-binding for VPN kill switch
+aes-gcm      = "0.10"                                       # AEAD for the --paranoid encrypted spool
+argon2       = "0.5"                                        # passphrase-to-key derivation for --paranoid
 
 [target.'cfg(unix)'.dependencies]
 libc         = "0.2"                                        # if_nametoindex for --bind-iface (Unix)

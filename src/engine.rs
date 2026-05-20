@@ -15,7 +15,10 @@ use crate::peer::message::{bitfield_to_bytes, BLOCK_SIZE};
 use crate::peer_id::PeerId;
 use crate::piece::{verify_piece, BlockOutcome, Picker, PieceManager};
 use crate::scheduler::ChokeScheduler;
-use crate::storage::{spawn_storage_task, Layout, PieceCache, StorageCommand, StorageEvent};
+use crate::storage::{
+    spawn_encrypted_storage_task, spawn_storage_task, Layout, PieceCache, StorageCommand,
+    StorageEvent,
+};
 use crate::tracker::{self, AnnounceRequest, Event};
 
 /// Outstanding block requests per unchoked peer.
@@ -61,6 +64,17 @@ pub struct EngineConfig {
     /// tracker announces so we don't advertise a listen socket we aren't
     /// running. The engine refuses to start in this mode without `proxy`.
     pub anonymous: bool,
+    /// **Paranoid storage** (B1): write every piece to an AES-256-GCM
+    /// encrypted spool file instead of the real file layout, keyed off a
+    /// passphrase via Argon2id. Plaintext never touches disk during the
+    /// session. The user later runs `rustytorrent decrypt` with the
+    /// same passphrase to extract.
+    pub paranoid: bool,
+    /// Passphrase used when `paranoid` is true. Required in that mode.
+    pub passphrase: Option<String>,
+    /// Where to place the encrypted spool file. Defaults to
+    /// `<output_dir>/<torrent-name>.rustytorrent-spool` when unset.
+    pub spool_path: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -79,6 +93,9 @@ impl Default for EngineConfig {
             proxy: None,
             anonymous: false,
             bind_iface: None,
+            paranoid: false,
+            passphrase: None,
+            spool_path: None,
         }
     }
 }
@@ -144,6 +161,13 @@ impl TorrentEngine {
                 "anonymous mode requires --socks5; refusing to dial clearnet".into(),
             ));
         }
+        // Paranoid mode needs a passphrase to derive the spool key. Fail
+        // closed here rather than later inside the storage task spawn.
+        if self.cfg.paranoid && self.cfg.passphrase.is_none() {
+            return Err(Error::Crypto(
+                "paranoid mode requires --passphrase (or RUSTYTORRENT_PASSPHRASE env)".into(),
+            ));
+        }
         // In anonymous mode we never want to emit a plain `\x13BitTorrent...`
         // handshake — it's a DPI fingerprint even if the eventual MSE fallback
         // hides everything after it. Force MSE-only outgoing dials.
@@ -159,6 +183,14 @@ impl TorrentEngine {
         if let Some(p) = &self.cfg.proxy {
             tracing::info!(target: "engine", proxy = %p.addr, "routing peer + tracker traffic through SOCKS5");
         }
+
+        // B5 — advertise the extensions we actually implement in the
+        // handshake reserved bytes. Anonymous mode never enables DHT, so
+        // we honor that here too.
+        let dht_enabled = self.cfg.enable_dht && !self.cfg.anonymous;
+        crate::peer::handshake::set_extension_bytes(crate::peer::handshake::extension_bytes_from(
+            dht_enabled,
+        ));
 
         let (peer_event_tx, mut peer_event_rx) = mpsc::channel::<PeerEvent>(1024);
         let mut peers = PeerManager::new(self.torrent.info_hash, self.peer_id, peer_event_tx);
@@ -209,12 +241,56 @@ impl TorrentEngine {
         let layout = Layout::from_torrent(self.cfg.output_dir.clone(), &self.torrent);
         let (storage_cmd_tx, storage_cmd_rx) = mpsc::channel::<StorageCommand>(64);
         let (storage_event_tx, mut storage_event_rx) = mpsc::channel::<StorageEvent>(64);
-        let storage_handle = spawn_storage_task(layout.clone(), storage_cmd_rx, storage_event_tx);
 
-        // Resume scan: SHA1-verify existing on-disk pieces before talking to anyone.
+        // Resolve the spool path up front so resume + storage spawn agree.
+        let spool_path = self.cfg.spool_path.clone().unwrap_or_else(|| {
+            let mut p = self.cfg.output_dir.clone();
+            p.push(format!("{}.rustytorrent-spool", self.torrent.info.name));
+            p
+        });
+
+        let storage_handle = if self.cfg.paranoid {
+            let passphrase = self
+                .cfg
+                .passphrase
+                .clone()
+                .expect("passphrase presence checked above");
+            tracing::info!(
+                target: "engine",
+                spool = %spool_path.display(),
+                "paranoid storage: every piece encrypted at rest, plaintext never persisted"
+            );
+            spawn_encrypted_storage_task(
+                spool_path.clone(),
+                passphrase,
+                layout.clone(),
+                storage_cmd_rx,
+                storage_event_tx,
+            )
+        } else {
+            spawn_storage_task(layout.clone(), storage_cmd_rx, storage_event_tx)
+        };
+
+        // Resume scan: hash-verify existing pieces (on-disk plaintext for
+        // the normal path, decrypted spool slots for paranoid) before
+        // talking to anyone.
         tracing::info!(target: "engine", "resume scan starting");
-        let already =
-            crate::storage::disk::scan_resume(&layout, &self.torrent.info.piece_hashes).await?;
+        let already = if self.cfg.paranoid {
+            let passphrase = self
+                .cfg
+                .passphrase
+                .as_deref()
+                .expect("passphrase presence checked above");
+            crate::storage::scan_spool_resume(
+                &spool_path,
+                passphrase,
+                &layout,
+                &self.torrent.info.piece_hashes,
+            )
+            .await?
+        } else {
+            crate::storage::disk::scan_resume(&layout, &self.torrent.info.piece_hashes).await?
+        };
         for i in &already {
             self.pm.mark_complete_verified(*i);
         }

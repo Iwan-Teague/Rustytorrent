@@ -18,6 +18,56 @@ pub const MAX_FRAME_LEN: u32 = (BLOCK_SIZE + 1024) * 2; // covers a 16 KiB piece
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 
+/// B3 — per-peer rate limit on inbound `Request` messages. A misbehaving peer
+/// can otherwise hammer us with Requests faster than we can read pieces off
+/// disk, turning into a cheap DoS against the upload side. We replenish at
+/// `REQUEST_TOKENS_PER_SEC` per second with a hard ceiling of
+/// `REQUEST_BURST_TOKENS` — anything over is silently dropped from the event
+/// stream (we don't disconnect: a brief burst from a real fast peer is
+/// indistinguishable from abuse, and the peer will just re-request later).
+///
+/// Default sized for honest fast peers: 200 req/s sustained, 50 burst. At
+/// 16 KiB block size that caps a single peer's read pressure on the disk
+/// task to ~3 MiB/s steady-state — well above any real seed rate.
+pub const REQUEST_TOKENS_PER_SEC: f64 = 200.0;
+pub const REQUEST_BURST_TOKENS: f64 = 50.0;
+
+/// Minimal token-bucket suitable for in-loop rate limiting. Not shared
+/// across tasks; each peer task owns its own bucket.
+struct TokenBucket {
+    capacity: f64,
+    rate_per_sec: f64,
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: f64, rate_per_sec: f64) -> Self {
+        Self {
+            capacity,
+            rate_per_sec,
+            // Start full so a brief opening burst doesn't get throttled.
+            tokens: capacity,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn try_consume(&mut self, n: f64) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.rate_per_sec).min(self.capacity);
+            self.last_refill = now;
+        }
+        if self.tokens >= n {
+            self.tokens -= n;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Events emitted by a peer task to the engine.
 #[derive(Debug)]
 pub enum PeerEvent {
@@ -514,9 +564,23 @@ where
     let (read_done_tx, mut read_done_rx) = tokio::sync::oneshot::channel::<Result<()>>();
     let read_task = tokio::spawn(async move {
         let res: Result<()> = async {
+            let mut request_bucket = TokenBucket::new(REQUEST_BURST_TOKENS, REQUEST_TOKENS_PER_SEC);
             loop {
                 let frame = read_frame(&mut reader, MAX_FRAME_LEN).await?;
                 let msg = Message::decode(&frame)?;
+                // B3 — throttle inbound Request messages per peer. Drop the
+                // event when the bucket's dry; the peer will re-request
+                // and we'll catch up on the next refill window. We don't
+                // disconnect here so honest fast peers aren't punished
+                // for short bursts that happen to land hot.
+                if matches!(msg, Message::Request { .. }) && !request_bucket.try_consume(1.0) {
+                    tracing::debug!(
+                        target: "peer",
+                        %addr,
+                        "request rate-limit hit; dropping Request frame"
+                    );
+                    continue;
+                }
                 if let Some(ev) = msg_to_event(addr, msg) {
                     if read_event_tx.send(ev).await.is_err() {
                         return Ok(());
@@ -625,5 +689,47 @@ fn msg_to_event(addr: SocketAddr, msg: Message) -> Option<PeerEvent> {
             begin,
             length,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_bucket_starts_full() {
+        let mut b = TokenBucket::new(10.0, 1.0);
+        // Should be able to drain `capacity` immediately without waiting.
+        for _ in 0..10 {
+            assert!(b.try_consume(1.0));
+        }
+        assert!(!b.try_consume(1.0), "bucket should be empty after draining");
+    }
+
+    #[test]
+    fn token_bucket_refills_over_time() {
+        let mut b = TokenBucket::new(5.0, 1000.0);
+        // Drain it.
+        for _ in 0..5 {
+            assert!(b.try_consume(1.0));
+        }
+        assert!(!b.try_consume(1.0));
+        // Wait long enough for at least a few tokens to regenerate.
+        std::thread::sleep(Duration::from_millis(20));
+        // 1000 t/s × 20 ms = 20 tokens, capped at capacity 5.
+        assert!(b.try_consume(5.0), "refill should restore up to capacity");
+    }
+
+    #[test]
+    fn token_bucket_caps_at_capacity() {
+        let mut b = TokenBucket::new(3.0, 1000.0);
+        // Let it sit so it would notionally accumulate way past capacity.
+        std::thread::sleep(Duration::from_millis(50));
+        // Even after a long sleep, we should never get more than `capacity` tokens.
+        assert!(b.try_consume(3.0));
+        assert!(
+            !b.try_consume(0.1),
+            "bucket must not exceed its declared capacity"
+        );
     }
 }

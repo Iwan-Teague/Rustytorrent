@@ -68,8 +68,8 @@ protection that A-tier doesn't touch.
 
 ## Status
 
-Last updated: 2026-05-20. **A-tier bundle complete** — landed in one focused
-commit, see git log. B-tier and C-tier items remain open.
+Last updated: 2026-05-20. **A-tier complete; B-tier trio (B1+B3+B5) landed**
+in a follow-up pass — see git log. B2/B4 and C-tier remain open.
 
 ### A-tier landed
 - ✅ A1: DH parameter validation in MSE handshake — rejects degenerate Y values.
@@ -78,3 +78,19 @@ commit, see git log. B-tier and C-tier items remain open.
 - ✅ A4: `--anonymous` implies MSE-only outgoing (no plain pstr emitted).
 - ✅ A5: `--bind-iface IFACE` for VPN kill switch (macOS / Linux / Windows).
 - ✅ A6: `--tor-isolation` for per-peer Tor circuits.
+
+### B-tier landed
+- ✅ B1: `--paranoid` mode — AES-256-GCM encrypted spool with Argon2id-derived
+  key; plaintext never persisted during the session. Companion `decrypt`
+  subcommand extracts the spool into the real file layout afterwards.
+- ✅ B3: per-peer token-bucket rate limit on inbound `Request` messages
+  (default 200 req/s, burst 50) — caps a single peer's disk-read pressure.
+- ✅ B5: handshake reserved-bytes fingerprint reduction — set the DHT bit
+  (BEP 5, byte 7 = 0x01) when DHT is enabled instead of always emitting
+  the all-zero "I support nothing" pattern.
+
+### B-tier remaining
+- B2: `--memory-only` (tmpfs / MAP_ANON) — partly subsumed by B1; left open
+  as a no-spool variant for sessions that fit in RAM.
+- B4: per-IP connection-rate limit on the listener — low priority since
+  `--anonymous` already disables the listener.
