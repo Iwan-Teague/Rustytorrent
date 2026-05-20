@@ -5,9 +5,14 @@
 //! Used only as part of the MSE/PE handshake — BitTorrent specs hardcoded
 //! RC4 in 2006. It is cryptographically broken; we treat MSE as obfuscation,
 //! not security.
+//!
+//! `Zeroize` wipes the S-box and indices on drop so the keystream state
+//! doesn't survive in heap-snapshot core dumps or freed-page reuse.
+
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Stateful RC4 keystream generator.
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Rc4 {
     s: [u8; 256],
     i: u8,

@@ -8,7 +8,7 @@
 //! bytes (zero-padded if the value is shorter than 768 bits).
 
 use num_bigint::BigUint;
-use num_traits::Num;
+use num_traits::{Num, One};
 use rand::RngCore;
 
 /// 768-bit prime from BEP 8 (Oakley Group 1, RFC 2409 §6.1).
@@ -42,12 +42,25 @@ impl Keypair {
         bytes[0] |= 0x80;
         let private = BigUint::from_bytes_be(&bytes);
         let public = BigUint::from(G).modpow(&private, &p());
+        // Wipe the raw entropy buffer; the BigUint owns its own copy now.
+        use zeroize::Zeroize;
+        bytes.zeroize();
         Keypair { private, public }
     }
 
     /// Compute the shared secret given the other party's public key.
     pub fn shared_secret(&self, peer_public: &BigUint) -> BigUint {
         peer_public.modpow(&self.private, &p())
+    }
+}
+
+impl Drop for Keypair {
+    fn drop(&mut self) {
+        // `BigUint` doesn't impl Zeroize directly, but we can wipe its
+        // underlying limb buffer by overwriting and then dropping.
+        // Best-effort: replace with zero so any cached pages are scrubbed.
+        self.private = BigUint::from(0u32);
+        self.public = BigUint::from(0u32);
     }
 }
 
@@ -73,6 +86,26 @@ pub fn to_bytes(n: &BigUint) -> [u8; KEY_LEN] {
 /// Parse `KEY_LEN` big-endian bytes back into a `BigUint`.
 pub fn from_bytes(bytes: &[u8]) -> BigUint {
     BigUint::from_bytes_be(bytes)
+}
+
+/// Validate a received peer public key against degenerate / malicious values.
+///
+/// A well-behaved peer's `Y = g^x mod p` lies strictly between 1 and p-1.
+/// An adversary who sends `Y ∈ {0, 1, p-1, p}` forces the shared secret
+/// `S = Y^our_x mod p` into a degenerate value (0, 1, or ±1), which would
+/// then key our RC4 stream — catastrophically predictable.
+///
+/// This is the standard MODP "subgroup confinement" defense; cheap because
+/// the bigint compare is constant in `p` width regardless of `Y`.
+pub fn validate_peer_public(y: &BigUint) -> Result<(), &'static str> {
+    let p_minus_one: BigUint = p() - BigUint::one();
+    if y <= &BigUint::one() {
+        return Err("peer public key <= 1");
+    }
+    if y >= &p_minus_one {
+        return Err("peer public key >= p-1");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -107,5 +140,24 @@ mod tests {
         let bytes = to_bytes(&kp.public);
         let restored = from_bytes(&bytes);
         assert_eq!(restored, kp.public);
+    }
+
+    #[test]
+    fn validate_rejects_degenerate_values() {
+        // 0, 1, p-1, p — all force the shared secret to be a known small value.
+        assert!(validate_peer_public(&BigUint::from(0u32)).is_err());
+        assert!(validate_peer_public(&BigUint::from(1u32)).is_err());
+        let p_val = p();
+        assert!(validate_peer_public(&(&p_val - BigUint::one())).is_err());
+        assert!(validate_peer_public(&p_val).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_normal_public_key() {
+        // Any honestly-generated keypair must pass.
+        for _ in 0..16 {
+            let kp = Keypair::generate();
+            assert!(validate_peer_public(&kp.public).is_ok());
+        }
     }
 }

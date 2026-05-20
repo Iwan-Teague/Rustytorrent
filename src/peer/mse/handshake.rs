@@ -68,10 +68,15 @@ where
         stream.write_all(&pad_a).await?;
     }
 
-    // 2) Read Yb (96 BE bytes), then derive S.
+    // 2) Read Yb (96 BE bytes), validate it's not a degenerate / malicious
+    //    value (0, 1, p-1, p — any of which would force a predictable shared
+    //    secret), then derive S.
     let mut yb = [0u8; Y_LEN];
     stream.read_exact(&mut yb).await?;
-    let s = dh::to_bytes(&kp.shared_secret(&dh::from_bytes(&yb)));
+    let yb_big = dh::from_bytes(&yb);
+    dh::validate_peer_public(&yb_big)
+        .map_err(|why| MseError::Handshake(format!("bad peer DH key: {why}")))?;
+    let s = dh::to_bytes(&kp.shared_secret(&yb_big));
 
     // 3) Send req1 || req2^req3 || ENCRYPT(VC || crypto_provide || len(PadC)
     //    || PadC || len(IA)=0 || IA="")
@@ -201,13 +206,15 @@ where
         return Err(MseError::Handshake("pre_read longer than Ya".into()));
     }
 
-    // 1) Receive Ya.
+    // 1) Receive Ya, validate it's not a degenerate / malicious value.
     let mut ya = [0u8; Y_LEN];
     ya[..pre_read.len()].copy_from_slice(pre_read);
     if pre_read.len() < Y_LEN {
         stream.read_exact(&mut ya[pre_read.len()..]).await?;
     }
     let peer_pub = dh::from_bytes(&ya);
+    dh::validate_peer_public(&peer_pub)
+        .map_err(|why| MseError::Handshake(format!("bad peer DH key: {why}")))?;
 
     // 2) Generate our DH key, send Yb + PadB.
     let kp = Keypair::generate();

@@ -1,3 +1,4 @@
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{Error, Result};
@@ -85,7 +86,7 @@ impl Handshake {
             .await
             .map_err(|e| Error::Handshake(format!("read: {e}")))?;
         let theirs = Handshake::decode(&buf)?;
-        if theirs.info_hash != info_hash {
+        if !bool::from(theirs.info_hash.ct_eq(&info_hash)) {
             return Err(Error::Handshake("info_hash mismatch".into()));
         }
         Ok(theirs)
@@ -106,7 +107,7 @@ impl Handshake {
             .await
             .map_err(|e| Error::Handshake(format!("read: {e}")))?;
         let theirs = Handshake::decode(&buf)?;
-        if theirs.info_hash != info_hash {
+        if !bool::from(theirs.info_hash.ct_eq(&info_hash)) {
             return Err(Error::Handshake("info_hash mismatch".into()));
         }
         let ours = Handshake::new(info_hash, peer_id);

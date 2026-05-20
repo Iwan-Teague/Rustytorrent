@@ -1,10 +1,15 @@
 use sha1::{Digest, Sha1};
+use subtle::ConstantTimeEq;
 
 /// Returns true iff SHA1(data) matches the expected hash.
 /// Critical correctness gate — only data that passes this check is ever written to disk.
+///
+/// Uses constant-time comparison so a future change (or a perceptive
+/// observer of the timing of a maliciously-crafted near-collision) can't
+/// learn anything about which prefix of the digest matched.
 pub fn verify_piece(data: &[u8], expected: &[u8; 20]) -> bool {
     let digest = Sha1::digest(data);
-    digest.as_slice() == expected.as_slice()
+    digest.as_slice().ct_eq(expected.as_slice()).into()
 }
 
 #[cfg(test)]
