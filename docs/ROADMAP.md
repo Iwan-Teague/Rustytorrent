@@ -14,14 +14,42 @@ RustyTorrent aims to be a fully-featured, production-quality BitTorrent client w
 
 | Phase | Name | Status |
 |-------|------|--------|
-| 1 | Parse & Inspect | 🔲 Not started |
-| 2 | Tracker Communication | 🔲 Not started |
-| 3 | Peer Handshake & Messaging | 🔲 Not started |
-| 4 | Core Downloading | 🔲 Not started |
-| 5 | Multi-file & Correctness | 🔲 Not started |
-| 6 | Hardening & Resume | 🔲 Not started |
-| 7 | Extensions | 🔲 Not started |
+| 1 | Parse & Inspect | ✅ Done |
+| 2 | Tracker Communication | ✅ Done |
+| 3 | Peer Handshake & Messaging | ✅ Done |
+| 4 | Core Downloading | ✅ Done |
+| 5 | Multi-file & Correctness | ✅ Done |
+| 6 | Hardening & Resume | ✅ Done |
+| 7 | Extensions | 🟡 MSE/PE + DHT done; BEPs 9/10/11 pending |
 | 8 | Web UI | 🔲 Not started |
+
+**Anonymity / security**:
+- Hand-rolled SOCKS5 client (RFC 1928 + RFC 1929 auth) for outgoing peer
+  dials and HTTP-tracker requests.
+- `--anonymous` bundle: requires `--socks5`, disables the inbound TCP
+  listener, disables DHT, randomizes peer_id per session, zeroes `port` in
+  tracker announces. See [docs/ANONYMITY.md](ANONYMITY.md) for the threat model.
+- MSE/PE wire encryption (BEP 8) for transport obfuscation; pair with
+  `--encrypt` to force MSE on every outbound dial.
+
+**Last verified:**
+- Localhost self-test (seeder ↔ leecher) — plain path: 32 MiB single-file
+  torrent in ~1 s, MD5 byte-identical.
+- Localhost self-test with `--encrypt` (forces outgoing MSE/PE) — same torrent
+  in ~2 s, MD5 byte-identical.
+- Real public swarm via **tracker** (Debian 13.5 amd64-netinst.iso, 755 MiB) —
+  427/3020 pieces (~109 MiB, 14 %) downloaded in 60 s at ~1.9 MB/s. Plain →
+  MSE fallback catches MSE-only peers automatically.
+- Real public swarm via **DHT** alone (`--no-tracker --dht`, same torrent) —
+  985/3020 pieces (~253 MiB, 32 %) downloaded in 90 s at ~2.8 MB/s. Bootstrap
+  → 78 contacts → 229 discovered peers → 50 connected.
+- DHT routing table persists to `~/.config/rustytorrent/dht_state` (~2 KB,
+  ~80 contacts) and warm-loads on next start.
+- Resume scan correctly skips already-verified pieces on restart.
+- SOCKS5 + anonymous-mode self-test: 32 MiB single-file torrent through a
+  local Python SOCKS5 proxy in ~1 s, MD5 byte-identical. `--anonymous`
+  rejects start when `--socks5` is missing.
+- 132 unit tests pass.
 
 ---
 

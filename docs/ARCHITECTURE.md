@@ -183,26 +183,42 @@ Frame format: `[length: u32 BE][id: u8][payload…]`
 
 **`connection.rs`** — Per-peer async task
 
-Each peer connection runs as:
+Each peer connection is **two** independent tasks sharing a `oneshot` for
+shutdown signalling:
 
 ```
+let (reader, writer) = stream.into_split();
+let (read_done_tx, read_done_rx) = oneshot::channel();
+
+// Read-only task.
 tokio::spawn(async move {
-    handshake(&mut stream, …).await?;
-    loop {
-        tokio::select! {
-            // read from TCP stream
-            frame = read_frame(&mut stream) => {
-                let msg = Message::decode(frame)?;
-                peer_event_tx.send(PeerEvent { peer_id, msg }).await?;
-            }
-            // write to TCP stream
-            cmd = cmd_rx.recv() => {
-                write_frame(&mut stream, cmd.encode()).await?;
-            }
-        }
+    let res = loop {
+        let frame = read_frame(&mut reader).await?;
+        let msg = Message::decode(&frame)?;
+        event_tx.send(msg_to_event(addr, msg)).await?;
+    };
+    let _ = read_done_tx.send(res);
+});
+
+// Write-only loop (runs in run_with_stream's stack).
+loop {
+    select! {
+        cmd = cmd_rx.recv() => write_frame(&mut writer, cmd.encode()).await?,
+        _   = sleep(until_next_keepalive) => write_frame(&mut writer, &[]).await?,
+        res = &mut read_done_rx => return res,
     }
-})
+}
 ```
+
+**Why split**: a naive single-task `select!` between `read_frame` and
+`cmd_rx.recv()` is a footgun. `read_frame` calls `AsyncReadExt::read_exact`,
+which is **not** cancel-safe. If `select!` drops a half-completed read (e.g.
+two of four length-prefix bytes already pulled), those bytes are lost, the
+next read restarts at a wrong offset, and a payload byte gets interpreted as
+a length prefix. The symptom is a `frame too large: 1398791722` log right
+after the seeder starts streaming Piece messages, and the connection dies.
+Running reader and writer on independent tasks sidesteps the cancellation
+entirely — neither future ever gets dropped mid-await.
 
 **`manager.rs`** — Connection pool
 
@@ -396,21 +412,79 @@ Use `thiserror` throughout the library. Use `anyhow` only in `main.rs` for top-l
 
 ## Dependency Summary
 
+Every BitTorrent-specific behavior in this crate is hand-written. The
+dependencies are domain-agnostic foundations only — none of them know what
+a torrent is.
+
 ```toml
 [dependencies]
-tokio        = { version = "1", features = ["full"] }
-reqwest      = { version = "0.12", features = ["rustls-tls"], default-features = false }
-serde        = { version = "1", features = ["derive"] }
-serde-bencode = "0.2"
-sha1         = "0.10"          # RustCrypto
-bitvec       = "1"
-clap         = { version = "4", features = ["derive"] }
-thiserror    = "1"
-anyhow       = "1"
-tracing      = "0.1"
+tokio        = { version = "1", features = ["full"] }       # async runtime
+reqwest      = { version = "0.12", features = ["rustls-tls"], default-features = false }  # HTTP GET for HTTP-tracker only
+sha1         = "0.10"                                        # RustCrypto SHA-1 primitive
+bitvec       = "1"                                           # generic bit-vector
+clap         = { version = "4", features = ["derive"] }      # CLI parser
+thiserror    = "1"                                           # derive macro for the Error enum
+anyhow       = "1"                                           # only used in main.rs
+tracing      = "0.1"                                         # structured logging
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rand         = "0.8"
-lru          = "0.12"
-toml         = "0.8"
-urlencoding  = "2"
+rand         = "0.8"                                         # peer_id, transaction_id, picker shuffle
+num-bigint   = "0.4"                                         # 768-bit DH for MSE/PE
+num-traits   = "0.2"                                         # Zero/One traits for num-bigint
+lru          = "0.12"                                        # generic LRU container for the upload cache
+```
+
+What is hand-written (not pulled in from any crate):
+
+| Concern | Module | Notes |
+|---|---|---|
+| Bencode decode | [`metainfo/bencode.rs`](../src/metainfo/bencode.rs) | Recursive-descent parser. Hand-written because `info_hash` requires the raw byte span of the `info` dict, awkward via serde. |
+| `.torrent` deserialization | [`metainfo/torrent.rs`](../src/metainfo/torrent.rs) | Walks the bencode tree into typed structs; manual raw-byte scan finds the `info` value span and SHA1s it. |
+| Percent encoding for trackers | [`tracker/http.rs::percent_encode`](../src/tracker/http.rs) | RFC 3986 unreserved-only encoder for raw 20-byte `info_hash` / `peer_id`. |
+| HTTP tracker request + response | [`tracker/http.rs`](../src/tracker/http.rs) | URL built by hand; response parsed by our own bencode parser. |
+| UDP tracker protocol (BEP 15) | [`tracker/udp.rs`](../src/tracker/udp.rs) | 16-byte connect / 98-byte announce packet hand-laid; retry/timeout per spec. |
+| Peer-ID generation | [`peer_id.rs`](../src/peer_id.rs) | Azureus-style `-RT0100-` + 12 random printable bytes. |
+| BitTorrent handshake | [`peer/handshake.rs`](../src/peer/handshake.rs) | 68-byte buffer encode/decode; `perform_outgoing` / `perform_incoming`. |
+| Wire-message codec | [`peer/message.rs`](../src/peer/message.rs) | Encode/decode for IDs 0–8, 4-byte BE length prefix framing, strict bitfield (spare bits must be zero). |
+| Per-peer task | [`peer/connection.rs`](../src/peer/connection.rs) | `tokio::select!` between socket reads, command channel, and keep-alive timer. No library wraps this. |
+| Peer pool | [`peer/manager.rs`](../src/peer/manager.rs) | `HashMap<SocketAddr, PeerSlot>`, cap + ban list, outgoing dial + incoming accept. |
+| Piece + block state machine | [`piece/manager.rs`](../src/piece/manager.rs) | Per-piece `Missing` / `InProgress` / `Complete`; per-block `requested` + `received` bitmaps. |
+| Rarest-first picker + endgame | [`piece/picker.rs`](../src/piece/picker.rs) | Availability table from `Bitfield` + `Have`, tie-shuffle, sticky per-peer assignment. |
+| SHA-1 piece verifier | [`piece/verifier.rs`](../src/piece/verifier.rs) | Thin wrapper around the `sha1` primitive — the only "library" call. |
+| File layout / piece↔file map | [`storage/layout.rs`](../src/storage/layout.rs) | Virtual offset map; one piece → many `(file, offset, count)` slices. |
+| Disk task (write / read / resume scan) | [`storage/disk.rs`](../src/storage/disk.rs) | `tokio::fs` for I/O; everything around it (pre-allocate, write fan-out across files, SHA1 rescan) is our own. |
+| Choke algorithm (BEP 3) | [`scheduler/choke.rs`](../src/scheduler/choke.rs) | 3 regular + 1 optimistic unchoke slots; 20-s rolling rate window per peer; anti-snubbing. |
+| Central engine | [`engine.rs`](../src/engine.rs) | `tokio::select!` hub for all channels; pipelining at depth 5; tracker re-announce; broadcast `Have` after writes; ctrl-c shutdown. |
+| RC4 stream cipher | [`peer/mse/rc4.rs`](../src/peer/mse/rc4.rs) | 256-byte S-box, key schedule, PRGA, 1024-byte discard helper. Includes known-answer test against the classic `"Key"` / `"Plaintext"` vector. |
+| 768-bit Diffie-Hellman | [`peer/mse/dh.rs`](../src/peer/mse/dh.rs) | RFC 2409 Oakley Group 1 prime + generator 2; mod-exp delegated to `num-bigint`. |
+| MSE/PE handshake | [`peer/mse/handshake.rs`](../src/peer/mse/handshake.rs) | Initiator and receiver flows including `HASH(req1,S)` / `HASH(req2,SKEY) XOR HASH(req3,S)` sync, encrypted VC alignment, `crypto_provide`/`crypto_select` negotiation, PadA/B/C/D handling. |
+| RC4 stream wrappers | [`peer/mse/stream.rs`](../src/peer/mse/stream.rs) | `EncryptedStream`, `Rc4Reader`, `Rc4Writer` implementing `AsyncRead` / `AsyncWrite` over an inner socket and a per-direction `Rc4` keystream. |
+| Plain-vs-MSE dispatch | [`peer/connection.rs`](../src/peer/connection.rs) | Outgoing: tries plain first, falls back to MSE on the signature failures of MSE-only peers. Incoming: peeks first byte; `\x13` → plain, anything else → MSE. `--encrypt` forces MSE-only for outgoing. |
+| 160-bit NodeId + XOR distance | [`dht/node_id.rs`](../src/dht/node_id.rs) | Kademlia ID space; bucket index = highest differing bit. |
+| K-bucket routing table | [`dht/routing.rs`](../src/dht/routing.rs) | 160 buckets × K=8 contacts; LRU within each bucket; "good" contacts (seen <15 min) win against stale ones. |
+| KRPC bencode codec | [`dht/krpc.rs`](../src/dht/krpc.rs) | Encode/decode for ping / find_node / get_peers / announce_peer queries + their three response shapes + error. Verified against the BEP 5 sample-ping wire bytes. |
+| DHT UDP server | [`dht/server.rs`](../src/dht/server.rs) | Owns the socket, transaction-id table, peer store, and token salt; answers inbound queries; runs iterative `get_peers` with α=3 parallel and a 15-second budget. |
+| DHT persistence | [`dht/persist.rs`](../src/dht/persist.rs) | `node_id` + routing-table snapshot saved every 5 minutes (and on graceful shutdown) to `$XDG_CONFIG_HOME/rustytorrent/dht_state`; trivial inspect-with-xxd binary format. |
+| LRU upload cache | [`storage/cache.rs`](../src/storage/cache.rs) | Whole-piece cache for the upload path. First Request triggers a disk read of the full piece; subsequent blocks for the same piece are served from RAM. Default 32 pieces (~8 MiB upper bound). |
+| SOCKS5 client (RFC 1928 + RFC 1929) | [`socks5.rs`](../src/socks5.rs) | Hand-rolled outgoing CONNECT through a SOCKS5 proxy, with optional username/password auth. Used by every peer dial and (transitively, via `reqwest`'s socks feature) by HTTP-tracker requests. |
+| Anonymous-mode bundle | [`engine.rs`](../src/engine.rs) | When `--anonymous` is set: refuse to start without a proxy, suppress the inbound TCP listener, force DHT off, force `port=0` in tracker announces, and use an ephemeral non-persisted peer_id. Documented in [docs/ANONYMITY.md](ANONYMITY.md). |
+
+---
+
+## Implemented CLI
+
+```
+rustytorrent info <file>                       # Phase 1: parse + display
+rustytorrent peers <file> [--port N] [--numwant N]   # Phase 2: live tracker query
+rustytorrent download <file>                   # Phase 4+: full client
+    [--output DIR]
+    [--port N]
+    [--peer host:port]      (repeatable — direct-dial in addition to/instead of tracker)
+    [--no-tracker]          (skip tracker, use --peer / --dht exclusively)
+    [--encrypt]             (force outgoing MSE/PE; skip the plain attempt)
+    [--dht]                 (enable BEP 5 DHT for trackerless peer discovery)
+    [--socks5 host:port]    (route peer + tracker traffic through SOCKS5)
+    [--socks5-user U]       (optional RFC 1929 username; requires --socks5)
+    [--socks5-pass P]       (optional RFC 1929 password; requires --socks5-user)
+    [--anonymous]           (strict bundle: requires --socks5; DHT off, listener off,
+                            ephemeral peer_id, port=0 in announces)
 ```
