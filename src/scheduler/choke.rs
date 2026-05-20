@@ -123,7 +123,7 @@ impl ChokeScheduler {
             .filter(|a| !self.is_snubbed(a) || self.seeding) // snubbed peers de-prioritized in leech mode
             .map(|a| (*a, self.rate_for(a)))
             .collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
         let mut chosen: Vec<SocketAddr> = ranked
             .into_iter()
