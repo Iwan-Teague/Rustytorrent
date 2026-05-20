@@ -71,6 +71,13 @@ enum Commands {
         /// `tun0`, `en0`), numeric interface index on Windows.
         #[arg(long)]
         bind_iface: Option<String>,
+        /// Tor stream isolation: every outgoing peer dial uses a randomly
+        /// generated SOCKS5 username so Tor routes it over its own circuit,
+        /// defeating correlation by a single exit node. Requires --socks5.
+        /// Harmless on non-Tor SOCKS5 proxies that ignore credentials;
+        /// avoid on commercial VPNs that require real auth.
+        #[arg(long, default_value_t = false, requires = "socks5")]
+        tor_isolation: bool,
     },
 }
 
@@ -103,6 +110,7 @@ async fn main() -> Result<()> {
             socks5_pass,
             anonymous,
             bind_iface,
+            tor_isolation,
         } => {
             cmd_download(
                 file,
@@ -117,6 +125,7 @@ async fn main() -> Result<()> {
                 socks5_pass,
                 anonymous,
                 bind_iface,
+                tor_isolation,
             )
             .await
         }
@@ -232,6 +241,7 @@ async fn cmd_download(
     socks5_pass: Option<String>,
     anonymous: bool,
     bind_iface: Option<String>,
+    tor_isolation: bool,
 ) -> Result<()> {
     let raw = tokio::fs::read(&path)
         .await
@@ -272,8 +282,16 @@ async fn cmd_download(
                 (None, None) => None,
                 _ => anyhow::bail!("--socks5-user and --socks5-pass must be set together"),
             };
-            println!("Proxy:      {addr} (SOCKS5)");
-            Some(rustytorrent::socks5::ProxyConfig { addr, credentials })
+            if tor_isolation {
+                println!("Proxy:      {addr} (SOCKS5, Tor stream isolation on)");
+            } else {
+                println!("Proxy:      {addr} (SOCKS5)");
+            }
+            Some(rustytorrent::socks5::ProxyConfig {
+                addr,
+                credentials,
+                isolation: tor_isolation,
+            })
         }
     };
 

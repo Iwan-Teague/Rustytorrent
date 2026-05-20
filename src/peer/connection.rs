@@ -264,7 +264,11 @@ async fn dial(
                     "--bind-iface + --socks5 not yet supported together".into(),
                 ));
             }
-            socks5::connect(p, addr)
+            // Materialize the per-dial config: when stream isolation is on
+            // this generates a fresh random SOCKS5 username so Tor puts
+            // this dial on its own circuit.
+            let effective = p.for_dial();
+            socks5::connect(&effective, addr)
                 .await
                 .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}")))
         }

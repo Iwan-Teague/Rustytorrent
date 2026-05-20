@@ -90,6 +90,7 @@ rustytorrent download <file> [OPTIONS]
   --socks5-pass P           SOCKS5 password (requires --socks5-user)
   --anonymous               strict bundle (requires --socks5; DHT/listener off)
   --bind-iface IFACE        VPN kill switch — bind outgoing sockets to IFACE
+  --tor-isolation           per-peer SOCKS5 username so each dial gets its own Tor circuit
 ```
 
 ## Documentation

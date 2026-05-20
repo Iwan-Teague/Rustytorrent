@@ -12,6 +12,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
@@ -49,6 +50,39 @@ pub struct ProxyConfig {
     pub addr: SocketAddr,
     /// Optional `(username, password)` for RFC 1929 auth.
     pub credentials: Option<Credentials>,
+    /// **Tor stream isolation.** When `true`, every outgoing dial uses a
+    /// freshly-randomized SOCKS5 username; Tor's SOCKS server treats
+    /// distinct usernames as distinct streams and routes each over its own
+    /// circuit. Defeats correlation by any single exit node.
+    ///
+    /// On non-Tor SOCKS5 proxies that ignore credentials this is harmless;
+    /// on proxies that *enforce* real USER/PASS auth this will break dials,
+    /// so leave it off for commercial VPNs that require real creds.
+    pub isolation: bool,
+}
+
+impl ProxyConfig {
+    /// Materialize the per-dial effective config. When `isolation` is on,
+    /// generate a fresh random username for each call so Tor puts it on a
+    /// new circuit.
+    pub fn for_dial(&self) -> ProxyConfig {
+        if !self.isolation {
+            return self.clone();
+        }
+        let mut nonce = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let username = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let creds = Credentials {
+            username,
+            // Tor doesn't actually check the password; any non-empty value works.
+            password: "x".into(),
+        };
+        ProxyConfig {
+            addr: self.addr,
+            credentials: Some(creds),
+            isolation: false, // already applied
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +339,7 @@ mod tests {
         let p = ProxyConfig {
             addr: "127.0.0.1:9050".parse().unwrap(),
             credentials: None,
+            isolation: false,
         };
         assert_eq!(p.as_socks5h_url(), "socks5h://127.0.0.1:9050");
     }
@@ -317,11 +352,44 @@ mod tests {
                 username: "user@host".into(),
                 password: "p:ss".into(),
             }),
+            isolation: false,
         };
         assert_eq!(
             p.as_socks5h_url(),
             "socks5h://user%40host:p%3Ass@10.0.0.1:1080"
         );
+    }
+
+    #[test]
+    fn for_dial_with_isolation_off_clones() {
+        let p = ProxyConfig {
+            addr: "127.0.0.1:9050".parse().unwrap(),
+            credentials: None,
+            isolation: false,
+        };
+        let d = p.for_dial();
+        assert_eq!(d.addr, p.addr);
+        assert!(d.credentials.is_none());
+    }
+
+    #[test]
+    fn for_dial_with_isolation_generates_unique_username() {
+        let p = ProxyConfig {
+            addr: "127.0.0.1:9050".parse().unwrap(),
+            credentials: None,
+            isolation: true,
+        };
+        let a = p.for_dial();
+        let b = p.for_dial();
+        // Two consecutive isolated dials should get distinct usernames so
+        // Tor puts them on separate circuits.
+        let ua = a.credentials.unwrap().username;
+        let ub = b.credentials.unwrap().username;
+        assert_ne!(ua, ub, "isolated dials must get fresh usernames");
+        // After applying isolation, the per-dial config has isolation=false
+        // so the SOCKS5 layer doesn't try to randomize again.
+        assert!(!a.isolation);
+        assert!(!b.isolation);
     }
 
     /// Spawn a tiny in-memory "SOCKS5 server" that does the protocol
@@ -412,6 +480,7 @@ mod tests {
             &ProxyConfig {
                 addr: proxy_addr,
                 credentials: None,
+                isolation: false,
             },
             target,
         )
@@ -438,6 +507,7 @@ mod tests {
                     username: "alice".into(),
                     password: "s3cret".into(),
                 }),
+                isolation: false,
             },
             target,
         )
@@ -471,6 +541,7 @@ mod tests {
             &ProxyConfig {
                 addr: proxy_addr,
                 credentials: None,
+                isolation: false,
             },
             "1.1.1.1:80".parse().unwrap(),
         )
@@ -502,6 +573,7 @@ mod tests {
             &ProxyConfig {
                 addr: proxy_addr,
                 credentials: None,
+                isolation: false,
             },
             "1.1.1.1:80".parse().unwrap(),
         )
