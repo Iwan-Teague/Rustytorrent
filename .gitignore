@@ -1,5 +1,5 @@
 /target
-Cargo.lock
+# Cargo.lock IS committed for application crates so CI builds are reproducible.
 *.torrent
 .DS_Store
 config.toml
