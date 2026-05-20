@@ -2,7 +2,7 @@
 name = "rustytorrent"
 version = "0.1.0"
 edition = "2021"
-description = "A BitTorrent client built in Rust"
+description = "A peer-to-peer file transfer client in Rust"
 license = "MIT"
 
 [dependencies]

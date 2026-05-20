@@ -41,7 +41,7 @@ Outstanding gaps (Phase 7 work):
 
 - Work top-to-bottom within each phase
 - Items marked ⚠️ are blockers — don't skip them
-- Estimates assume familiarity with Rust but not BitTorrent internals
+- Estimates assume familiarity with Rust but not the underlying protocol
 - Each phase should be fully working before starting the next
 
 ---

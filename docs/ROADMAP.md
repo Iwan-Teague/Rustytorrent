@@ -1,12 +1,12 @@
 # RustyTorrent — Roadmap
 
-> A BitTorrent client built in Rust. Fast, correct, and a joy to hack on.
+> A peer-to-peer file transfer client built in Rust. Fast, correct, and a joy to hack on.
 
 ---
 
 ## Vision
 
-RustyTorrent aims to be a fully-featured, production-quality BitTorrent client written in idiomatic Rust. The long-term goal is spec compliance with the core BEP suite, a clean async architecture, and an optional web UI — built incrementally in phases so the project is usable at every stage.
+RustyTorrent aims to be a fully-featured, production-quality peer-to-peer file transfer client written in idiomatic Rust. The long-term goal is spec compliance with the core BEP suite, a clean async architecture, and an optional web UI — built incrementally in phases so the project is usable at every stage.
 
 ---
 
@@ -24,7 +24,7 @@ RustyTorrent aims to be a fully-featured, production-quality BitTorrent client w
 | 8 | Web UI | 🔲 Not started |
 
 **Anonymity / security**:
-- Hand-rolled SOCKS5 client (RFC 1928 + RFC 1929 auth) for outgoing peer
+- Built-in SOCKS5 client (RFC 1928 + RFC 1929 auth) for outgoing peer
   dials and HTTP-tracker requests.
 - `--anonymous` bundle: requires `--socks5`, disables the inbound TCP
   listener, disables DHT, randomizes peer_id per session, zeroes `port` in
@@ -107,10 +107,10 @@ Connecting to any of those peers.
 ## Phase 3 — Peer Handshake & Messaging
 **Target: Week 2–3**
 
-Speak the BitTorrent wire protocol. No downloading yet.
+Speak the peer wire protocol. No downloading yet.
 
 ### Goals
-- BitTorrent handshake (19-byte preamble, reserved bytes, info_hash, peer_id)
+- Peer handshake (19-byte preamble, reserved bytes, info_hash, peer_id)
 - All standard wire messages: Choke, Unchoke, Interested, NotInterested, Have, Bitfield, Request, Piece, Cancel
 - Async per-peer task with mpsc channel back to engine
 - PeerManager: connect to up to 50 peers, handle disconnects
@@ -186,7 +186,7 @@ The client is usable for real, multi-hour downloads. It can be interrupted and r
 ## Phase 7 — Protocol Extensions
 **Target: Month 2–3**
 
-Stretch goals that make RustyTorrent a first-class citizen in the BitTorrent ecosystem.
+Stretch goals that make RustyTorrent a first-class citizen in the wider peer-to-peer ecosystem.
 
 ### Goals (in priority order)
 1. **Extension Protocol (BEP 10)** — prerequisite handshake extension for all below

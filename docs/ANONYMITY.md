@@ -29,7 +29,7 @@ every peer from your real IP.
 | Passive ISP observer / DPI | ❌ sees BT traffic to clearnet peers | 🟡 sees BT traffic to proxy IP only | 🟡 sees BT traffic to proxy IP only |
 | MSE/PE-aware DPI (looks at byte patterns) | ❌ plain BT is trivially fingerprinted | 🟡 still fingerprintable inside the proxy tunnel if peer chose plain | ✅ if proxy is Tor or commercial VPN, transport encryption hides BT shape; `--encrypt` forces MSE outbound for additional cover |
 | Active DHT scraper enumerating swarms | ❌ your IP is in the DHT for everyone to scrape | 🟡 still exposed: DHT runs UDP, can't ride SOCKS5 CONNECT, but we leave it on unless `--anonymous` | ✅ DHT is forcibly **off** |
-| Port-scan of your IP from BitTorrent listen port | ❌ exposed by listener bind | ❌ still bound on your real IP | ✅ listener is **not bound** |
+| Port-scan of your IP from the peer listen port | ❌ exposed by listener bind | ❌ still bound on your real IP | ✅ listener is **not bound** |
 | Cross-session correlation by stable `peer_id` | ❌ same `-RT0100-…` prefix + 12 stable random bytes every run | ❌ peer_id still persisted | ✅ peer_id is freshly generated every run, never persisted |
 | Compromised proxy | n/a | ❌ proxy operator sees everything | ❌ proxy operator sees everything |
 | Compromised proxy + correlation with tracker IP-allocation records | n/a | ❌ deanonymizable | ❌ deanonymizable (need a different transport, e.g. I2P) |
@@ -92,13 +92,13 @@ rustytorrent download foo.torrent \
     --anonymous
 ```
 
-Tor caveats specific to BitTorrent:
+Tor caveats specific to high-volume P2P traffic:
 
 - **Tor is TCP only** — DHT and UDP trackers can't go through it. `--anonymous`
   handles this by turning them off.
 - **Tor exits are bandwidth-constrained** — expect 100 KB/s, not 10 MB/s. Be
   considerate of exit relay operators; don't seed long-term over Tor.
-- **Tor + BitTorrent has a checkered history.** Past clients (incl. some big
+- **Tor + heavy P2P has a checkered history.** Past clients (incl. some big
   ones) leaked the real IP through DHT or PEX even when nominally "torified".
   This client closes DHT in `--anonymous` mode and never enabled PEX; we
   believe the visible attack surface from `--socks5 --anonymous` is just the

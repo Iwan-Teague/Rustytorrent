@@ -412,9 +412,9 @@ Use `thiserror` throughout the library. Use `anyhow` only in `main.rs` for top-l
 
 ## Dependency Summary
 
-Every BitTorrent-specific behavior in this crate is hand-written. The
-dependencies are domain-agnostic foundations only — none of them know what
-a torrent is.
+Every protocol-specific behavior in this crate is written from scratch in
+this repo. The dependencies are domain-agnostic foundations only — none of
+them know what a torrent is.
 
 ```toml
 [dependencies]
@@ -443,7 +443,7 @@ What is hand-written (not pulled in from any crate):
 | HTTP tracker request + response | [`tracker/http.rs`](../src/tracker/http.rs) | URL built by hand; response parsed by our own bencode parser. |
 | UDP tracker protocol (BEP 15) | [`tracker/udp.rs`](../src/tracker/udp.rs) | 16-byte connect / 98-byte announce packet hand-laid; retry/timeout per spec. |
 | Peer-ID generation | [`peer_id.rs`](../src/peer_id.rs) | Azureus-style `-RT0100-` + 12 random printable bytes. |
-| BitTorrent handshake | [`peer/handshake.rs`](../src/peer/handshake.rs) | 68-byte buffer encode/decode; `perform_outgoing` / `perform_incoming`. |
+| Peer handshake | [`peer/handshake.rs`](../src/peer/handshake.rs) | 68-byte buffer encode/decode; `perform_outgoing` / `perform_incoming`. |
 | Wire-message codec | [`peer/message.rs`](../src/peer/message.rs) | Encode/decode for IDs 0–8, 4-byte BE length prefix framing, strict bitfield (spare bits must be zero). |
 | Per-peer task | [`peer/connection.rs`](../src/peer/connection.rs) | `tokio::select!` between socket reads, command channel, and keep-alive timer. No library wraps this. |
 | Peer pool | [`peer/manager.rs`](../src/peer/manager.rs) | `HashMap<SocketAddr, PeerSlot>`, cap + ban list, outgoing dial + incoming accept. |
@@ -465,7 +465,7 @@ What is hand-written (not pulled in from any crate):
 | DHT UDP server | [`dht/server.rs`](../src/dht/server.rs) | Owns the socket, transaction-id table, peer store, and token salt; answers inbound queries; runs iterative `get_peers` with α=3 parallel and a 15-second budget. |
 | DHT persistence | [`dht/persist.rs`](../src/dht/persist.rs) | `node_id` + routing-table snapshot saved every 5 minutes (and on graceful shutdown) to `$XDG_CONFIG_HOME/rustytorrent/dht_state`; trivial inspect-with-xxd binary format. |
 | LRU upload cache | [`storage/cache.rs`](../src/storage/cache.rs) | Whole-piece cache for the upload path. First Request triggers a disk read of the full piece; subsequent blocks for the same piece are served from RAM. Default 32 pieces (~8 MiB upper bound). |
-| SOCKS5 client (RFC 1928 + RFC 1929) | [`socks5.rs`](../src/socks5.rs) | Hand-rolled outgoing CONNECT through a SOCKS5 proxy, with optional username/password auth. Used by every peer dial and (transitively, via `reqwest`'s socks feature) by HTTP-tracker requests. |
+| SOCKS5 client (RFC 1928 + RFC 1929) | [`socks5.rs`](../src/socks5.rs) | Outgoing CONNECT through a SOCKS5 proxy, with optional username/password auth. Used by every peer dial and (transitively, via `reqwest`'s socks feature) by HTTP-tracker requests. |
 | Anonymous-mode bundle | [`engine.rs`](../src/engine.rs) | When `--anonymous` is set: refuse to start without a proxy, suppress the inbound TCP listener, force DHT off, force `port=0` in tracker announces, and use an ephemeral non-persisted peer_id. Documented in [docs/ANONYMITY.md](ANONYMITY.md). |
 
 ---

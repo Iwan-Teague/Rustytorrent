@@ -1,11 +1,12 @@
 # RustyTorrent
 
-A fully-functional BitTorrent client written from scratch in Rust. The
-protocol-specific bits — bencode, info-hash, the peer wire protocol, HTTP/UDP
-trackers, MSE/PE encryption, the BEP 5 DHT, the piece state machine, the
-rarest-first picker, the choke algorithm, the engine — are all hand-written;
-the dependency list is entirely generic infrastructure (async runtime, HTTP
-client, hash primitives, bit-vectors, big-int math for DH, CLI parser).
+A fully-functional peer-to-peer file transfer client written from scratch
+in Rust. The protocol-specific bits — bencode, info-hash, the peer wire
+protocol, HTTP/UDP trackers, MSE/PE encryption, the BEP 5 DHT, the piece
+state machine, the rarest-first picker, the choke algorithm, the engine —
+are all written from first principles in this repo; the dependency list is
+entirely generic infrastructure (async runtime, HTTP client, hash
+primitives, bit-vectors, big-int math for DH, CLI parser).
 
 Cross-platform: Linux, macOS (Intel + Apple Silicon), and Windows.
 
@@ -16,7 +17,7 @@ Cross-platform: Linux, macOS (Intel + Apple Silicon), and Windows.
 | Bencode parser + `.torrent` decoder with raw-bytes `info_hash` | ✅ |
 | HTTP trackers (BEP 3) and UDP trackers (BEP 15) with retry + connection-id refresh | ✅ |
 | Peer wire protocol (handshake + all 9 messages, BEP 3) | ✅ |
-| MSE / Protocol Encryption (BEP 8): hand-rolled RC4, 768-bit DH, full handshake | ✅ |
+| MSE / Protocol Encryption (BEP 8): RC4, 768-bit DH, full handshake | ✅ |
 | BEP 5 DHT: KRPC, k-bucket routing table, iterative `get_peers`, persistent state | ✅ |
 | Piece state machine with block-level pipelining (depth 5) | ✅ |
 | Rarest-first picker + endgame mode + SHA-1 verifier | ✅ |
