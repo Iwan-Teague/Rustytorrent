@@ -21,6 +21,10 @@ num-traits   = "0.2"
 lru          = "0.12"
 zeroize      = { version = "1.8", features = ["derive"] }  # wipe crypto secrets on drop
 subtle       = "2"                                          # constant-time byte comparisons
+socket2      = "0.6"                                        # interface-binding for VPN kill switch
+
+[target.'cfg(unix)'.dependencies]
+libc         = "0.2"                                        # if_nametoindex for --bind-iface (Unix)
 
 [dev-dependencies]
 tokio-test   = "0.4"

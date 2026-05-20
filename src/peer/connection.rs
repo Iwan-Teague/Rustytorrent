@@ -113,9 +113,11 @@ pub async fn run_outgoing(
     event_tx: mpsc::Sender<PeerEvent>,
     cmd_rx: mpsc::Receiver<PeerCommand>,
     proxy: Option<ProxyConfig>,
+    bind_iface: Option<String>,
 ) -> Result<()> {
-    tracing::debug!(target: "peer", %addr, via_proxy = proxy.is_some(), "dialing (plain)");
-    let outcome = match plain_handshake(addr, info_hash, peer_id, proxy.as_ref()).await {
+    tracing::debug!(target: "peer", %addr, via_proxy = proxy.is_some(), bind = ?bind_iface, "dialing (plain)");
+    let iface = bind_iface.as_deref();
+    let outcome = match plain_handshake(addr, info_hash, peer_id, proxy.as_ref(), iface).await {
         Ok((reader, writer, theirs)) => {
             let _ = event_tx
                 .send(PeerEvent::Connected {
@@ -127,7 +129,7 @@ pub async fn run_outgoing(
         }
         Err(e) if is_likely_mse_signal(&e) => {
             tracing::debug!(target: "peer", %addr, reason = %e, "plain failed, retrying with MSE");
-            match mse_handshake_outgoing(addr, info_hash, peer_id, proxy.as_ref()).await {
+            match mse_handshake_outgoing(addr, info_hash, peer_id, proxy.as_ref(), iface).await {
                 Ok((reader, writer, theirs)) => {
                     let _ = event_tx
                         .send(PeerEvent::Connected {
@@ -164,9 +166,18 @@ pub async fn run_outgoing_mse_only(
     event_tx: mpsc::Sender<PeerEvent>,
     cmd_rx: mpsc::Receiver<PeerCommand>,
     proxy: Option<ProxyConfig>,
+    bind_iface: Option<String>,
 ) -> Result<()> {
-    tracing::debug!(target: "peer", %addr, via_proxy = proxy.is_some(), "dialing (MSE-only)");
-    let outcome = match mse_handshake_outgoing(addr, info_hash, peer_id, proxy.as_ref()).await {
+    tracing::debug!(target: "peer", %addr, via_proxy = proxy.is_some(), bind = ?bind_iface, "dialing (MSE-only)");
+    let outcome = match mse_handshake_outgoing(
+        addr,
+        info_hash,
+        peer_id,
+        proxy.as_ref(),
+        bind_iface.as_deref(),
+    )
+    .await
+    {
         Ok((reader, writer, theirs)) => {
             let _ = event_tx
                 .send(PeerEvent::Connected {
@@ -213,8 +224,9 @@ async fn plain_handshake(
     info_hash: [u8; 20],
     peer_id: PeerId,
     proxy: Option<&ProxyConfig>,
+    bind_iface: Option<&str>,
 ) -> Result<(OwnedReadHalf, OwnedWriteHalf, Handshake)> {
-    let mut stream = dial(addr, proxy).await?;
+    let mut stream = dial(addr, proxy, bind_iface).await?;
     let _ = stream.set_nodelay(true);
     let theirs = match timeout(
         HANDSHAKE_TIMEOUT,
@@ -233,16 +245,50 @@ async fn plain_handshake(
 /// is configured. The returned `TcpStream` is, post-handshake, a transparent
 /// byte-pipe to `addr` — the rest of the per-peer code doesn't need to know
 /// whether it's direct or proxied.
-async fn dial(addr: SocketAddr, proxy: Option<&ProxyConfig>) -> Result<TcpStream> {
+async fn dial(
+    addr: SocketAddr,
+    proxy: Option<&ProxyConfig>,
+    bind_iface: Option<&str>,
+) -> Result<TcpStream> {
     match proxy {
-        None => match timeout(Duration::from_secs(10), TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => Ok(s),
-            Ok(Err(e)) => Err(Error::Network(format!("connect {addr}: {e}"))),
-            Err(_) => Err(Error::Network(format!("connect {addr}: timeout"))),
+        Some(p) => {
+            // Through a proxy: we connect to the proxy's IP, not the peer's,
+            // so the bind-iface decision applies to the proxy connection too
+            // (and the kernel route to the proxy). socks5::connect does its
+            // own TcpStream::connect under the hood — to enforce the bound
+            // iface we'd need to wire it through socks5. For now, refuse the
+            // combination loudly rather than silently leak via the default
+            // route.
+            if bind_iface.is_some() {
+                return Err(Error::Network(
+                    "--bind-iface + --socks5 not yet supported together".into(),
+                ));
+            }
+            socks5::connect(p, addr)
+                .await
+                .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}")))
+        }
+        None => match bind_iface {
+            Some(iface) => {
+                match timeout(
+                    Duration::from_secs(10),
+                    crate::netbind::connect_via_interface(addr, iface),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => Ok(s),
+                    Ok(Err(e)) => Err(Error::Network(format!("connect {addr} via {iface}: {e}"))),
+                    Err(_) => Err(Error::Network(format!(
+                        "connect {addr} via {iface}: timeout"
+                    ))),
+                }
+            }
+            None => match timeout(Duration::from_secs(10), TcpStream::connect(addr)).await {
+                Ok(Ok(s)) => Ok(s),
+                Ok(Err(e)) => Err(Error::Network(format!("connect {addr}: {e}"))),
+                Err(_) => Err(Error::Network(format!("connect {addr}: timeout"))),
+            },
         },
-        Some(p) => socks5::connect(p, addr)
-            .await
-            .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}"))),
     }
 }
 
@@ -254,12 +300,13 @@ async fn mse_handshake_outgoing(
     info_hash: [u8; 20],
     peer_id: PeerId,
     proxy: Option<&ProxyConfig>,
+    bind_iface: Option<&str>,
 ) -> Result<(
     mse::Rc4Reader<OwnedReadHalf>,
     mse::Rc4Writer<OwnedWriteHalf>,
     Handshake,
 )> {
-    let stream = dial(addr, proxy).await?;
+    let stream = dial(addr, proxy, bind_iface).await?;
     let _ = stream.set_nodelay(true);
 
     // MSE handshake first. After this, all reads/writes through `enc` are

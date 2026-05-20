@@ -50,6 +50,10 @@ pub struct EngineConfig {
     /// proxy's IP; pair with `anonymous = true` to also close DHT/listener
     /// side-channels that would otherwise leak the real IP.
     pub proxy: Option<crate::socks5::ProxyConfig>,
+    /// Bind every outbound socket to this network interface (e.g. `utun0`,
+    /// `tun0`). Acts as a VPN kill switch — if the interface goes away,
+    /// dials fail closed instead of falling back to the default route.
+    pub bind_iface: Option<String>,
     /// "Anonymous mode" bundle: require a proxy, disable the inbound TCP
     /// listener (no incoming connections — they'd land on our real IP),
     /// disable DHT (UDP-only, can't go through SOCKS5 CONNECT, and would
@@ -74,6 +78,7 @@ impl Default for EngineConfig {
             dht_bootstrap: Vec::new(),
             proxy: None,
             anonymous: false,
+            bind_iface: None,
         }
     }
 }
@@ -160,6 +165,7 @@ impl TorrentEngine {
         peers.set_max_peers(self.cfg.max_peers);
         peers.set_force_outgoing_mse(self.cfg.force_outgoing_mse);
         peers.set_proxy(self.cfg.proxy.clone());
+        peers.set_bind_iface(self.cfg.bind_iface.clone());
 
         // Bind incoming-connection listener — unless anonymous mode (the
         // listener would expose our real IP on the configured port).

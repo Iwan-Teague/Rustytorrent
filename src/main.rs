@@ -64,6 +64,13 @@ enum Commands {
         /// otherwise undo it.
         #[arg(long, default_value_t = false, requires = "socks5")]
         anonymous: bool,
+        /// Bind every outgoing socket to this network interface (VPN kill
+        /// switch). If the interface goes away — VPN tunnel drops, Wi-Fi
+        /// reconnects — outbound dials fail closed instead of leaking via
+        /// the default route. Interface name on Unix (e.g. `utun0`,
+        /// `tun0`, `en0`), numeric interface index on Windows.
+        #[arg(long)]
+        bind_iface: Option<String>,
     },
 }
 
@@ -95,6 +102,7 @@ async fn main() -> Result<()> {
             socks5_user,
             socks5_pass,
             anonymous,
+            bind_iface,
         } => {
             cmd_download(
                 file,
@@ -108,6 +116,7 @@ async fn main() -> Result<()> {
                 socks5_user,
                 socks5_pass,
                 anonymous,
+                bind_iface,
             )
             .await
         }
@@ -222,6 +231,7 @@ async fn cmd_download(
     socks5_user: Option<String>,
     socks5_pass: Option<String>,
     anonymous: bool,
+    bind_iface: Option<String>,
 ) -> Result<()> {
     let raw = tokio::fs::read(&path)
         .await
@@ -279,6 +289,10 @@ async fn cmd_download(
         println!("Anonymous:  on (DHT off, listener off, peer_id ephemeral, port=0 in announces)");
     }
 
+    if let Some(iface) = &bind_iface {
+        println!("Bound to:   {iface} (VPN kill switch)");
+    }
+
     let cfg = rustytorrent::engine::EngineConfig {
         output_dir: output,
         listen_port: port,
@@ -288,6 +302,7 @@ async fn cmd_download(
         enable_dht: dht,
         proxy,
         anonymous,
+        bind_iface,
         ..Default::default()
     };
     let engine = rustytorrent::engine::TorrentEngine::new(t, peer_id, cfg);

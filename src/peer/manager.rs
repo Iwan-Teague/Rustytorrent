@@ -22,6 +22,7 @@ pub struct PeerManager {
     max_peers: usize,
     force_outgoing_mse: bool,
     proxy: Option<ProxyConfig>,
+    bind_iface: Option<String>,
 }
 
 struct PeerSlot {
@@ -44,6 +45,7 @@ impl PeerManager {
             max_peers: DEFAULT_MAX_PEERS,
             force_outgoing_mse: false,
             proxy: None,
+            bind_iface: None,
         }
     }
 
@@ -57,6 +59,10 @@ impl PeerManager {
 
     pub fn set_proxy(&mut self, proxy: Option<ProxyConfig>) {
         self.proxy = proxy;
+    }
+
+    pub fn set_bind_iface(&mut self, iface: Option<String>) {
+        self.bind_iface = iface;
     }
 
     pub fn connected_count(&self) -> usize {
@@ -125,11 +131,18 @@ impl PeerManager {
         let event_tx = self.event_tx.clone();
         let force_mse = self.force_outgoing_mse;
         let proxy = self.proxy.clone();
+        let bind_iface = self.bind_iface.clone();
         let task = tokio::spawn(async move {
             let res = if force_mse {
-                run_outgoing_mse_only(addr, info_hash, peer_id, event_tx, cmd_rx, proxy).await
+                run_outgoing_mse_only(
+                    addr, info_hash, peer_id, event_tx, cmd_rx, proxy, bind_iface,
+                )
+                .await
             } else {
-                run_outgoing(addr, info_hash, peer_id, event_tx, cmd_rx, proxy).await
+                run_outgoing(
+                    addr, info_hash, peer_id, event_tx, cmd_rx, proxy, bind_iface,
+                )
+                .await
             };
             if let Err(e) = res {
                 tracing::debug!(target: "peer", %addr, error = %e, "peer task ended");

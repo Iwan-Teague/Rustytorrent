@@ -89,6 +89,7 @@ rustytorrent download <file> [OPTIONS]
   --socks5-user U           SOCKS5 username (requires --socks5)
   --socks5-pass P           SOCKS5 password (requires --socks5-user)
   --anonymous               strict bundle (requires --socks5; DHT/listener off)
+  --bind-iface IFACE        VPN kill switch — bind outgoing sockets to IFACE
 ```
 
 ## Documentation

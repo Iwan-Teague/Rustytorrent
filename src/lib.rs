@@ -2,6 +2,7 @@ pub mod dht;
 pub mod engine;
 pub mod error;
 pub mod metainfo;
+pub mod netbind;
 pub mod peer;
 pub mod peer_id;
 pub mod piece;
