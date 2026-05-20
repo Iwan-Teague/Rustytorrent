@@ -139,10 +139,16 @@ impl TorrentEngine {
                 "anonymous mode requires --socks5; refusing to dial clearnet".into(),
             ));
         }
+        // In anonymous mode we never want to emit a plain `\x13BitTorrent...`
+        // handshake — it's a DPI fingerprint even if the eventual MSE fallback
+        // hides everything after it. Force MSE-only outgoing dials.
+        if self.cfg.anonymous && !self.cfg.force_outgoing_mse {
+            self.cfg.force_outgoing_mse = true;
+        }
         if self.cfg.anonymous {
             tracing::info!(
                 target: "engine",
-                "anonymous mode: DHT off, listener off, port=0 in announces"
+                "anonymous mode: DHT off, listener off, port=0 in announces, MSE-only outgoing"
             );
         }
         if let Some(p) = &self.cfg.proxy {
