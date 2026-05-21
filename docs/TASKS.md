@@ -33,8 +33,6 @@ Outstanding gaps:
 
 - **µTP (BEP 29)** — TCP only today; a UDP path would unlock the
   UDP-only slice of the swarm.
-- **MSE on magnet bootstrap** — `metadata_fetch` currently only tries
-  plain BT for the bootstrap dial; MSE-only peers are skipped.
 
 ---
 

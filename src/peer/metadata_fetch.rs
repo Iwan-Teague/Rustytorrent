@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sha1::{Digest, Sha1};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::timeout;
@@ -141,33 +142,110 @@ pub async fn fetch_metadata(
     outcome
 }
 
+/// Orchestrate a single peer attempt: dial, run plain BT handshake; if
+/// that fails in a way that looks like the peer is MSE-only, redial and
+/// run the MSE handshake before retrying BT. Either way, hand the
+/// resulting stream (plain `TcpStream` or `EncryptedStream`) to the
+/// generic `exchange_metadata` function, which does the BEP 10 + 9
+/// protocol over any AsyncRead+AsyncWrite.
 async fn try_fetch_from(
     addr: SocketAddr,
     info_hash: [u8; 20],
     our_peer_id: PeerId,
     proxy: Option<&ProxyConfig>,
 ) -> Result<Vec<u8>> {
-    let mut stream = dial(addr, proxy).await?;
-    let _ = stream.set_nodelay(true);
+    // Attempt 1: plain BT handshake on a fresh TcpStream.
+    let plain_result = async {
+        let mut stream = dial(addr, proxy).await?;
+        let _ = stream.set_nodelay(true);
+        let theirs = match timeout(
+            HANDSHAKE_TIMEOUT,
+            Handshake::perform_outgoing(&mut stream, info_hash, our_peer_id),
+        )
+        .await
+        {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(Error::Handshake("bt handshake timeout".into())),
+        };
+        if !supports_extension_protocol(&theirs.reserved) {
+            return Err(Error::Network(
+                "peer lacks BEP 10 extension protocol".into(),
+            ));
+        }
+        exchange_metadata(&mut stream, info_hash, addr).await
+    }
+    .await;
 
-    // BT handshake. Must verify info_hash AND check the peer's
-    // BEP 10 reserved bit — without it they can't speak ut_metadata.
+    match plain_result {
+        Ok(v) => return Ok(v),
+        Err(e) if !looks_like_mse_signal(&e) => return Err(e),
+        Err(_) => {
+            tracing::debug!(target: "magnet", %addr, "plain BT failed; retrying with MSE");
+        }
+    }
+
+    // Attempt 2: MSE handshake on a fresh TcpStream. The first TCP
+    // attempt is now in some intermediate state (we sent the plain pstr
+    // and got a reject or EOF), so we redial cleanly.
+    let stream = dial(addr, proxy).await?;
+    let _ = stream.set_nodelay(true);
+    let mut enc = match timeout(
+        HANDSHAKE_TIMEOUT,
+        crate::peer::mse::perform_outgoing(stream, info_hash),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(Error::Handshake(format!("mse handshake: {e}"))),
+        Err(_) => return Err(Error::Handshake("mse handshake timeout".into())),
+    };
     let theirs = match timeout(
         HANDSHAKE_TIMEOUT,
-        Handshake::perform_outgoing(&mut stream, info_hash, our_peer_id),
+        Handshake::perform_outgoing(&mut enc, info_hash, our_peer_id),
     )
     .await
     {
         Ok(Ok(h)) => h,
-        Ok(Err(e)) => return Err(Error::Network(format!("bt handshake: {e}"))),
-        Err(_) => return Err(Error::Network("bt handshake timeout".into())),
+        Ok(Err(e)) => return Err(Error::Network(format!("bt-over-mse handshake: {e}"))),
+        Err(_) => return Err(Error::Network("bt-over-mse handshake timeout".into())),
     };
     if !supports_extension_protocol(&theirs.reserved) {
         return Err(Error::Network(
-            "peer lacks BEP 10 extension protocol".into(),
+            "peer (over MSE) lacks BEP 10 extension protocol".into(),
         ));
     }
+    exchange_metadata(&mut enc, info_hash, addr).await
+}
 
+/// Heuristic: did the plain BT handshake fail in a way that suggests the
+/// peer is MSE-only? Mirrors `peer::connection::is_likely_mse_signal`,
+/// but inlined here so the bootstrap module doesn't need to expose the
+/// helper crate-wide.
+fn looks_like_mse_signal(e: &Error) -> bool {
+    match e {
+        Error::Handshake(s) => {
+            s.contains("early eof")
+                || s.contains("bad pstrlen")
+                || s.contains("bad protocol string")
+                || s.contains("read: unexpected end of file")
+        }
+        Error::Network(s) => s.contains("Connection reset"),
+        _ => false,
+    }
+}
+
+/// Run the BEP 10 extension handshake + BEP 9 ut_metadata exchange over
+/// any AsyncRead+AsyncWrite stream (plain or MSE-encrypted). Returns
+/// the assembled, hash-verified info dict.
+async fn exchange_metadata<S>(
+    stream: &mut S,
+    info_hash: [u8; 20],
+    addr: SocketAddr,
+) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Extension handshake exchange. Send ours; read theirs from the
     // post-handshake message stream (filtering out unrelated Bitfield/
     // Have/etc. that legitimately also appear early).
@@ -175,11 +253,11 @@ async fn try_fetch_from(
         ext_id: EXT_HANDSHAKE_ID,
         payload: build_handshake_payload(),
     };
-    write_message(&mut stream, &our_ext)
+    write_message(stream, &our_ext)
         .await
         .map_err(|e| Error::Network(format!("ext handshake write: {e}")))?;
 
-    let peer_info = read_extension_handshake(&mut stream).await?;
+    let peer_info = read_extension_handshake(stream).await?;
     let their_id = peer_info.their_ut_metadata_id.ok_or_else(|| {
         Error::Network("peer doesn't advertise ut_metadata in extension handshake".into())
     })?;
@@ -201,11 +279,11 @@ async fn try_fetch_from(
             ext_id: their_id,
             payload: build_metadata_request(next as u32),
         };
-        write_message(&mut stream, &req)
+        write_message(stream, &req)
             .await
             .map_err(|e| Error::Network(format!("ut_metadata request: {e}")))?;
 
-        let resp = read_metadata_response(&mut stream).await?;
+        let resp = read_metadata_response(stream).await?;
         match resp {
             MetadataResponse::Data {
                 piece,
@@ -277,9 +355,12 @@ fn piece_expected_len(piece_idx: usize, num_pieces: usize, total_size: u32) -> u
 /// peer's extension handshake (`Extended { ext_id: 0 }`). Bitfield /
 /// Have / KeepAlive / etc. are common before the ext handshake and
 /// must be skipped, not errored on.
-async fn read_extension_handshake(
-    stream: &mut TcpStream,
-) -> Result<crate::peer::extension::PeerExtensionInfo> {
+async fn read_extension_handshake<S>(
+    stream: &mut S,
+) -> Result<crate::peer::extension::PeerExtensionInfo>
+where
+    S: AsyncRead + Unpin,
+{
     loop {
         let frame = timeout(EXT_STEP_TIMEOUT, read_frame(stream, FETCH_MAX_FRAME_LEN))
             .await
@@ -306,7 +387,10 @@ async fn read_extension_handshake(
 /// Wait for the next ut_metadata response on the stream. Same
 /// filtering discipline as `read_extension_handshake` — non-Extended
 /// frames are skipped.
-async fn read_metadata_response(stream: &mut TcpStream) -> Result<MetadataResponse> {
+async fn read_metadata_response<S>(stream: &mut S) -> Result<MetadataResponse>
+where
+    S: AsyncRead + Unpin,
+{
     loop {
         let frame = timeout(EXT_STEP_TIMEOUT, read_frame(stream, FETCH_MAX_FRAME_LEN))
             .await
