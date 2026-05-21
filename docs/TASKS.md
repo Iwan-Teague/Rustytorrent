@@ -33,7 +33,6 @@ Outstanding gaps:
 
 - **PEX (BEP 11)** — supplemental peer-discovery channel; DHT already
   covers most of the same ground, so this is a small follow-up.
-- **Rate limiter** — no configurable max down/up speed yet.
 - **µTP (BEP 29)** — TCP only today; a UDP path would unlock the
   UDP-only slice of the swarm.
 

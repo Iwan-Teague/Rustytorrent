@@ -51,7 +51,7 @@ protection that A-tier doesn't touch.
 | C3 | **µTP (BEP 29) over UDP** | Connect to peers that only speak µTP. Today we only do TCP, so a slice of the swarm is unreachable. Adds a UDP path that needs its own proxy story (or hard-off in anonymous mode, like DHT). | ~600 lines |
 | C4 | **I2P transport** | Native anonymity overlay; tiny swarms but no Tor-style exit-node trust issues. Substantial work — different transport entirely. | ~1000+ lines |
 | C5 | **Custom MSE reserved-byte fingerprint matching** | Per-peer Tor circuit + matching the *exact* handshake byte pattern of (say) qBittorrent so traffic analysis can't distinguish us by client. | ~50 lines (depends on B5) |
-| C6 | **Tracker-frequency jitter + announce randomization** | Don't announce on a perfectly periodic schedule; add Gaussian jitter. Rotate the `peer_id` mid-session in anonymous mode every N hours. | ~30 lines |
+| ~~C6~~ | ~~**Tracker-frequency jitter**~~ — landed. Reannounce interval is jittered upward (+0-5% normal, +5-50% anonymous) so two clients on the same tracker don't share an identical cadence fingerprint. peer_id mid-session rotation is still open. | done |
 
 ---
 
@@ -94,3 +94,14 @@ in a follow-up pass — see git log. B2/B4 and C-tier remain open.
   as a no-spool variant for sessions that fit in RAM.
 - B4: per-IP connection-rate limit on the listener — low priority since
   `--anonymous` already disables the listener.
+
+### C-tier landed
+- ✅ C6 (partial): tracker-announce interval jitter (upward only, larger
+  window in anonymous mode) so two clients sharing a tracker don't share
+  an identical cadence fingerprint. Mid-session peer_id rotation remains
+  open.
+
+### Cross-cutting
+- ✅ Engine-wide bandwidth limiter (`--max-down` / `--max-up`) — token
+  bucket on Request issuance and `serve_request`. Not a security item
+  per se but lands alongside the C-tier work.

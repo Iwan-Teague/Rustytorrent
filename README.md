@@ -105,6 +105,8 @@ rustytorrent download <file> [OPTIONS]
   --paranoid                write encrypted spool only; plaintext never on disk
   --passphrase P            passphrase for --paranoid (or RUSTYTORRENT_PASSPHRASE env)
   --spool PATH              override the spool file path
+  --max-down N              cap inbound bandwidth, KiB/s (engine-wide)
+  --max-up N                cap outbound bandwidth, KiB/s (engine-wide)
 
 rustytorrent decrypt <file> [OPTIONS]      # extract a --paranoid spool afterwards
 

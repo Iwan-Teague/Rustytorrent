@@ -7,6 +7,7 @@ pub mod netbind;
 pub mod peer;
 pub mod peer_id;
 pub mod piece;
+pub mod ratelimit;
 pub mod scheduler;
 pub mod socks5;
 pub mod storage;

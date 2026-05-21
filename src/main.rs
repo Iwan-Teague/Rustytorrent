@@ -93,6 +93,15 @@ enum Commands {
         /// `<output>/<torrent-name>.rustytorrent-spool`.
         #[arg(long)]
         spool: Option<PathBuf>,
+        /// Cap download rate at this many KiB/s, engine-wide across
+        /// all peers. Unset = unthrottled. Gated at Request issuance.
+        #[arg(long)]
+        max_down: Option<u64>,
+        /// Cap upload rate at this many KiB/s. Unset = unthrottled.
+        /// Gated at `serve_request`; over-quota peer requests are
+        /// silently dropped (peer re-requests later).
+        #[arg(long)]
+        max_up: Option<u64>,
     },
     /// Download from a magnet URI (BEP 9 + BEP 10 + BEP 53). Bootstraps a
     /// peer pool via DHT and the magnet's own trackers, fetches the info
@@ -138,6 +147,12 @@ enum Commands {
         passphrase: Option<String>,
         #[arg(long)]
         spool: Option<PathBuf>,
+        /// Cap download rate, KiB/s. Same semantics as `download`.
+        #[arg(long)]
+        max_down: Option<u64>,
+        /// Cap upload rate, KiB/s.
+        #[arg(long)]
+        max_up: Option<u64>,
     },
     /// Decrypt a `--paranoid` spool into the real file layout using the
     /// same passphrase that produced it. Pieces that don't hash-match
@@ -193,6 +208,8 @@ async fn main() -> Result<()> {
             paranoid,
             passphrase,
             spool,
+            max_down,
+            max_up,
         } => {
             cmd_download(
                 file,
@@ -211,6 +228,8 @@ async fn main() -> Result<()> {
                 paranoid,
                 passphrase,
                 spool,
+                max_down,
+                max_up,
             )
             .await
         }
@@ -236,6 +255,8 @@ async fn main() -> Result<()> {
             paranoid,
             passphrase,
             spool,
+            max_down,
+            max_up,
         } => {
             cmd_magnet(
                 uri,
@@ -253,6 +274,8 @@ async fn main() -> Result<()> {
                 paranoid,
                 passphrase,
                 spool,
+                max_down,
+                max_up,
             )
             .await
         }
@@ -372,6 +395,8 @@ async fn cmd_download(
     paranoid: bool,
     passphrase: Option<String>,
     spool: Option<PathBuf>,
+    max_down: Option<u64>,
+    max_up: Option<u64>,
 ) -> Result<()> {
     let raw = tokio::fs::read(&path)
         .await
@@ -450,6 +475,13 @@ async fn cmd_download(
         println!("Paranoid:   on (encrypted spool, plaintext never written)");
     }
 
+    if let Some(d) = max_down {
+        println!("Max down:   {d} KiB/s");
+    }
+    if let Some(u) = max_up {
+        println!("Max up:     {u} KiB/s");
+    }
+
     let cfg = rustytorrent::engine::EngineConfig {
         output_dir: output,
         listen_port: port,
@@ -463,6 +495,8 @@ async fn cmd_download(
         paranoid,
         passphrase: resolved_passphrase,
         spool_path: spool,
+        max_down_bytes_per_sec: max_down.map(|k| k * 1024),
+        max_up_bytes_per_sec: max_up.map(|k| k * 1024),
         ..Default::default()
     };
     let engine = rustytorrent::engine::TorrentEngine::new(t, peer_id, cfg);
@@ -605,6 +639,8 @@ async fn cmd_magnet(
     paranoid: bool,
     passphrase: Option<String>,
     spool: Option<PathBuf>,
+    max_down: Option<u64>,
+    max_up: Option<u64>,
 ) -> Result<()> {
     let magnet = rustytorrent::magnet::MagnetLink::parse(&uri)?;
     println!(
@@ -757,6 +793,13 @@ async fn cmd_magnet(
         println!("Paranoid:   on (encrypted spool, plaintext never written)");
     }
 
+    if let Some(d) = max_down {
+        println!("Max down:   {d} KiB/s");
+    }
+    if let Some(u) = max_up {
+        println!("Max up:     {u} KiB/s");
+    }
+
     let cfg = rustytorrent::engine::EngineConfig {
         output_dir: output,
         listen_port: port,
@@ -771,6 +814,8 @@ async fn cmd_magnet(
         paranoid,
         passphrase: resolved_passphrase,
         spool_path: spool,
+        max_down_bytes_per_sec: max_down.map(|k| k * 1024),
+        max_up_bytes_per_sec: max_up.map(|k| k * 1024),
         ..Default::default()
     };
     let engine = rustytorrent::engine::TorrentEngine::new(t, peer_id, cfg);

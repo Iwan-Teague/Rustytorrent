@@ -14,6 +14,7 @@ use crate::peer::manager::PeerManager;
 use crate::peer::message::{bitfield_to_bytes, BLOCK_SIZE};
 use crate::peer_id::PeerId;
 use crate::piece::{verify_piece, BlockOutcome, Picker, PieceManager};
+use crate::ratelimit::TokenBucket;
 use crate::scheduler::ChokeScheduler;
 use crate::storage::{
     spawn_encrypted_storage_task, spawn_storage_task, Layout, PieceCache, StorageCommand,
@@ -75,6 +76,17 @@ pub struct EngineConfig {
     /// Where to place the encrypted spool file. Defaults to
     /// `<output_dir>/<torrent-name>.rustytorrent-spool` when unset.
     pub spool_path: Option<PathBuf>,
+    /// Cap inbound bandwidth at this many bytes/sec (engine-wide,
+    /// summed across all peers). `None` = unthrottled. Enforced by
+    /// gating outgoing `Request` issuance — when the bucket is dry we
+    /// stop asking for new blocks, so peers naturally back off.
+    pub max_down_bytes_per_sec: Option<u64>,
+    /// Cap outbound bandwidth at this many bytes/sec, engine-wide.
+    /// `None` = unthrottled. Enforced at `serve_request` — over-quota
+    /// requests are silently dropped (peer re-requests later) rather
+    /// than queued, which keeps the engine memory-bounded under bursty
+    /// load.
+    pub max_up_bytes_per_sec: Option<u64>,
 }
 
 impl Default for EngineConfig {
@@ -96,6 +108,8 @@ impl Default for EngineConfig {
             paranoid: false,
             passphrase: None,
             spool_path: None,
+            max_down_bytes_per_sec: None,
+            max_up_bytes_per_sec: None,
         }
     }
 }
@@ -123,6 +137,14 @@ pub struct TorrentEngine {
     /// Lets us serve all blocks of a popular piece from RAM after the first
     /// read instead of going back to disk per-block.
     upload_cache: PieceCache,
+    /// Engine-wide download throttle. Token bucket sized at 2 seconds
+    /// of burst over the configured rate; gated at Request-issue time
+    /// so peers naturally back off when we stop asking for blocks.
+    download_bucket: Option<TokenBucket>,
+    /// Engine-wide upload throttle. Gated at `serve_request`; over-quota
+    /// peer requests are dropped silently rather than queued so memory
+    /// stays bounded under bursty load.
+    upload_bucket: Option<TokenBucket>,
 }
 
 impl TorrentEngine {
@@ -133,6 +155,16 @@ impl TorrentEngine {
             torrent.num_pieces(),
         );
         let picker = Picker::new(torrent.num_pieces());
+        let download_bucket = cfg.max_down_bytes_per_sec.map(|r| {
+            let rate = r as f64;
+            // 2 s of burst headroom so the picker can refill the pipeline
+            // after a brief stall without the cap kicking in.
+            TokenBucket::new(rate * 2.0, rate)
+        });
+        let upload_bucket = cfg.max_up_bytes_per_sec.map(|r| {
+            let rate = r as f64;
+            TokenBucket::new(rate * 2.0, rate)
+        });
         Self {
             torrent: Arc::new(torrent),
             peer_id,
@@ -150,6 +182,8 @@ impl TorrentEngine {
             start_time: Instant::now(),
             last_progress: Instant::now(),
             upload_cache: PieceCache::default(),
+            download_bucket,
+            upload_bucket,
         }
     }
 
@@ -339,7 +373,14 @@ impl TorrentEngine {
             }
         };
 
-        let mut tracker_timer = interval(initial_interval.max(self.cfg.reannounce_min));
+        // C6 — jitter the reannounce cadence so two clients sharing the
+        // same tracker don't produce identical timing fingerprints. We
+        // never go below the tracker's stated min (or our floor),
+        // because trackers ban for re-announcing too fast.
+        let mut tracker_timer = interval(jittered_interval(
+            initial_interval.max(self.cfg.reannounce_min),
+            self.cfg.anonymous,
+        ));
         tracker_timer.tick().await; // first tick is immediate
 
         let mut choke_timer = interval(crate::scheduler::choke::CHOKE_INTERVAL);
@@ -413,7 +454,10 @@ impl TorrentEngine {
                     ).await;
                     match res {
                         Ok((_, resp)) => {
-                            tracker_timer = interval(resp.interval.max(self.cfg.reannounce_min));
+                            tracker_timer = interval(jittered_interval(
+                                resp.interval.max(self.cfg.reannounce_min),
+                                self.cfg.anonymous,
+                            ));
                             tracker_timer.tick().await;
                             let started = peers.try_connect_many(resp.peers);
                             if started > 0 {
@@ -720,6 +764,14 @@ impl TorrentEngine {
         let Some(peer_handle) = peers.handle(&addr).cloned() else {
             return;
         };
+        // Upload throttle: if the bucket can't cover this block, drop
+        // the request silently. Peers re-request on timeout, so the
+        // user-visible effect is just a smoother cap on outbound rate.
+        if let Some(b) = &mut self.upload_bucket {
+            if !b.try_consume(length as f64) {
+                return;
+            }
+        }
         // Optimistic accounting — the actual TCP send may fail, but the
         // approximation is good enough for choker rate tracking.
         self.uploaded = self.uploaded.saturating_add(length as u64);
@@ -893,6 +945,18 @@ impl TorrentEngine {
                     continue;
                 }
             };
+            // Download throttle: gate at the actual request site so we
+            // don't burn budget on iterations the picker bails out of.
+            // We charge `block.1` (the real block length, which is
+            // BLOCK_SIZE for everything except possibly the last block).
+            if let Some(b) = &mut self.download_bucket {
+                if !b.try_consume(block.1 as f64) {
+                    if !endgame {
+                        self.pm.release_block(piece_idx, block.0);
+                    }
+                    break;
+                }
+            }
             if let Some(h) = peers.handle(&addr) {
                 if h.try_send(PeerCommand::Request {
                     index: piece_idx as u32,
@@ -942,6 +1006,59 @@ impl TorrentEngine {
             "[progress] {done:>5}/{total} pieces  {pct:>5.1}%  down {:>7.1} KiB  {:>7.1} KiB/s",
             self.downloaded as f64 / 1024.0,
             rate / 1024.0,
+        );
+    }
+}
+
+/// Compute a jittered re-announce interval (C6).
+///
+/// We always jitter **upward** — going below the tracker's stated
+/// interval is the fastest path to a ban. In normal mode the
+/// adjustment is tiny (+0..5 %), just enough to defeat the trivial
+/// "same client announces every N seconds on the dot" timing
+/// fingerprint. In anonymous mode the window opens up to +5..50 %
+/// since the cost of an extra few minutes between announces is much
+/// cheaper than letting timing analysis link two of the user's
+/// torrents to the same machine.
+fn jittered_interval(base: Duration, anonymous: bool) -> Duration {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let pct: u32 = if anonymous {
+        rng.gen_range(5..=50)
+    } else {
+        rng.gen_range(0..=5)
+    };
+    base + base * pct / 100
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jitter_is_always_at_least_base() {
+        let base = Duration::from_secs(600);
+        for _ in 0..100 {
+            assert!(jittered_interval(base, false) >= base);
+            assert!(jittered_interval(base, true) >= base);
+        }
+    }
+
+    #[test]
+    fn anonymous_jitter_is_bigger_on_average() {
+        let base = Duration::from_secs(600);
+        let n = 200;
+        let avg_normal: u128 = (0..n)
+            .map(|_| jittered_interval(base, false).as_millis())
+            .sum::<u128>()
+            / n as u128;
+        let avg_anon: u128 = (0..n)
+            .map(|_| jittered_interval(base, true).as_millis())
+            .sum::<u128>()
+            / n as u128;
+        assert!(
+            avg_anon > avg_normal,
+            "expected anonymous avg ({avg_anon}ms) > normal avg ({avg_normal}ms)"
         );
     }
 }

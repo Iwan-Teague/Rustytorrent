@@ -12,6 +12,7 @@ use crate::peer::handshake::Handshake;
 use crate::peer::message::{read_frame, write_frame, Message, BLOCK_SIZE};
 use crate::peer::mse;
 use crate::peer_id::PeerId;
+use crate::ratelimit::TokenBucket;
 use crate::socks5::{self, ProxyConfig};
 
 pub const MAX_FRAME_LEN: u32 = (BLOCK_SIZE + 1024) * 2; // covers a 16 KiB piece + headroom
@@ -31,42 +32,6 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 /// task to ~3 MiB/s steady-state — well above any real seed rate.
 pub const REQUEST_TOKENS_PER_SEC: f64 = 200.0;
 pub const REQUEST_BURST_TOKENS: f64 = 50.0;
-
-/// Minimal token-bucket suitable for in-loop rate limiting. Not shared
-/// across tasks; each peer task owns its own bucket.
-struct TokenBucket {
-    capacity: f64,
-    rate_per_sec: f64,
-    tokens: f64,
-    last_refill: Instant,
-}
-
-impl TokenBucket {
-    fn new(capacity: f64, rate_per_sec: f64) -> Self {
-        Self {
-            capacity,
-            rate_per_sec,
-            // Start full so a brief opening burst doesn't get throttled.
-            tokens: capacity,
-            last_refill: Instant::now(),
-        }
-    }
-
-    fn try_consume(&mut self, n: f64) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        if elapsed > 0.0 {
-            self.tokens = (self.tokens + elapsed * self.rate_per_sec).min(self.capacity);
-            self.last_refill = now;
-        }
-        if self.tokens >= n {
-            self.tokens -= n;
-            true
-        } else {
-            false
-        }
-    }
-}
 
 /// Events emitted by a peer task to the engine.
 #[derive(Debug)]
@@ -696,47 +661,5 @@ fn msg_to_event(addr: SocketAddr, msg: Message) -> Option<PeerEvent> {
         // by sending them. BEP 10 spec explicitly permits ignoring
         // extension messages we don't understand.
         Message::Extended { .. } => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn token_bucket_starts_full() {
-        let mut b = TokenBucket::new(10.0, 1.0);
-        // Should be able to drain `capacity` immediately without waiting.
-        for _ in 0..10 {
-            assert!(b.try_consume(1.0));
-        }
-        assert!(!b.try_consume(1.0), "bucket should be empty after draining");
-    }
-
-    #[test]
-    fn token_bucket_refills_over_time() {
-        let mut b = TokenBucket::new(5.0, 1000.0);
-        // Drain it.
-        for _ in 0..5 {
-            assert!(b.try_consume(1.0));
-        }
-        assert!(!b.try_consume(1.0));
-        // Wait long enough for at least a few tokens to regenerate.
-        std::thread::sleep(Duration::from_millis(20));
-        // 1000 t/s × 20 ms = 20 tokens, capped at capacity 5.
-        assert!(b.try_consume(5.0), "refill should restore up to capacity");
-    }
-
-    #[test]
-    fn token_bucket_caps_at_capacity() {
-        let mut b = TokenBucket::new(3.0, 1000.0);
-        // Let it sit so it would notionally accumulate way past capacity.
-        std::thread::sleep(Duration::from_millis(50));
-        // Even after a long sleep, we should never get more than `capacity` tokens.
-        assert!(b.try_consume(3.0));
-        assert!(
-            !b.try_consume(0.1),
-            "bucket must not exceed its declared capacity"
-        );
     }
 }
