@@ -77,7 +77,7 @@ pub fn build_handshake_payload() -> Vec<u8> {
 }
 
 /// What we learn about a peer from their extension-handshake payload.
-/// Both fields are optional — peers may decline to advertise either.
+/// All fields are optional — peers may decline to advertise any of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerExtensionInfo {
     /// The numeric ID *they* expect us to use when we send them a
@@ -85,6 +85,10 @@ pub struct PeerExtensionInfo {
     /// `ut_metadata` in their `m` dict — they can't serve metadata to
     /// us, so we should drop the connection and try another peer.
     pub their_ut_metadata_id: Option<u8>,
+    /// The numeric ID *they* expect us to use when we send them a
+    /// `ut_pex` (BEP 11) extension message. `None` → they don't speak
+    /// PEX (or don't want to receive it from us); we just don't send.
+    pub their_ut_pex_id: Option<u8>,
     /// The size in bytes of their info dict, if they're seeding a
     /// torrent for which they have the metadata. Required for us to
     /// know how many `piece` requests to issue.
@@ -116,6 +120,15 @@ pub fn parse_handshake_payload(payload: &[u8]) -> Result<PeerExtensionInfo> {
             if id != 0 {
                 info.their_ut_metadata_id = Some(id as u8);
             }
+        }
+        if let Some(v) = m_dict.get(b"ut_pex".as_slice()) {
+            let id = v
+                .as_int()
+                .map_err(|_| Error::Network("ut_pex id not int".into()))?;
+            if (1..=255).contains(&id) {
+                info.their_ut_pex_id = Some(id as u8);
+            }
+            // id 0 disables ut_pex per BEP 10; skip without error.
         }
     }
     if let Some(sz) = dict.get(b"metadata_size".as_slice()) {

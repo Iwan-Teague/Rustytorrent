@@ -252,9 +252,47 @@ impl TorrentEngine {
                         "listening for incoming peers"
                     );
                     Some(tokio::spawn(async move {
+                        // B4 — per-source-IP rate limit on inbound
+                        // connection attempts. A token bucket per IP
+                        // (lazily created on first sight, GC'd to keep
+                        // the map bounded) caps how fast any single
+                        // source can hammer us. We *accept* the TCP
+                        // connection (we have to, to read the source
+                        // IP) and then drop it without engaging the
+                        // handshake when the bucket's dry.
+                        let mut buckets: HashMap<std::net::IpAddr, TokenBucket> = HashMap::new();
+                        let mut last_gc = Instant::now();
                         loop {
                             match l.accept().await {
                                 Ok((s, addr)) => {
+                                    let ip = addr.ip();
+                                    let bucket = buckets.entry(ip).or_insert_with(|| {
+                                        // 10 attempts in the first second,
+                                        // then 1/sec sustained — comfortably
+                                        // above any honest peer-discovery
+                                        // pattern, well below the rate a
+                                        // SYN-flood-style probe would use.
+                                        TokenBucket::new(10.0, 1.0)
+                                    });
+                                    if !bucket.try_consume(1.0) {
+                                        tracing::debug!(
+                                            target: "engine",
+                                            %addr,
+                                            "per-IP connect rate limit; dropping"
+                                        );
+                                        drop(s);
+                                        continue;
+                                    }
+                                    // Cheap GC: every 5 minutes drop
+                                    // bucket entries that look full
+                                    // (no recent activity → idle, safe
+                                    // to forget). Keeps the map from
+                                    // growing without bound on a
+                                    // long-lived seeding session.
+                                    if last_gc.elapsed() > Duration::from_secs(300) {
+                                        buckets.retain(|_, b| b.available() < 9.0);
+                                        last_gc = Instant::now();
+                                    }
                                     if incoming_tx.send((s, addr)).await.is_err() {
                                         break;
                                     }
@@ -445,6 +483,17 @@ impl TorrentEngine {
                     }
                 }
                 _ = tracker_timer.tick(), if !self.cfg.no_tracker => {
+                    // C5 — in anonymous mode, rotate the peer_id at
+                    // every reannounce. Existing TCP connections keep
+                    // their negotiated id (handshake already happened),
+                    // but every NEW dial after this point will use the
+                    // fresh id. Defeats the "same client signature
+                    // across unrelated swarms" correlation.
+                    if self.cfg.anonymous {
+                        self.peer_id = crate::peer_id::generate();
+                        peers.set_peer_id(self.peer_id);
+                        tracing::debug!(target: "engine", "anonymous mode: rotated peer_id for new dials");
+                    }
                     let req = self.announce_request(Event::None);
                     let res = tracker::announce_with_fallback(
                         &self.torrent.announce_list,

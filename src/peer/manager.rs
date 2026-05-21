@@ -65,6 +65,15 @@ impl PeerManager {
         self.bind_iface = iface;
     }
 
+    /// Replace the peer_id used on every *future* outgoing dial. Already-
+    /// established connections retain whichever id was negotiated at
+    /// their handshake. Used by anonymous mode to rotate the id between
+    /// reannounces (C5) so a long-lived session can't be correlated by
+    /// the same 20-byte client identifier appearing in unrelated swarms.
+    pub fn set_peer_id(&mut self, peer_id: PeerId) {
+        self.our_peer_id = peer_id;
+    }
+
     pub fn connected_count(&self) -> usize {
         self.peers.len()
     }

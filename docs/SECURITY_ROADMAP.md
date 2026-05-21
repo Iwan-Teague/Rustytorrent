@@ -92,14 +92,21 @@ in a follow-up pass — see git log. B2/B4 and C-tier remain open.
 ### B-tier remaining
 - B2: `--memory-only` (tmpfs / MAP_ANON) — partly subsumed by B1; left open
   as a no-spool variant for sessions that fit in RAM.
-- B4: per-IP connection-rate limit on the listener — low priority since
-  `--anonymous` already disables the listener.
+
+### B-tier additional
+- ✅ B4: per-source-IP rate limit on inbound listener (10-burst, 1/sec
+  sustained, lazy GC). Cheap SYN-flood defence on the public listener
+  for non-anonymous sessions.
 
 ### C-tier landed
-- ✅ C6 (partial): tracker-announce interval jitter (upward only, larger
-  window in anonymous mode) so two clients sharing a tracker don't share
-  an identical cadence fingerprint. Mid-session peer_id rotation remains
-  open.
+- ✅ C5: anonymous-mode peer_id rotation. At every reannounce in
+  anonymous mode the engine regenerates its peer_id; existing TCP
+  connections keep their already-handshaken id, but every new
+  outgoing dial after that point uses the fresh one — defeats the
+  "same 20-byte client signature across unrelated swarms" correlation.
+- ✅ C6: tracker-announce interval jitter (upward only, larger window
+  in anonymous mode) so two clients sharing a tracker don't share an
+  identical cadence fingerprint.
 
 ### Cross-cutting
 - ✅ Engine-wide bandwidth limiter (`--max-down` / `--max-up`) — token
