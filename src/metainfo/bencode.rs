@@ -64,6 +64,48 @@ impl BencodeValue {
             .get(key)
             .ok_or_else(|| Error::Bencode(format!("missing key: {}", String::from_utf8_lossy(key))))
     }
+
+    /// Serialize this value back to bencode bytes. BEP 3 requires dict
+    /// keys to appear in lexicographic byte order, which `BTreeMap`
+    /// already gives us. Used to encode BEP 10 extension-handshake dicts
+    /// and ut_metadata request/data/reject envelopes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_into(&mut out);
+        out
+    }
+
+    fn write_into(&self, out: &mut Vec<u8>) {
+        match self {
+            BencodeValue::Int(i) => {
+                out.push(b'i');
+                out.extend_from_slice(i.to_string().as_bytes());
+                out.push(b'e');
+            }
+            BencodeValue::Bytes(b) => {
+                out.extend_from_slice(b.len().to_string().as_bytes());
+                out.push(b':');
+                out.extend_from_slice(b);
+            }
+            BencodeValue::List(items) => {
+                out.push(b'l');
+                for item in items {
+                    item.write_into(out);
+                }
+                out.push(b'e');
+            }
+            BencodeValue::Dict(map) => {
+                out.push(b'd');
+                for (k, v) in map {
+                    out.extend_from_slice(k.len().to_string().as_bytes());
+                    out.push(b':');
+                    out.extend_from_slice(k);
+                    v.write_into(out);
+                }
+                out.push(b'e');
+            }
+        }
+    }
 }
 
 fn parse_value(input: &[u8]) -> Result<(BencodeValue, &[u8])> {
@@ -283,5 +325,52 @@ mod tests {
         assert_eq!(skip_value(b"4:spam").unwrap(), 6);
         assert_eq!(skip_value(b"le").unwrap(), 2);
         assert_eq!(skip_value(b"d3:cow3:mooe").unwrap(), 12);
+    }
+
+    #[test]
+    fn encode_int() {
+        assert_eq!(BencodeValue::Int(42).to_bytes(), b"i42e");
+        assert_eq!(BencodeValue::Int(-7).to_bytes(), b"i-7e");
+        assert_eq!(BencodeValue::Int(0).to_bytes(), b"i0e");
+    }
+
+    #[test]
+    fn encode_bytes() {
+        assert_eq!(BencodeValue::Bytes(b"spam".to_vec()).to_bytes(), b"4:spam");
+        assert_eq!(BencodeValue::Bytes(vec![]).to_bytes(), b"0:");
+    }
+
+    #[test]
+    fn encode_list() {
+        let v = BencodeValue::List(vec![
+            BencodeValue::Int(1),
+            BencodeValue::Bytes(b"a".to_vec()),
+        ]);
+        assert_eq!(v.to_bytes(), b"li1e1:ae");
+    }
+
+    #[test]
+    fn encode_dict_keys_in_lex_order() {
+        let mut d = BTreeMap::new();
+        // Insert out of order — BTreeMap should re-order; bencode requires lex order.
+        d.insert(b"zz".to_vec(), BencodeValue::Int(2));
+        d.insert(b"aa".to_vec(), BencodeValue::Int(1));
+        assert_eq!(BencodeValue::Dict(d).to_bytes(), b"d2:aai1e2:zzi2ee");
+    }
+
+    #[test]
+    fn encode_roundtrips_through_parse() {
+        let mut d = BTreeMap::new();
+        d.insert(b"m".to_vec(), {
+            let mut m = BTreeMap::new();
+            m.insert(b"ut_metadata".to_vec(), BencodeValue::Int(2));
+            m.insert(b"ut_pex".to_vec(), BencodeValue::Int(1));
+            BencodeValue::Dict(m)
+        });
+        d.insert(b"v".to_vec(), BencodeValue::Bytes(b"rustytorrent".to_vec()));
+        let original = BencodeValue::Dict(d);
+        let bytes = original.to_bytes();
+        let parsed = BencodeValue::parse_all(&bytes).unwrap();
+        assert_eq!(parsed, original);
     }
 }

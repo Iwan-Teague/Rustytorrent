@@ -1,6 +1,7 @@
 pub mod dht;
 pub mod engine;
 pub mod error;
+pub mod magnet;
 pub mod metainfo;
 pub mod netbind;
 pub mod peer;

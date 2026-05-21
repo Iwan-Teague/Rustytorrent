@@ -186,10 +186,13 @@ impl TorrentEngine {
 
         // B5 — advertise the extensions we actually implement in the
         // handshake reserved bytes. Anonymous mode never enables DHT, so
-        // we honor that here too.
+        // we honor that here too. BEP 10 (extension protocol) is always
+        // on — it's how we accept ut_metadata/ut_pex without breaking
+        // peers that expect us to opt in.
         let dht_enabled = self.cfg.enable_dht && !self.cfg.anonymous;
         crate::peer::handshake::set_extension_bytes(crate::peer::handshake::extension_bytes_from(
             dht_enabled,
+            true,
         ));
 
         let (peer_event_tx, mut peer_event_rx) = mpsc::channel::<PeerEvent>(1024);

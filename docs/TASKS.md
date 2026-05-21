@@ -29,11 +29,13 @@ End-to-end download is verified by:
   256 KiB ≈ 8 MiB) collapses 16 disk reads per piece down to 1 when leechers
   pull all blocks of the same piece sequentially.
 
-Outstanding gaps (Phase 7 work):
+Outstanding gaps:
 
-- **No magnet links (parses `xt=urn:btih:…` URIs)** — torrent file required.
-- **No extension protocol (BEP 10) / PEX (BEP 11) / ut_metadata (BEP 9)**.
+- **PEX (BEP 11)** — supplemental peer-discovery channel; DHT already
+  covers most of the same ground, so this is a small follow-up.
 - **Rate limiter** — no configurable max down/up speed yet.
+- **µTP (BEP 29)** — TCP only today; a UDP path would unlock the
+  UDP-only slice of the swarm.
 
 ---
 
@@ -271,23 +273,24 @@ Outstanding gaps (Phase 7 work):
 - [x] Incoming dispatch: peek first byte; `\x13` → plain, anything else → MSE
 - [x] Integration verified against real Debian swarm (14 % of 755 MiB in 60 s at ~1.9 MB/s)
 
-### Extension Protocol (BEP 10)
-- [ ] Set reserved bytes in handshake to signal support — 30m
-- [ ] Implement `extended` message (ID 20) framing — 2h
-- [ ] Exchange extension handshake with `m` dict of supported extensions — 2h
+### Extension Protocol (BEP 10)  ✅
+- [x] Set reserved bytes in handshake to signal support (byte 5 = 0x10) ([`peer/handshake.rs`](../src/peer/handshake.rs))
+- [x] `extended` message (id 20) framing in the wire codec ([`peer/message.rs`](../src/peer/message.rs))
+- [x] Exchange extension handshake with `m` dict of supported extensions ([`peer/extension.rs`](../src/peer/extension.rs))
 
 ### Peer Exchange / PEX (BEP 11)
 - [ ] Implement `ut_pex` extension message — 3h
 - [ ] Integrate new peers from PEX into PeerManager — 1h
 
-### ut_metadata (BEP 9)
-- [ ] Implement `ut_metadata` extension: `request`, `data`, `reject` messages — 4h
-- [ ] Reassemble and verify metadata from peers — 2h
+### ut_metadata (BEP 9)  ✅
+- [x] `ut_metadata` request/data/reject codec ([`peer/extension.rs`](../src/peer/extension.rs))
+- [x] Reassemble + SHA-1 verify metadata against magnet info_hash ([`peer/metadata_fetch.rs`](../src/peer/metadata_fetch.rs))
 
-### Magnet Links
-- [ ] Parse magnet URI (`xt=urn:btih:...`, `tr=...`, `dn=...`) — 1h
-- [ ] Bootstrap from trackers in magnet URI — 1h
-- [ ] Fetch metadata via ut_metadata before starting download — 1h
+### Magnet Links  ✅
+- [x] Parse magnet URI (`xt=urn:btih:` hex/base32, `tr=`, `dn=`) ([`magnet.rs`](../src/magnet.rs))
+- [x] Bootstrap from trackers in magnet URI ([`main.rs` `cmd_magnet`](../src/main.rs))
+- [x] Bootstrap from DHT for trackerless magnets
+- [x] Fetch metadata via ut_metadata before handing off to the engine
 
 ### DHT (BEP 5)  ✅
 - [x] 160-bit `NodeId` + XOR distance + bucket index ([`dht/node_id.rs`](../src/dht/node_id.rs))

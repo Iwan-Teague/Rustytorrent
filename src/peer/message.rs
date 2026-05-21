@@ -29,6 +29,14 @@ pub enum Message {
         begin: u32,
         length: u32,
     },
+    /// BEP 10 extension protocol envelope. `ext_id == 0` is the handshake;
+    /// other values are per-peer-negotiated IDs from the peer's `m` dict.
+    /// The `payload` is whatever the extension specifies (typically a
+    /// bencoded dict for ut_metadata / ut_pex / etc).
+    Extended {
+        ext_id: u8,
+        payload: Vec<u8>,
+    },
 }
 
 impl Message {
@@ -41,6 +49,8 @@ impl Message {
     pub const ID_REQUEST: u8 = 6;
     pub const ID_PIECE: u8 = 7;
     pub const ID_CANCEL: u8 = 8;
+    /// BEP 10 — extension protocol envelope.
+    pub const ID_EXTENDED: u8 = 20;
 
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -79,6 +89,12 @@ impl Message {
                 p.extend_from_slice(&begin.to_be_bytes());
                 p.extend_from_slice(&length.to_be_bytes());
                 Self::tag(Self::ID_CANCEL, &p)
+            }
+            Message::Extended { ext_id, payload } => {
+                let mut p = Vec::with_capacity(1 + payload.len());
+                p.push(*ext_id);
+                p.extend_from_slice(payload);
+                Self::tag(Self::ID_EXTENDED, &p)
             }
         }
     }
@@ -124,6 +140,15 @@ impl Message {
                 Ok(Message::Piece { index, begin, data })
             }
             Self::ID_CANCEL => Self::decode_index_begin_length(p, Message::ID_CANCEL),
+            Self::ID_EXTENDED => {
+                if p.is_empty() {
+                    return Err(Error::Network("extended payload empty".into()));
+                }
+                Ok(Message::Extended {
+                    ext_id: p[0],
+                    payload: p[1..].to_vec(),
+                })
+            }
             other => Err(Error::Network(format!("unknown message id {other}"))),
         }
     }
@@ -318,6 +343,20 @@ mod tests {
             begin: 32768,
             length: 16384,
         });
+    }
+
+    #[test]
+    fn extended_roundtrip() {
+        roundtrip(Message::Extended {
+            ext_id: 0,
+            payload: b"d1:md11:ut_metadatai2eee".to_vec(),
+        });
+    }
+
+    #[test]
+    fn extended_rejects_empty_payload() {
+        // Frame body is just [ID_EXTENDED] with no ext_id byte — must error.
+        assert!(Message::decode(&[Message::ID_EXTENDED]).is_err());
     }
 
     #[test]

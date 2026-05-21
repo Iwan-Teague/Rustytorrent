@@ -27,7 +27,8 @@ Cross-platform: Linux, macOS (Intel + Apple Silicon), and Windows.
 | LRU upload-cache (32 pieces) to keep popular pieces in RAM | ✅ |
 | SOCKS5 outgoing proxy (RFC 1928 + RFC 1929 auth) for peer + tracker traffic | ✅ |
 | `--anonymous` bundle: DHT off, listener off, ephemeral peer_id, `port=0` | ✅ |
-| Magnet links / extension protocol (BEP 10/11/9) | ❌ — Phase 7 work |
+| BEP 10 extension protocol + BEP 9 ut_metadata + magnet links | ✅ |
+| BEP 11 PEX (peer exchange) | ❌ — small follow-up |
 | Web UI | ❌ — Phase 8 work |
 
 ## Quick start
@@ -57,6 +58,16 @@ cargo build --release
 # Direct peer, no network discovery (good for self-tests)
 ./target/release/rustytorrent download file.torrent --output ~/Downloads \
     --no-tracker --peer 1.2.3.4:6881
+```
+
+### Magnet links
+
+```sh
+# Magnet URI — fetches metadata from peers via DHT + ut_metadata, then
+# downloads as usual. DHT defaults to on for magnets.
+./target/release/rustytorrent magnet \
+    "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=demo&tr=udp://tracker.example:6969" \
+    --output ~/Downloads
 ```
 
 ### Anonymity
@@ -100,6 +111,16 @@ rustytorrent decrypt <file> [OPTIONS]      # extract a --paranoid spool afterwar
   --output DIR              destination directory (default: ".")
   --spool PATH              encrypted spool to read
   --passphrase P            same passphrase used to produce the spool
+
+rustytorrent magnet <URI> [OPTIONS]        # download from a magnet link
+
+  --output DIR              destination directory (default: ".")
+  --port N                  listen port (default: 6881)
+  --peer host:port          extra bootstrap peer (repeatable)
+  --dht                     enable DHT (default: true for magnets)
+  --encrypt                 force outgoing MSE/PE post-bootstrap
+  --socks5 …                same SOCKS5 / anonymity flags as `download`
+  --paranoid / --passphrase / --spool   same encrypted-spool flags as `download`
 ```
 
 ## Documentation

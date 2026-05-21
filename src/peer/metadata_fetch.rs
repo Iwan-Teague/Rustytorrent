@@ -1,0 +1,360 @@
+//! Magnet-link bootstrap: fetch a torrent's info dict via BEP 9
+//! (ut_metadata) from any peer that supports BEP 10 (extension
+//! protocol).
+//!
+//! ## Flow
+//!
+//! 1. Caller supplies the info_hash (from `magnet:?xt=urn:btih:…`),
+//!    a pool of candidate peer addresses (typically from DHT
+//!    `get_peers` + the magnet's `tr=` trackers), and optional proxy.
+//! 2. We dial up to `MAX_CONCURRENT_FETCH` peers in parallel. Each
+//!    attempt does a plain BT handshake, an extension handshake, and a
+//!    loop of `ut_metadata` requests for piece 0..N until the full
+//!    info dict is reassembled.
+//! 3. First peer to deliver a complete dict that SHA1-hashes to the
+//!    expected info_hash wins; the rest are cancelled.
+//!
+//! ## Why this is its own module
+//!
+//! It deliberately doesn't touch `PeerManager` or the regular
+//! `post_handshake_loop`. The bootstrap is a one-shot — the
+//! connections we open here are torn down after we have the metadata.
+//! Mixing the regular engine flow (rarest-first picker, choker,
+//! storage task, etc.) with a single-message bootstrap loop would
+//! force a lot of awkward conditional state. Self-contained is cheaper.
+//!
+//! ## MSE on bootstrap
+//!
+//! For now we only attempt the plain handshake — if a peer is
+//! MSE-only we just skip them and try the next. The magnet pool is
+//! typically large enough that this isn't blocking. Layering MSE on
+//! the bootstrap path is a small follow-up.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use sha1::{Digest, Sha1};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::time::timeout;
+
+use crate::error::{Error, Result};
+use crate::peer::extension::{
+    build_handshake_payload, build_metadata_request, parse_handshake_payload,
+    parse_metadata_response, MetadataResponse, EXT_HANDSHAKE_ID, METADATA_PIECE_SIZE,
+    OUR_UT_METADATA_ID,
+};
+use crate::peer::handshake::{supports_extension_protocol, Handshake, HANDSHAKE_LEN};
+use crate::peer::message::{read_frame, write_message, Message, BLOCK_SIZE};
+use crate::peer_id::PeerId;
+use crate::socks5::{self, ProxyConfig};
+
+/// Cap parallel dials during bootstrap. Higher = faster on average but
+/// more connections opened that we'll just drop after the first success.
+const MAX_CONCURRENT_FETCH: usize = 16;
+/// Per-peer step timeouts. Generous because peers behind slow links
+/// genuinely take seconds to respond to ut_metadata requests.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const EXT_STEP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Whole-pool timeout. If we can't get the metadata from any peer in
+/// this window, give up — the swarm probably can't serve it (rare).
+const OVERALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Max frame size we'll accept from the peer during bootstrap. The
+/// largest legitimate frame is a `Data` ut_metadata response carrying
+/// one 16 KiB metadata piece plus its bencode envelope — give a little
+/// headroom for the dict.
+const FETCH_MAX_FRAME_LEN: u32 = (METADATA_PIECE_SIZE as u32) + 1024;
+
+/// Fetch the info dict bytes for `info_hash` from any peer in
+/// `peer_pool`. Returns the raw bencoded info dict (which the caller
+/// is responsible for verifying — we already SHA1-checked it here,
+/// but the caller still needs to parse it into a `TorrentFile`).
+///
+/// Errors:
+/// - `Network` if every peer attempt failed within the overall
+///   timeout. This is the magnet equivalent of "DHT returned nothing
+///   useful + tracker had no peers".
+pub async fn fetch_metadata(
+    info_hash: [u8; 20],
+    peer_pool: Vec<SocketAddr>,
+    proxy: Option<ProxyConfig>,
+) -> Result<Vec<u8>> {
+    if peer_pool.is_empty() {
+        return Err(Error::Network(
+            "magnet bootstrap: no candidate peers (DHT + trackers returned nothing)".into(),
+        ));
+    }
+
+    let our_peer_id = crate::peer_id::generate();
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCH));
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+
+    let mut handles = Vec::with_capacity(peer_pool.len());
+    for addr in peer_pool {
+        let sem = sem.clone();
+        let tx = tx.clone();
+        let proxy = proxy.clone();
+        let handle = tokio::spawn(async move {
+            let permit = match sem.acquire().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            match try_fetch_from(addr, info_hash, our_peer_id, proxy.as_ref()).await {
+                Ok(bytes) => {
+                    // tx is bounded(1) — first sender wins; subsequent
+                    // sends short-circuit because the receiver has
+                    // already taken the value and the channel closes.
+                    let _ = tx.send(bytes).await;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "magnet",
+                        %addr,
+                        error = %e,
+                        "ut_metadata fetch attempt failed"
+                    );
+                }
+            }
+            drop(permit);
+        });
+        handles.push(handle);
+    }
+    drop(tx);
+
+    let outcome = match timeout(OVERALL_TIMEOUT, rx.recv()).await {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Err(Error::Network(
+            "magnet bootstrap: every peer attempt failed".into(),
+        )),
+        Err(_) => Err(Error::Network(format!(
+            "magnet bootstrap: timed out after {}s",
+            OVERALL_TIMEOUT.as_secs()
+        ))),
+    };
+    // Cancel any still-in-flight attempts — we have what we needed (or gave up).
+    for h in handles {
+        h.abort();
+    }
+    outcome
+}
+
+async fn try_fetch_from(
+    addr: SocketAddr,
+    info_hash: [u8; 20],
+    our_peer_id: PeerId,
+    proxy: Option<&ProxyConfig>,
+) -> Result<Vec<u8>> {
+    let mut stream = dial(addr, proxy).await?;
+    let _ = stream.set_nodelay(true);
+
+    // BT handshake. Must verify info_hash AND check the peer's
+    // BEP 10 reserved bit — without it they can't speak ut_metadata.
+    let theirs = match timeout(
+        HANDSHAKE_TIMEOUT,
+        Handshake::perform_outgoing(&mut stream, info_hash, our_peer_id),
+    )
+    .await
+    {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => return Err(Error::Network(format!("bt handshake: {e}"))),
+        Err(_) => return Err(Error::Network("bt handshake timeout".into())),
+    };
+    if !supports_extension_protocol(&theirs.reserved) {
+        return Err(Error::Network(
+            "peer lacks BEP 10 extension protocol".into(),
+        ));
+    }
+
+    // Extension handshake exchange. Send ours; read theirs from the
+    // post-handshake message stream (filtering out unrelated Bitfield/
+    // Have/etc. that legitimately also appear early).
+    let our_ext = Message::Extended {
+        ext_id: EXT_HANDSHAKE_ID,
+        payload: build_handshake_payload(),
+    };
+    write_message(&mut stream, &our_ext)
+        .await
+        .map_err(|e| Error::Network(format!("ext handshake write: {e}")))?;
+
+    let peer_info = read_extension_handshake(&mut stream).await?;
+    let their_id = peer_info.their_ut_metadata_id.ok_or_else(|| {
+        Error::Network("peer doesn't advertise ut_metadata in extension handshake".into())
+    })?;
+    let total_size = peer_info.metadata_size.ok_or_else(|| {
+        Error::Network("peer doesn't advertise metadata_size — can't bootstrap".into())
+    })?;
+
+    // Request pieces 0..ceil(total_size / METADATA_PIECE_SIZE), assemble.
+    let num_pieces = (total_size as usize).div_ceil(METADATA_PIECE_SIZE);
+    let mut assembled = vec![0u8; total_size as usize];
+    let mut received = vec![false; num_pieces];
+
+    while received.iter().any(|&got| !got) {
+        let next = received
+            .iter()
+            .position(|&got| !got)
+            .expect("loop guard says at least one is missing");
+        let req = Message::Extended {
+            ext_id: their_id,
+            payload: build_metadata_request(next as u32),
+        };
+        write_message(&mut stream, &req)
+            .await
+            .map_err(|e| Error::Network(format!("ut_metadata request: {e}")))?;
+
+        let resp = read_metadata_response(&mut stream).await?;
+        match resp {
+            MetadataResponse::Data {
+                piece,
+                total_size: peer_total,
+                data,
+            } => {
+                if peer_total != total_size {
+                    return Err(Error::Network(format!(
+                        "peer total_size changed mid-fetch: was {total_size}, now {peer_total}"
+                    )));
+                }
+                let idx = piece as usize;
+                if idx >= num_pieces {
+                    return Err(Error::Network(format!(
+                        "piece {idx} out of range (have {num_pieces})"
+                    )));
+                }
+                let expected_len = piece_expected_len(idx, num_pieces, total_size);
+                if data.len() != expected_len {
+                    return Err(Error::Network(format!(
+                        "piece {idx} length {} != expected {expected_len}",
+                        data.len()
+                    )));
+                }
+                let off = idx * METADATA_PIECE_SIZE;
+                assembled[off..off + expected_len].copy_from_slice(&data);
+                received[idx] = true;
+            }
+            MetadataResponse::Reject { piece } => {
+                return Err(Error::Network(format!(
+                    "peer rejected ut_metadata piece {piece}"
+                )));
+            }
+            MetadataResponse::Other => {
+                // Some other ut_metadata message variant — keep waiting.
+                continue;
+            }
+        }
+    }
+
+    // Hash-verify against the magnet's info_hash. This is the whole
+    // point — anyone can ship bytes, but only a peer who actually has
+    // the right metadata can produce something that hashes correctly.
+    let mut hasher = Sha1::new();
+    hasher.update(&assembled);
+    let got: [u8; 20] = hasher.finalize().into();
+    if got != info_hash {
+        return Err(Error::Network(format!(
+            "fetched metadata hash mismatch: peer {addr} sent garbage that didn't verify"
+        )));
+    }
+    Ok(assembled)
+}
+
+fn piece_expected_len(piece_idx: usize, num_pieces: usize, total_size: u32) -> usize {
+    if piece_idx + 1 == num_pieces {
+        let r = (total_size as usize) % METADATA_PIECE_SIZE;
+        if r == 0 {
+            METADATA_PIECE_SIZE
+        } else {
+            r
+        }
+    } else {
+        METADATA_PIECE_SIZE
+    }
+}
+
+/// Read messages from the post-handshake stream until we get the
+/// peer's extension handshake (`Extended { ext_id: 0 }`). Bitfield /
+/// Have / KeepAlive / etc. are common before the ext handshake and
+/// must be skipped, not errored on.
+async fn read_extension_handshake(
+    stream: &mut TcpStream,
+) -> Result<crate::peer::extension::PeerExtensionInfo> {
+    loop {
+        let frame = timeout(EXT_STEP_TIMEOUT, read_frame(stream, FETCH_MAX_FRAME_LEN))
+            .await
+            .map_err(|_| Error::Network("ext handshake read timeout".into()))?
+            .map_err(|e| Error::Network(format!("ext handshake frame: {e}")))?;
+        if frame.is_empty() {
+            continue; // keep-alive
+        }
+        let msg = Message::decode(&frame)?;
+        if let Message::Extended { ext_id, payload } = msg {
+            if ext_id == EXT_HANDSHAKE_ID {
+                return parse_handshake_payload(&payload);
+            }
+            // An ut_metadata data response showing up before the
+            // handshake would be a protocol violation; tolerate by
+            // continuing to wait.
+            continue;
+        }
+        // Bitfield, Have, KeepAlive, Choke, etc. — irrelevant to us
+        // during the bootstrap. Drop and loop.
+    }
+}
+
+/// Wait for the next ut_metadata response on the stream. Same
+/// filtering discipline as `read_extension_handshake` — non-Extended
+/// frames are skipped.
+async fn read_metadata_response(stream: &mut TcpStream) -> Result<MetadataResponse> {
+    loop {
+        let frame = timeout(EXT_STEP_TIMEOUT, read_frame(stream, FETCH_MAX_FRAME_LEN))
+            .await
+            .map_err(|_| Error::Network("ut_metadata read timeout".into()))?
+            .map_err(|e| Error::Network(format!("ut_metadata frame: {e}")))?;
+        if frame.is_empty() {
+            continue;
+        }
+        let msg = Message::decode(&frame)?;
+        if let Message::Extended { ext_id, payload } = msg {
+            if ext_id == OUR_UT_METADATA_ID {
+                return parse_metadata_response(&payload);
+            }
+            // A second extension handshake (some clients send a fresh
+            // one on every connection event) or an ext_id we didn't
+            // assign — ignore.
+            continue;
+        }
+        // Other BT messages aren't relevant; keep waiting.
+    }
+}
+
+async fn dial(addr: SocketAddr, proxy: Option<&ProxyConfig>) -> Result<TcpStream> {
+    match proxy {
+        Some(p) => {
+            let effective = p.for_dial();
+            timeout(DIAL_TIMEOUT, socks5::connect(&effective, addr))
+                .await
+                .map_err(|_| Error::Network(format!("socks5 dial {addr}: timeout")))?
+                .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}")))
+        }
+        None => timeout(DIAL_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| Error::Network(format!("connect {addr}: timeout")))?
+            .map_err(|e| Error::Network(format!("connect {addr}: {e}"))),
+    }
+}
+
+// `HANDSHAKE_LEN` is part of the `handshake` API; reference it so the
+// `unused_imports` lint doesn't fire when this module is read
+// independently (it implicitly bounds our peer-frame buffer
+// expectations even though we delegate the buffer to `read_exact`
+// inside the codec).
+#[allow(dead_code)]
+const _: usize = HANDSHAKE_LEN;
+
+// `BLOCK_SIZE` from message.rs is the BT block size, distinct from
+// `METADATA_PIECE_SIZE` — kept as a constant import to document that
+// the two happen to coincide at 16 KiB but mean different things.
+#[allow(dead_code)]
+const _: u32 = BLOCK_SIZE;

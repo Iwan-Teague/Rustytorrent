@@ -90,6 +90,44 @@ impl TorrentFile {
         self.info.piece_hashes.len()
     }
 
+    /// Construct a `TorrentFile` from the raw bytes of an info dict
+    /// (typically fetched via BEP 9 ut_metadata for a magnet link), an
+    /// already-known info_hash (from the magnet's `xt=urn:btih:…`),
+    /// and a flat list of tracker URLs (from the magnet's `tr=`). The
+    /// caller has already SHA1-verified the info_bytes against the
+    /// info_hash; we recompute it here as a belt-and-braces check and
+    /// reject if they disagree.
+    pub fn from_info_dict_bytes(
+        info_bytes: &[u8],
+        info_hash: [u8; 20],
+        trackers: Vec<String>,
+    ) -> Result<Self> {
+        let recomputed = sha1_of(info_bytes);
+        if recomputed != info_hash {
+            return Err(Error::Bencode(format!(
+                "info dict sha1 {:x?} doesn't match magnet info_hash {:x?}",
+                recomputed, info_hash
+            )));
+        }
+        let info_v = BencodeValue::parse_all(info_bytes)?;
+        let info = Info::from_value(&info_v)?;
+        // Magnet trackers go into announce-list as a single tier so
+        // they're tried in order. `announce` (single-tracker field)
+        // stays empty — `trackers()` already de-duplicates across
+        // both shapes.
+        let announce_list = if trackers.is_empty() {
+            Vec::new()
+        } else {
+            vec![trackers]
+        };
+        Ok(TorrentFile {
+            info_hash,
+            announce: None,
+            announce_list,
+            info,
+        })
+    }
+
     pub fn trackers(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for tier in &self.announce_list {
@@ -199,9 +237,13 @@ impl Info {
 /// the original encoder produced — re-encoding would risk a hash mismatch.
 fn compute_info_hash(input: &[u8]) -> Result<[u8; 20]> {
     let info_slice = find_info_slice(input)?;
+    Ok(sha1_of(info_slice))
+}
+
+fn sha1_of(bytes: &[u8]) -> [u8; 20] {
     let mut hasher = Sha1::new();
-    hasher.update(info_slice);
-    Ok(hasher.finalize().into())
+    hasher.update(bytes);
+    hasher.finalize().into()
 }
 
 fn find_info_slice(input: &[u8]) -> Result<&[u8]> {

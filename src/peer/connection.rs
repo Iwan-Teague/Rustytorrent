@@ -689,6 +689,13 @@ fn msg_to_event(addr: SocketAddr, msg: Message) -> Option<PeerEvent> {
             begin,
             length,
         }),
+        // BEP 10 extension messages aren't handled by the engine loop —
+        // ut_metadata is consumed by the dedicated magnet-bootstrap
+        // fetcher, and ut_pex isn't wired in yet. Silently drop so peers
+        // that advertise these extensions don't blow up the connection
+        // by sending them. BEP 10 spec explicitly permits ignoring
+        // extension messages we don't understand.
+        Message::Extended { .. } => None,
     }
 }
 

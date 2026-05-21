@@ -25,6 +25,10 @@ static EXTENSION_BYTES: OnceLock<[u8; 8]> = OnceLock::new();
 
 /// BEP 5 (DHT) advertises support via byte 7 bit 0 — value `0x01`.
 const RESERVED_BIT_DHT: u8 = 0x01;
+/// BEP 10 (extension protocol) advertises support via byte 5 bit 4 —
+/// value `0x10`. Setting this opts us into receiving `Extended` (id 20)
+/// messages and into the magnet-link / ut_metadata flow.
+const RESERVED_BIT_EXTENSION: u8 = 0x10;
 
 /// Install the reserved-bytes pattern for the rest of the process. Idempotent
 /// (first call wins); the engine calls this once during `run()`. Subsequent
@@ -37,12 +41,24 @@ pub fn set_extension_bytes(bytes: [u8; 8]) {
 /// Build the reserved-bytes byte string from a flag set. Kept separate from
 /// `set_extension_bytes` so tests can exercise the bit layout without
 /// touching the global.
-pub fn extension_bytes_from(dht_enabled: bool) -> [u8; 8] {
+///
+/// `extension_protocol` is always advertised once the BEP 10 implementation
+/// landed — it's how peers know we can speak `ut_metadata` (BEP 9) for
+/// magnet-link bootstrap. DHT is conditional on the runtime flag.
+pub fn extension_bytes_from(dht_enabled: bool, extension_protocol: bool) -> [u8; 8] {
     let mut r = [0u8; 8];
     if dht_enabled {
         r[7] |= RESERVED_BIT_DHT;
     }
+    if extension_protocol {
+        r[5] |= RESERVED_BIT_EXTENSION;
+    }
     r
+}
+
+/// True iff the peer advertised the BEP 10 extension-protocol reserved bit.
+pub fn supports_extension_protocol(reserved: &[u8; 8]) -> bool {
+    reserved[5] & RESERVED_BIT_EXTENSION != 0
 }
 
 fn current_extension_bytes() -> [u8; 8] {
@@ -178,19 +194,35 @@ mod tests {
     }
 
     #[test]
-    fn extension_bytes_dht_off_is_all_zero() {
-        assert_eq!(extension_bytes_from(false), [0u8; 8]);
+    fn extension_bytes_all_off_is_all_zero() {
+        assert_eq!(extension_bytes_from(false, false), [0u8; 8]);
     }
 
     #[test]
     fn extension_bytes_dht_on_sets_last_byte_bit_zero() {
-        let bytes = extension_bytes_from(true);
-        assert_eq!(bytes[0..7], [0u8; 7]);
+        let bytes = extension_bytes_from(true, false);
+        assert_eq!(bytes[5], 0);
+        assert_eq!(bytes[6], 0);
         assert_eq!(
             bytes[7] & 0x01,
             0x01,
             "DHT bit (byte 7, value 0x01) must be set"
         );
+    }
+
+    #[test]
+    fn extension_bytes_extension_protocol_sets_byte_5_bit_4() {
+        let bytes = extension_bytes_from(false, true);
+        assert_eq!(bytes[5] & 0x10, 0x10, "BEP 10 bit (byte 5, value 0x10)");
+        assert_eq!(bytes[7], 0);
+    }
+
+    #[test]
+    fn supports_extension_protocol_detects_the_bit() {
+        let yes = extension_bytes_from(false, true);
+        let no = extension_bytes_from(false, false);
+        assert!(supports_extension_protocol(&yes));
+        assert!(!supports_extension_protocol(&no));
     }
 
     #[test]

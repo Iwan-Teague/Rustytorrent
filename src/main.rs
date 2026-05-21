@@ -94,6 +94,51 @@ enum Commands {
         #[arg(long)]
         spool: Option<PathBuf>,
     },
+    /// Download from a magnet URI (BEP 9 + BEP 10 + BEP 53). Bootstraps a
+    /// peer pool via DHT and the magnet's own trackers, fetches the info
+    /// dict via ut_metadata, hash-verifies against the magnet's
+    /// info_hash, then runs the regular download engine.
+    Magnet {
+        /// `magnet:?xt=urn:btih:…&tr=…` URI.
+        uri: String,
+        #[arg(short, long, default_value = ".")]
+        output: PathBuf,
+        #[arg(long, default_value_t = 6881)]
+        port: u16,
+        /// Extra peer to dial directly (host:port). Useful when the
+        /// magnet's trackers are dead and DHT is slow to find peers.
+        #[arg(long)]
+        peer: Vec<String>,
+        /// Force MSE/PE on outgoing dials after the metadata is fetched.
+        /// The bootstrap itself currently only attempts plain.
+        #[arg(long, default_value_t = false)]
+        encrypt: bool,
+        /// Enable DHT. Defaults to ON for magnets — without trackers in
+        /// the URI and no DHT, there are no peers to bootstrap from.
+        #[arg(long, default_value_t = true)]
+        dht: bool,
+        #[arg(long)]
+        socks5: Option<String>,
+        #[arg(long, requires = "socks5")]
+        socks5_user: Option<String>,
+        #[arg(long, requires = "socks5_user")]
+        socks5_pass: Option<String>,
+        /// Anonymous bundle. Requires --socks5. Magnet bootstrap then
+        /// relies on the magnet's `tr=` trackers (DHT is off in
+        /// anonymous mode); if there are none, bootstrap fails.
+        #[arg(long, default_value_t = false, requires = "socks5")]
+        anonymous: bool,
+        #[arg(long)]
+        bind_iface: Option<String>,
+        #[arg(long, default_value_t = false, requires = "socks5")]
+        tor_isolation: bool,
+        #[arg(long, default_value_t = false)]
+        paranoid: bool,
+        #[arg(long)]
+        passphrase: Option<String>,
+        #[arg(long)]
+        spool: Option<PathBuf>,
+    },
     /// Decrypt a `--paranoid` spool into the real file layout using the
     /// same passphrase that produced it. Pieces that don't hash-match
     /// (e.g. half-written or under a different key) are skipped.
@@ -175,6 +220,42 @@ async fn main() -> Result<()> {
             spool,
             passphrase,
         } => cmd_decrypt(file, output, spool, passphrase).await,
+        Commands::Magnet {
+            uri,
+            output,
+            port,
+            peer,
+            encrypt,
+            dht,
+            socks5,
+            socks5_user,
+            socks5_pass,
+            anonymous,
+            bind_iface,
+            tor_isolation,
+            paranoid,
+            passphrase,
+            spool,
+        } => {
+            cmd_magnet(
+                uri,
+                output,
+                port,
+                peer,
+                encrypt,
+                dht,
+                socks5,
+                socks5_user,
+                socks5_pass,
+                anonymous,
+                bind_iface,
+                tor_isolation,
+                paranoid,
+                passphrase,
+                spool,
+            )
+            .await
+        }
     }
 }
 
@@ -466,6 +547,234 @@ async fn cmd_decrypt(
         .ok();
     let _ = handle.await;
 
+    println!("Done.");
+    Ok(())
+}
+
+/// Resolve a `--socks5` flag value to a `ProxyConfig`, including
+/// optional credentials and the Tor isolation knob. Shared by
+/// `cmd_download` and `cmd_magnet`.
+async fn resolve_proxy(
+    socks5: Option<String>,
+    socks5_user: Option<String>,
+    socks5_pass: Option<String>,
+    tor_isolation: bool,
+) -> Result<Option<rustytorrent::socks5::ProxyConfig>> {
+    let Some(spec) = socks5 else {
+        return Ok(None);
+    };
+    let addr = tokio::net::lookup_host(spec.as_str())
+        .await
+        .with_context(|| format!("resolving SOCKS5 proxy {spec}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("SOCKS5 proxy {spec} did not resolve"))?;
+    let credentials = match (socks5_user, socks5_pass) {
+        (Some(u), Some(p)) => Some(rustytorrent::socks5::Credentials {
+            username: u,
+            password: p,
+        }),
+        (None, None) => None,
+        _ => anyhow::bail!("--socks5-user and --socks5-pass must be set together"),
+    };
+    if tor_isolation {
+        println!("Proxy:      {addr} (SOCKS5, Tor stream isolation on)");
+    } else {
+        println!("Proxy:      {addr} (SOCKS5)");
+    }
+    Ok(Some(rustytorrent::socks5::ProxyConfig {
+        addr,
+        credentials,
+        isolation: tor_isolation,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_magnet(
+    uri: String,
+    output: PathBuf,
+    port: u16,
+    extra_peers: Vec<String>,
+    encrypt: bool,
+    dht: bool,
+    socks5: Option<String>,
+    socks5_user: Option<String>,
+    socks5_pass: Option<String>,
+    anonymous: bool,
+    bind_iface: Option<String>,
+    tor_isolation: bool,
+    paranoid: bool,
+    passphrase: Option<String>,
+    spool: Option<PathBuf>,
+) -> Result<()> {
+    let magnet = rustytorrent::magnet::MagnetLink::parse(&uri)?;
+    println!(
+        "Magnet:     {} ({} trackers)",
+        magnet
+            .display_name
+            .as_deref()
+            .unwrap_or("(no display name)"),
+        magnet.trackers.len()
+    );
+    println!("Info hash:  {}", hex(&magnet.info_hash));
+
+    // Pre-advertise BEP 10 so the bootstrap dials send the right
+    // reserved bits before the engine has a chance to install them.
+    // OnceLock makes the engine's later call a no-op.
+    rustytorrent::peer::handshake::set_extension_bytes(
+        rustytorrent::peer::handshake::extension_bytes_from(dht && !anonymous, true),
+    );
+
+    let proxy = resolve_proxy(socks5, socks5_user, socks5_pass, tor_isolation).await?;
+
+    let peer_id = if anonymous {
+        rustytorrent::peer_id::generate()
+    } else {
+        rustytorrent::peer_id::load_or_generate(&rustytorrent::peer_id::default_path())
+    };
+
+    // Build the bootstrap peer pool: --peer args, magnet trackers,
+    // and DHT lookups (when DHT is permitted).
+    let mut pool: Vec<std::net::SocketAddr> = Vec::new();
+    for s in &extra_peers {
+        let addr: std::net::SocketAddr = s
+            .parse()
+            .with_context(|| format!("invalid peer address: {s}"))?;
+        pool.push(addr);
+    }
+
+    // Tracker bootstrap: each `tr=` URL gets one announce. We bail
+    // peer-by-peer rather than fail the whole thing on a dead tracker.
+    if !magnet.trackers.is_empty() {
+        println!("Bootstrap:  querying {} tracker(s)", magnet.trackers.len());
+        let req = rustytorrent::tracker::AnnounceRequest {
+            info_hash: magnet.info_hash,
+            peer_id,
+            // BEP 27 hint: port=0 in anonymous mode so we don't
+            // advertise a listen socket we aren't running.
+            port: if anonymous { 0 } else { port },
+            uploaded: 0,
+            downloaded: 0,
+            // We don't know `left` yet — magnet stage. Use 0 (the
+            // common convention for "metadata not yet known").
+            left: 0,
+            event: rustytorrent::tracker::Event::Started,
+            num_want: 50,
+        };
+        for url in &magnet.trackers {
+            match rustytorrent::tracker::announce_with_proxy(url, &req, proxy.as_ref()).await {
+                Ok(resp) => {
+                    tracing::info!(
+                        target: "magnet",
+                        tracker = %url,
+                        peers = resp.peers.len(),
+                        "tracker bootstrap"
+                    );
+                    pool.extend(resp.peers);
+                }
+                Err(e) => {
+                    tracing::warn!(target: "magnet", tracker = %url, error = %e, "tracker failed");
+                }
+            }
+        }
+    }
+
+    // DHT bootstrap. Skipped under --anonymous (UDP can't ride SOCKS5
+    // and would leak our IP) and when the caller explicitly turned it
+    // off. We spawn a temporary DHT just for the bootstrap; the
+    // engine spawns its own DHT later when it takes over.
+    let dht_handle = if dht && !anonymous {
+        println!("Bootstrap:  warming up DHT (allow ~10s)");
+        let bootstrap = vec![
+            "router.bittorrent.com:6881".to_string(),
+            "router.utorrent.com:6881".to_string(),
+            "dht.transmissionbt.com:6881".to_string(),
+        ];
+        match rustytorrent::dht::Dht::spawn(port, bootstrap, None).await {
+            Ok(d) => {
+                // Brief warm-up so get_peers has something to work
+                // with. Engine's persistent table would be better
+                // but we don't want to fight it for the same UDP
+                // port across two spawns.
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let dht_peers = d.get_peers(magnet.info_hash).await;
+                tracing::info!(
+                    target: "magnet",
+                    peers = dht_peers.len(),
+                    "dht bootstrap"
+                );
+                pool.extend(dht_peers);
+                Some(d)
+            }
+            Err(e) => {
+                tracing::warn!(target: "magnet", error = %e, "dht spawn failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    pool.sort();
+    pool.dedup();
+    println!("Bootstrap:  {} candidate peer(s)", pool.len());
+
+    let info_bytes =
+        rustytorrent::peer::metadata_fetch::fetch_metadata(magnet.info_hash, pool, proxy.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("magnet bootstrap: {e}"))?;
+    println!("Fetched:    {} bytes of info dict", info_bytes.len());
+
+    // Shut down the bootstrap DHT before the engine spawns its own on
+    // the same port.
+    if let Some(d) = dht_handle {
+        d.shutdown().await;
+    }
+
+    let t = rustytorrent::metainfo::TorrentFile::from_info_dict_bytes(
+        &info_bytes,
+        magnet.info_hash,
+        magnet.trackers,
+    )?;
+    println!(
+        "Downloading {} ({})",
+        t.info.name,
+        format_size(t.total_length())
+    );
+    println!("Output dir: {}", output.display());
+
+    if anonymous {
+        println!("Anonymous:  on (DHT off, listener off, peer_id ephemeral, port=0 in announces)");
+    }
+    if let Some(iface) = &bind_iface {
+        println!("Bound to:   {iface} (VPN kill switch)");
+    }
+    let resolved_passphrase = if paranoid {
+        Some(resolve_passphrase(passphrase)?)
+    } else {
+        None
+    };
+    if paranoid {
+        println!("Paranoid:   on (encrypted spool, plaintext never written)");
+    }
+
+    let cfg = rustytorrent::engine::EngineConfig {
+        output_dir: output,
+        listen_port: port,
+        // No --no-tracker for magnet: announce-list came from the URI
+        // and is the user's only way to influence the tracker set.
+        no_tracker: false,
+        force_outgoing_mse: encrypt,
+        enable_dht: dht,
+        proxy,
+        anonymous,
+        bind_iface,
+        paranoid,
+        passphrase: resolved_passphrase,
+        spool_path: spool,
+        ..Default::default()
+    };
+    let engine = rustytorrent::engine::TorrentEngine::new(t, peer_id, cfg);
+    engine.run().await?;
     println!("Done.");
     Ok(())
 }
