@@ -254,7 +254,7 @@ impl TorrentEngine {
             drop(incoming_tx);
             None
         } else {
-            match tokio::net::TcpListener::bind(("0.0.0.0", self.cfg.listen_port)).await {
+            match bind_dual_stack_listener(self.cfg.listen_port) {
                 Ok(l) => {
                     tracing::info!(
                         target: "engine",
@@ -1196,6 +1196,58 @@ impl TorrentEngine {
             self.downloaded as f64 / 1024.0,
             rate / 1024.0,
         );
+    }
+}
+
+/// Bind the inbound peer listener as a dual-stack socket so both IPv4
+/// and IPv6 peers can reach us on the same port.
+///
+/// Why not just `tokio::net::TcpListener::bind("[::]:port")`? On Linux
+/// that already accepts both families by default, but macOS / *BSD
+/// usually set `IPV6_V6ONLY=1` and Windows always does, so a naive
+/// `[::]` bind silently rejects IPv4 peers. We use `socket2` to flip
+/// `set_only_v6(false)` explicitly before binding, which is the
+/// portable recipe.
+///
+/// Falls back to an IPv4-only listener on `0.0.0.0` if the IPv6 bind
+/// fails — the most common failure is a host without IPv6 configured
+/// at all, in which case losing IPv6 reach is preferable to losing
+/// the listener entirely.
+fn bind_dual_stack_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    let try_v6 = || -> std::io::Result<tokio::net::TcpListener> {
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        sock.set_only_v6(false)?;
+        sock.set_reuse_address(true)?;
+        let addr: std::net::SocketAddr = (std::net::Ipv6Addr::UNSPECIFIED, port).into();
+        sock.bind(&addr.into())?;
+        sock.listen(128)?;
+        sock.set_nonblocking(true)?;
+        tokio::net::TcpListener::from_std(sock.into())
+    };
+    match try_v6() {
+        Ok(l) => Ok(l),
+        Err(e) => {
+            tracing::debug!(
+                target: "engine",
+                error = %e,
+                "IPv6 dual-stack bind failed; falling back to IPv4-only"
+            );
+            let sock = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            sock.set_reuse_address(true)?;
+            let addr: std::net::SocketAddr = (std::net::Ipv4Addr::UNSPECIFIED, port).into();
+            sock.bind(&addr.into())?;
+            sock.listen(128)?;
+            sock.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(sock.into())
+        }
     }
 }
 
