@@ -145,6 +145,14 @@ pub struct TorrentEngine {
     /// peer requests are dropped silently rather than queued so memory
     /// stays bounded under bursty load.
     upload_bucket: Option<TokenBucket>,
+    /// BEP 11 — for each peer that advertised a `ut_pex` id in their
+    /// extension handshake, the id we should use when sending them
+    /// outgoing PEX. Populated on `PeerEvent::ExtensionHandshake`.
+    peer_pex_ids: HashMap<SocketAddr, u8>,
+    /// BEP 11 — last set of peer addresses we shared with each peer via
+    /// PEX. Used to compute `added`/`dropped` deltas on the next send so
+    /// we never duplicate information that's already in flight.
+    peer_pex_snapshot: HashMap<SocketAddr, std::collections::HashSet<SocketAddr>>,
 }
 
 impl TorrentEngine {
@@ -184,6 +192,8 @@ impl TorrentEngine {
             upload_cache: PieceCache::default(),
             download_bucket,
             upload_bucket,
+            peer_pex_ids: HashMap::new(),
+            peer_pex_snapshot: HashMap::new(),
         }
     }
 
@@ -464,6 +474,13 @@ impl TorrentEngine {
         dht_timer.tick().await;
         let mut dht_full_period = false;
 
+        // BEP 11 outgoing PEX cadence — every 60 s we broadcast
+        // added/dropped diffs to peers that advertised a ut_pex id.
+        // Anonymous mode never populates `peer_pex_ids`, so the tick
+        // is a no-op there.
+        let mut pex_timer = interval(Duration::from_secs(60));
+        pex_timer.tick().await;
+
         let result: Result<()> = loop {
             tokio::select! {
                 Some(ev) = peer_event_rx.recv() => {
@@ -572,6 +589,9 @@ impl TorrentEngine {
                         dht_timer = interval(Duration::from_secs(300));
                         dht_timer.tick().await;
                     }
+                }
+                _ = pex_timer.tick(), if !self.peer_pex_ids.is_empty() => {
+                    self.send_pex_to_all(&peers).await;
                 }
                 else => break Ok(()),
             }
@@ -776,6 +796,20 @@ impl TorrentEngine {
                 // already dispatched the read is a no-op. If the peer disconnects
                 // before our Piece send completes, the send simply fails.
             }
+            PeerEvent::ExtensionHandshake {
+                addr,
+                their_ut_pex_id,
+            } => {
+                // Track the peer's ut_pex id so the periodic PEX timer
+                // knows where to address outgoing peer-exchange
+                // messages. Anonymous mode skips this entirely — we
+                // never want to broadcast our peer set in that posture.
+                if !self.cfg.anonymous {
+                    if let Some(id) = their_ut_pex_id {
+                        self.peer_pex_ids.insert(addr, id);
+                    }
+                }
+            }
             PeerEvent::Pex {
                 addr,
                 peers: pex_peers,
@@ -914,6 +948,54 @@ impl TorrentEngine {
     /// Clean up engine-side state for a peer that has gone away (disconnected,
     /// banned, or kicked for a protocol violation). Used by the Disconnected
     /// handler and the bad-block path.
+    /// Push BEP 11 PEX updates to every peer that advertised a ut_pex
+    /// id. The payload for each peer is the delta vs the snapshot we
+    /// last sent them: `added` is the currently-connected set minus
+    /// what they already knew, `dropped` is what they knew but is no
+    /// longer connected. We never include the recipient in their own
+    /// PEX list. Empty deltas skip the send.
+    async fn send_pex_to_all(&mut self, peers: &PeerManager) {
+        use std::collections::HashSet;
+        let current: HashSet<SocketAddr> = peers.addrs().copied().collect();
+        // Snapshot the (addr, id) pairs so we can mutate self.peer_pex_snapshot
+        // inside the loop without aliasing.
+        let targets: Vec<(SocketAddr, u8)> =
+            self.peer_pex_ids.iter().map(|(a, id)| (*a, *id)).collect();
+        for (addr, ext_id) in targets {
+            // Don't tell a peer about themselves.
+            let visible: HashSet<SocketAddr> =
+                current.iter().copied().filter(|a| *a != addr).collect();
+            let last = self
+                .peer_pex_snapshot
+                .get(&addr)
+                .cloned()
+                .unwrap_or_default();
+
+            let mut added: Vec<SocketAddr> = visible.difference(&last).copied().collect();
+            let mut dropped: Vec<SocketAddr> = last.difference(&visible).copied().collect();
+            if added.is_empty() && dropped.is_empty() {
+                continue;
+            }
+            added.truncate(crate::peer::extension::PEX_MAX_ENTRIES_PER_DIRECTION);
+            dropped.truncate(crate::peer::extension::PEX_MAX_ENTRIES_PER_DIRECTION);
+            let payload = crate::peer::extension::build_pex_payload(&added, &dropped);
+
+            if let Some(handle) = peers.handle(&addr) {
+                if handle
+                    .try_send(PeerCommand::Extension { ext_id, payload })
+                    .is_err()
+                {
+                    // Channel full / closed — drop the snapshot update
+                    // too so the next tick recomputes from scratch.
+                    continue;
+                }
+            }
+            // Record what we just shared so the next tick's diff is
+            // accurate even when peers connect/disconnect mid-cycle.
+            self.peer_pex_snapshot.insert(addr, visible);
+        }
+    }
+
     fn cleanup_disconnected_peer(&mut self, addr: SocketAddr) {
         self.peer_choking_us.remove(&addr);
         self.am_interested.remove(&addr);
@@ -925,6 +1007,10 @@ impl TorrentEngine {
         }
         self.picker.forget_peer(&addr);
         self.choker.forget(&addr);
+        // BEP 11 — drop PEX bookkeeping for the departing peer so the
+        // map doesn't grow unbounded over a long-lived seeding session.
+        self.peer_pex_ids.remove(&addr);
+        self.peer_pex_snapshot.remove(&addr);
     }
 
     async fn handle_storage_event(&mut self, ev: StorageEvent, peers: &mut PeerManager) {

@@ -88,6 +88,14 @@ pub enum PeerEvent {
         addr: SocketAddr,
         peers: Vec<SocketAddr>,
     },
+    /// BEP 10 extension handshake parsed out of an Extended { ext_id: 0 }
+    /// frame. Lets the engine learn which numeric IDs this peer wants us
+    /// to use when we send them extension messages (specifically:
+    /// `ut_pex` for outgoing PEX).
+    ExtensionHandshake {
+        addr: SocketAddr,
+        their_ut_pex_id: Option<u8>,
+    },
 }
 
 /// Commands the engine sends to a single peer task.
@@ -114,6 +122,13 @@ pub enum PeerCommand {
         data: Vec<u8>,
     },
     Bitfield(Vec<u8>),
+    /// BEP 10 — engine wants this peer to receive a generic extension
+    /// message. Used today for outgoing BEP 11 PEX; the `ext_id` is
+    /// the peer's advertised id for the extension in question.
+    Extension {
+        ext_id: u8,
+        payload: Vec<u8>,
+    },
 }
 
 /// Outbound side of a peer task — the engine keeps one of these per peer.
@@ -586,12 +601,35 @@ where
                     );
                     continue;
                 }
-                // BEP 11 PEX: when we receive an Extended message at our
-                // declared ut_pex id, parse + forward the added peers to
-                // the engine. Other extension ids (handshake echoes,
-                // ut_metadata requests we don't serve) are silently
-                // dropped — same as msg_to_event's catch-all.
+                // BEP 10 / 11 — the extension protocol envelope. We
+                // care about two specific ext_ids:
+                //   - 0: the peer's extension handshake, which tells us
+                //     which numeric id THEY want us to use when sending
+                //     them ut_pex. We bubble that up so the engine can
+                //     start sending outgoing PEX.
+                //   - OUR_UT_PEX_ID: incoming PEX peer-list updates,
+                //     which we parse + forward to the engine for
+                //     `PeerManager::try_connect_many`.
+                // Anything else (ut_metadata requests we don't serve,
+                // unknown extensions) is silently dropped per the spec.
                 if let Message::Extended { ext_id, payload } = &msg {
+                    if *ext_id == crate::peer::extension::EXT_HANDSHAKE_ID {
+                        match crate::peer::extension::parse_handshake_payload(payload) {
+                            Ok(info) => {
+                                let ev = PeerEvent::ExtensionHandshake {
+                                    addr,
+                                    their_ut_pex_id: info.their_ut_pex_id,
+                                };
+                                if read_event_tx.send(ev).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(target: "peer", %addr, error = %e, "ext handshake parse");
+                            }
+                        }
+                        continue;
+                    }
                     if *ext_id == crate::peer::extension::OUR_UT_PEX_ID {
                         match crate::peer::extension::parse_pex(payload) {
                             Ok(pex) if !pex.added.is_empty() => {
@@ -645,6 +683,8 @@ where
                         PeerCommand::Piece { index, begin, data } =>
                             Message::Piece { index, begin, data }.encode(),
                         PeerCommand::Bitfield(b) => Message::Bitfield(b).encode(),
+                        PeerCommand::Extension { ext_id, payload } =>
+                            Message::Extended { ext_id, payload }.encode(),
                     };
                     writer.write_all(&bytes).await
                         .map_err(|e| Error::Network(format!("write: {e}")))?;

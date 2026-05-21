@@ -233,6 +233,95 @@ pub fn parse_metadata_response(payload: &[u8]) -> Result<MetadataResponse> {
     }
 }
 
+/// BEP 11 recommends capping each ut_pex message to ~50 added entries
+/// per direction to keep payload size sane and avoid flooding peers.
+pub const PEX_MAX_ENTRIES_PER_DIRECTION: usize = 50;
+
+/// Build an outgoing ut_pex payload covering the `added` and `dropped`
+/// peer sets. IPv4 and IPv6 entries are split into the spec-required
+/// `added`/`added6` (and `dropped`/`dropped6`) fields. Flags bytes are
+/// all-zero today — we don't yet advertise per-peer encryption or
+/// seed-status hints in the PEX channel.
+///
+/// Empty `added` AND empty `dropped` still produces a valid (but
+/// useless) payload — the caller should skip the send in that case.
+pub fn build_pex_payload(
+    added: &[std::net::SocketAddr],
+    dropped: &[std::net::SocketAddr],
+) -> Vec<u8> {
+    let (added4, added6) = split_v4_v6(added);
+    let (dropped4, dropped6) = split_v4_v6(dropped);
+
+    let mut d = BTreeMap::new();
+
+    if !added4.is_empty() {
+        d.insert(
+            b"added".to_vec(),
+            BencodeValue::Bytes(encode_compact_v4(&added4)),
+        );
+        d.insert(
+            b"added.f".to_vec(),
+            BencodeValue::Bytes(vec![0u8; added4.len()]),
+        );
+    }
+    if !added6.is_empty() {
+        d.insert(
+            b"added6".to_vec(),
+            BencodeValue::Bytes(encode_compact_v6(&added6)),
+        );
+        d.insert(
+            b"added6.f".to_vec(),
+            BencodeValue::Bytes(vec![0u8; added6.len()]),
+        );
+    }
+    if !dropped4.is_empty() {
+        d.insert(
+            b"dropped".to_vec(),
+            BencodeValue::Bytes(encode_compact_v4(&dropped4)),
+        );
+    }
+    if !dropped6.is_empty() {
+        d.insert(
+            b"dropped6".to_vec(),
+            BencodeValue::Bytes(encode_compact_v6(&dropped6)),
+        );
+    }
+
+    BencodeValue::Dict(d).to_bytes()
+}
+
+fn split_v4_v6(
+    addrs: &[std::net::SocketAddr],
+) -> (Vec<std::net::SocketAddrV4>, Vec<std::net::SocketAddrV6>) {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for a in addrs {
+        match a {
+            std::net::SocketAddr::V4(a4) => v4.push(*a4),
+            std::net::SocketAddr::V6(a6) => v6.push(*a6),
+        }
+    }
+    (v4, v6)
+}
+
+fn encode_compact_v4(addrs: &[std::net::SocketAddrV4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(addrs.len() * 6);
+    for a in addrs {
+        out.extend_from_slice(&a.ip().octets());
+        out.extend_from_slice(&a.port().to_be_bytes());
+    }
+    out
+}
+
+fn encode_compact_v6(addrs: &[std::net::SocketAddrV6]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(addrs.len() * 18);
+    for a in addrs {
+        out.extend_from_slice(&a.ip().octets());
+        out.extend_from_slice(&a.port().to_be_bytes());
+    }
+    out
+}
+
 /// BEP 11 ut_pex payload parsed out of an incoming Extended message.
 /// We only need the `added` peer list — the dropped list is for clients
 /// that want to maintain a view of "still alive in this swarm"
@@ -441,6 +530,30 @@ mod tests {
         let bytes = BencodeValue::Dict(d).to_bytes();
         let pex = parse_pex(&bytes).unwrap();
         assert!(pex.added.is_empty());
+    }
+
+    #[test]
+    fn build_pex_payload_is_parseable_round_trip() {
+        let added: Vec<std::net::SocketAddr> = vec![
+            "1.2.3.4:5678".parse().unwrap(),
+            "[::1]:6881".parse().unwrap(),
+        ];
+        let dropped: Vec<std::net::SocketAddr> = vec!["9.9.9.9:80".parse().unwrap()];
+        let bytes = build_pex_payload(&added, &dropped);
+        // Round-trip through parse_pex: only `added`/`added6` are
+        // checked; dropped goes into separate keys we don't surface
+        // in PexMessage today.
+        let pex = parse_pex(&bytes).unwrap();
+        assert_eq!(pex.added.len(), 2);
+        assert!(pex.added.contains(&"1.2.3.4:5678".parse().unwrap()));
+        assert!(pex.added.contains(&"[::1]:6881".parse().unwrap()));
+    }
+
+    #[test]
+    fn build_pex_payload_empty_added_and_dropped_yields_empty_dict() {
+        let bytes = build_pex_payload(&[], &[]);
+        // Empty dict bencodes as "de" (start dict, end dict).
+        assert_eq!(bytes, b"de");
     }
 
     #[test]

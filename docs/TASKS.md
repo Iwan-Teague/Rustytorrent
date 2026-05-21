@@ -31,12 +31,10 @@ End-to-end download is verified by:
 
 Outstanding gaps:
 
-- **Outgoing PEX** — we receive PEX from peers but don't yet send it
-  back. The receive path is the higher-leverage half (free peers); the
-  send path is a polite reciprocal that some clients reward in their
-  peer-selection algorithms.
 - **µTP (BEP 29)** — TCP only today; a UDP path would unlock the
   UDP-only slice of the swarm.
+- **MSE on magnet bootstrap** — `metadata_fetch` currently only tries
+  plain BT for the bootstrap dial; MSE-only peers are skipped.
 
 ---
 
@@ -279,11 +277,11 @@ Outstanding gaps:
 - [x] `extended` message (id 20) framing in the wire codec ([`peer/message.rs`](../src/peer/message.rs))
 - [x] Exchange extension handshake with `m` dict of supported extensions ([`peer/extension.rs`](../src/peer/extension.rs))
 
-### Peer Exchange / PEX (BEP 11)
+### Peer Exchange / PEX (BEP 11)  ✅
 - [x] `ut_pex` payload parser (IPv4 `added` + IPv6 `added6`, drops zero-port entries) ([`peer/extension.rs`](../src/peer/extension.rs))
 - [x] Post-BT-handshake extension-handshake exchange so peers know our `ut_pex` id ([`peer/connection.rs`](../src/peer/connection.rs) `post_handshake_loop`)
 - [x] Engine handles `PeerEvent::Pex` and forwards to `PeerManager::try_connect_many` ([`engine.rs`](../src/engine.rs))
-- [ ] Outgoing PEX (we send peer-list updates) — small follow-up
+- [x] Outgoing PEX — every 60 s the engine builds added/dropped deltas per peer (tracking last snapshot, capped at 50 entries/direction) and ships via `PeerCommand::Extension`. Skipped under `--anonymous`.
 
 ### ut_metadata (BEP 9)  ✅
 - [x] `ut_metadata` request/data/reject codec ([`peer/extension.rs`](../src/peer/extension.rs))

@@ -28,7 +28,7 @@ Cross-platform: Linux, macOS (Intel + Apple Silicon), and Windows.
 | SOCKS5 outgoing proxy (RFC 1928 + RFC 1929 auth) for peer + tracker traffic | ✅ |
 | `--anonymous` bundle: DHT off, listener off, ephemeral peer_id, `port=0` | ✅ |
 | BEP 10 extension protocol + BEP 9 ut_metadata + magnet links | ✅ |
-| BEP 11 PEX — receive incoming peer-exchange messages, forward to PeerManager | ✅ |
+| BEP 11 PEX — bidirectional: receive incoming peer lists + send delta updates every 60 s | ✅ |
 | Engine-wide bandwidth limiter (`--max-down`, `--max-up`) | ✅ |
 | Web UI | ❌ — Phase 8 work |
 
