@@ -41,20 +41,27 @@ pub const METADATA_PIECE_SIZE: usize = 16384;
 /// sending us an extension message. The peer's IDs for the same
 /// extensions are negotiated separately in their handshake.
 pub const OUR_UT_METADATA_ID: u8 = 1;
+/// Our assigned id for incoming BEP 11 (ut_pex) messages.
+pub const OUR_UT_PEX_ID: u8 = 2;
 
 /// The well-known ext_id for the extension handshake itself.
 pub const EXT_HANDSHAKE_ID: u8 = 0;
 
-/// Build our outgoing extension-handshake payload. The single field that
-/// matters today is `m.ut_metadata` — telling peers which numeric ID to
-/// use when shipping us `ut_metadata` messages. `v` ("client version
-/// string") is conventional and helps debugging.
+/// Build our outgoing extension-handshake payload. The `m` dict tells
+/// peers which numeric IDs to use when sending us specific extension
+/// messages — we advertise both `ut_metadata` and `ut_pex` so peers
+/// know how to address ut_metadata requests (which we silently
+/// ignore today — no harm) and ut_pex peer-list updates (which we
+/// parse and route to the engine's PeerManager).
+///
+/// `v` ("client version string") is conventional and helps debugging.
 pub fn build_handshake_payload() -> Vec<u8> {
     let mut m_map = BTreeMap::new();
     m_map.insert(
         b"ut_metadata".to_vec(),
         BencodeValue::Int(OUR_UT_METADATA_ID as i64),
     );
+    m_map.insert(b"ut_pex".to_vec(), BencodeValue::Int(OUR_UT_PEX_ID as i64));
 
     let mut root = BTreeMap::new();
     root.insert(b"m".to_vec(), BencodeValue::Dict(m_map));
@@ -213,6 +220,54 @@ pub fn parse_metadata_response(payload: &[u8]) -> Result<MetadataResponse> {
     }
 }
 
+/// BEP 11 ut_pex payload parsed out of an incoming Extended message.
+/// We only need the `added` peer list — the dropped list is for clients
+/// that want to maintain a view of "still alive in this swarm"
+/// per-source, which we don't bother tracking. IPv4 ("added") and IPv6
+/// ("added6") families are both returned, deduplicated by the caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PexMessage {
+    pub added: Vec<std::net::SocketAddr>,
+}
+
+/// Parse a ut_pex extension payload. Malformed entries are skipped
+/// rather than fatal — peers vary in how strict they are about packing
+/// the compact-peer lists.
+pub fn parse_pex(payload: &[u8]) -> Result<PexMessage> {
+    let v = BencodeValue::parse_all(payload)
+        .map_err(|e| Error::Network(format!("ut_pex bencode: {e}")))?;
+    let d = v
+        .as_dict()
+        .map_err(|_| Error::Network("ut_pex not a dict".into()))?;
+
+    let mut added: Vec<std::net::SocketAddr> = Vec::new();
+    // IPv4: 6-byte entries (4 addr + 2 port BE).
+    if let Some(BencodeValue::Bytes(bytes)) = d.get(b"added".as_slice()) {
+        for chunk in bytes.chunks_exact(6) {
+            let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+            if port == 0 {
+                continue; // 0 means "no listen socket"; can't dial it
+            }
+            added.push(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port));
+        }
+    }
+    // IPv6: 18-byte entries (16 addr + 2 port BE).
+    if let Some(BencodeValue::Bytes(bytes)) = d.get(b"added6".as_slice()) {
+        for chunk in bytes.chunks_exact(18) {
+            let mut addr = [0u8; 16];
+            addr.copy_from_slice(&chunk[..16]);
+            let ip = std::net::Ipv6Addr::from(addr);
+            let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+            if port == 0 {
+                continue;
+            }
+            added.push(std::net::SocketAddr::new(std::net::IpAddr::V6(ip), port));
+        }
+    }
+    Ok(PexMessage { added })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +370,83 @@ mod tests {
         assert_eq!(
             parse_metadata_response(&bytes).unwrap(),
             MetadataResponse::Reject { piece: 5 }
+        );
+    }
+
+    #[test]
+    fn handshake_payload_advertises_ut_pex_too() {
+        let bytes = build_handshake_payload();
+        let v = BencodeValue::parse_all(&bytes).unwrap();
+        let m = v.dict_get(b"m").unwrap().as_dict().unwrap();
+        assert_eq!(
+            m.get(b"ut_pex".as_slice()).unwrap().as_int().unwrap(),
+            OUR_UT_PEX_ID as i64
+        );
+    }
+
+    #[test]
+    fn parse_pex_added_ipv4() {
+        // Two compact peers: 1.2.3.4:5678 and 9.10.11.12:80
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[1, 2, 3, 4]);
+        payload.extend_from_slice(&5678u16.to_be_bytes());
+        payload.extend_from_slice(&[9, 10, 11, 12]);
+        payload.extend_from_slice(&80u16.to_be_bytes());
+
+        let mut d = BTreeMap::new();
+        d.insert(b"added".to_vec(), BencodeValue::Bytes(payload));
+        let bytes = BencodeValue::Dict(d).to_bytes();
+
+        let pex = parse_pex(&bytes).unwrap();
+        assert_eq!(pex.added.len(), 2);
+        assert_eq!(
+            pex.added[0],
+            "1.2.3.4:5678".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            pex.added[1],
+            "9.10.11.12:80".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_pex_skips_zero_port_entries() {
+        // 1.2.3.4:0 — port 0 means "no listen socket"; drop it.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[1, 2, 3, 4, 0, 0]);
+        let mut d = BTreeMap::new();
+        d.insert(b"added".to_vec(), BencodeValue::Bytes(payload));
+        let bytes = BencodeValue::Dict(d).to_bytes();
+        let pex = parse_pex(&bytes).unwrap();
+        assert!(pex.added.is_empty());
+    }
+
+    #[test]
+    fn parse_pex_handles_missing_keys() {
+        // Empty dict — no `added` field at all.
+        let d: BTreeMap<Vec<u8>, BencodeValue> = BTreeMap::new();
+        let bytes = BencodeValue::Dict(d).to_bytes();
+        let pex = parse_pex(&bytes).unwrap();
+        assert!(pex.added.is_empty());
+    }
+
+    #[test]
+    fn parse_pex_ipv6_added6() {
+        // One IPv6 peer: ::1:6881
+        let mut payload = Vec::new();
+        let ip = std::net::Ipv6Addr::LOCALHOST.octets();
+        payload.extend_from_slice(&ip);
+        payload.extend_from_slice(&6881u16.to_be_bytes());
+
+        let mut d = BTreeMap::new();
+        d.insert(b"added6".to_vec(), BencodeValue::Bytes(payload));
+        let bytes = BencodeValue::Dict(d).to_bytes();
+
+        let pex = parse_pex(&bytes).unwrap();
+        assert_eq!(pex.added.len(), 1);
+        assert_eq!(
+            pex.added[0],
+            "[::1]:6881".parse::<std::net::SocketAddr>().unwrap()
         );
     }
 }

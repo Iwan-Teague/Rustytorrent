@@ -82,6 +82,12 @@ pub enum PeerEvent {
         begin: u32,
         length: u32,
     },
+    /// BEP 11 PEX — peer is sharing additional peer addresses with us.
+    /// The engine adds them to the connection pool, deduplicated.
+    Pex {
+        addr: SocketAddr,
+        peers: Vec<SocketAddr>,
+    },
 }
 
 /// Commands the engine sends to a single peer task.
@@ -134,25 +140,37 @@ pub async fn run_outgoing(
     let iface = bind_iface.as_deref();
     let outcome = match plain_handshake(addr, info_hash, peer_id, proxy.as_ref(), iface).await {
         Ok((reader, writer, theirs)) => {
+            let supports_ext =
+                crate::peer::handshake::supports_extension_protocol(&theirs.reserved);
             let _ = event_tx
                 .send(PeerEvent::Connected {
                     addr,
                     peer_id: theirs.peer_id,
                 })
                 .await;
-            post_handshake_loop(reader, writer, addr, event_tx.clone(), cmd_rx).await
+            post_handshake_loop(reader, writer, addr, event_tx.clone(), cmd_rx, supports_ext).await
         }
         Err(e) if is_likely_mse_signal(&e) => {
             tracing::debug!(target: "peer", %addr, reason = %e, "plain failed, retrying with MSE");
             match mse_handshake_outgoing(addr, info_hash, peer_id, proxy.as_ref(), iface).await {
                 Ok((reader, writer, theirs)) => {
+                    let supports_ext =
+                        crate::peer::handshake::supports_extension_protocol(&theirs.reserved);
                     let _ = event_tx
                         .send(PeerEvent::Connected {
                             addr,
                             peer_id: theirs.peer_id,
                         })
                         .await;
-                    post_handshake_loop(reader, writer, addr, event_tx.clone(), cmd_rx).await
+                    post_handshake_loop(
+                        reader,
+                        writer,
+                        addr,
+                        event_tx.clone(),
+                        cmd_rx,
+                        supports_ext,
+                    )
+                    .await
                 }
                 Err(e) => Err(e),
             }
@@ -194,13 +212,15 @@ pub async fn run_outgoing_mse_only(
     .await
     {
         Ok((reader, writer, theirs)) => {
+            let supports_ext =
+                crate::peer::handshake::supports_extension_protocol(&theirs.reserved);
             let _ = event_tx
                 .send(PeerEvent::Connected {
                     addr,
                     peer_id: theirs.peer_id,
                 })
                 .await;
-            post_handshake_loop(reader, writer, addr, event_tx.clone(), cmd_rx).await
+            post_handshake_loop(reader, writer, addr, event_tx.clone(), cmd_rx, supports_ext).await
         }
         Err(e) => Err(e),
     };
@@ -421,6 +441,7 @@ async fn run_plain_on_stream(
         Ok(r) => r?,
         Err(_) => return Err(Error::Handshake("timeout".into())),
     };
+    let supports_ext = crate::peer::handshake::supports_extension_protocol(&theirs.reserved);
     let _ = event_tx
         .send(PeerEvent::Connected {
             addr,
@@ -428,7 +449,7 @@ async fn run_plain_on_stream(
         })
         .await;
     let (reader, writer) = stream.into_split();
-    post_handshake_loop(reader, writer, addr, event_tx, cmd_rx).await
+    post_handshake_loop(reader, writer, addr, event_tx, cmd_rx, supports_ext).await
 }
 
 /// Inbound connection dispatcher: peek the first byte and pick the right path.
@@ -492,6 +513,7 @@ async fn run_mse_on_stream(
         Ok(r) => r?,
         Err(_) => return Err(Error::Handshake("bt-over-mse incoming timeout".into())),
     };
+    let supports_ext = crate::peer::handshake::supports_extension_protocol(&theirs.reserved);
     let _ = event_tx
         .send(PeerEvent::Connected {
             addr,
@@ -503,7 +525,7 @@ async fn run_mse_on_stream(
     let (read_half, write_half) = raw.into_split();
     let reader = mse::Rc4Reader::new(read_half, in_cipher);
     let writer = mse::Rc4Writer::new(write_half, out_cipher);
-    post_handshake_loop(reader, writer, addr, event_tx, cmd_rx).await
+    post_handshake_loop(reader, writer, addr, event_tx, cmd_rx, supports_ext).await
 }
 
 /// The generic post-handshake event loop. The read side runs on its own
@@ -520,11 +542,29 @@ async fn post_handshake_loop<R, W>(
     addr: SocketAddr,
     event_tx: mpsc::Sender<PeerEvent>,
     mut cmd_rx: mpsc::Receiver<PeerCommand>,
+    peer_supports_extension: bool,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
+    // BEP 10 — if the peer set the extension-protocol reserved bit,
+    // reciprocate by sending our `m` dict so they know which ext_id
+    // to use when forwarding us PEX (and ut_metadata, which we
+    // silently ignore today). Peers that didn't advertise BEP 10 may
+    // close the connection on an unknown id=20 frame, so we gate.
+    if peer_supports_extension {
+        let payload = crate::peer::extension::build_handshake_payload();
+        let msg = Message::Extended {
+            ext_id: crate::peer::extension::EXT_HANDSHAKE_ID,
+            payload,
+        };
+        if let Err(e) = crate::peer::message::write_message(&mut writer, &msg).await {
+            // Non-fatal — log and proceed; the peer still gets the
+            // regular BT message stream, just without PEX.
+            tracing::debug!(target: "peer", %addr, error = %e, "ext handshake send failed");
+        }
+    }
     let read_event_tx = event_tx.clone();
     let (read_done_tx, mut read_done_rx) = tokio::sync::oneshot::channel::<Result<()>>();
     let read_task = tokio::spawn(async move {
@@ -545,6 +585,31 @@ where
                         "request rate-limit hit; dropping Request frame"
                     );
                     continue;
+                }
+                // BEP 11 PEX: when we receive an Extended message at our
+                // declared ut_pex id, parse + forward the added peers to
+                // the engine. Other extension ids (handshake echoes,
+                // ut_metadata requests we don't serve) are silently
+                // dropped — same as msg_to_event's catch-all.
+                if let Message::Extended { ext_id, payload } = &msg {
+                    if *ext_id == crate::peer::extension::OUR_UT_PEX_ID {
+                        match crate::peer::extension::parse_pex(payload) {
+                            Ok(pex) if !pex.added.is_empty() => {
+                                let ev = PeerEvent::Pex {
+                                    addr,
+                                    peers: pex.added,
+                                };
+                                if read_event_tx.send(ev).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            Ok(_) => {} // empty payload, nothing to do
+                            Err(e) => {
+                                tracing::debug!(target: "peer", %addr, error = %e, "ut_pex parse");
+                            }
+                        }
+                        continue;
+                    }
                 }
                 if let Some(ev) = msg_to_event(addr, msg) {
                     if read_event_tx.send(ev).await.is_err() {

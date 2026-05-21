@@ -727,6 +727,34 @@ impl TorrentEngine {
                 // already dispatched the read is a no-op. If the peer disconnects
                 // before our Piece send completes, the send simply fails.
             }
+            PeerEvent::Pex {
+                addr,
+                peers: pex_peers,
+            } => {
+                // BEP 11 — supplemental peer discovery. Drop self and
+                // already-connected addresses; PeerManager handles
+                // dedupe + max-peers cap. In anonymous mode we ignore
+                // PEX entirely: peers shared via PEX could be honeypot
+                // entries trying to enumerate the swarm.
+                if self.cfg.anonymous {
+                    tracing::debug!(
+                        target: "engine",
+                        from = %addr,
+                        n = pex_peers.len(),
+                        "ignoring PEX in anonymous mode"
+                    );
+                } else {
+                    let started = peers.try_connect_many(pex_peers);
+                    if started > 0 {
+                        tracing::debug!(
+                            target: "engine",
+                            from = %addr,
+                            started,
+                            "added peers from PEX"
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }

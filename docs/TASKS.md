@@ -31,8 +31,10 @@ End-to-end download is verified by:
 
 Outstanding gaps:
 
-- **PEX (BEP 11)** — supplemental peer-discovery channel; DHT already
-  covers most of the same ground, so this is a small follow-up.
+- **Outgoing PEX** — we receive PEX from peers but don't yet send it
+  back. The receive path is the higher-leverage half (free peers); the
+  send path is a polite reciprocal that some clients reward in their
+  peer-selection algorithms.
 - **µTP (BEP 29)** — TCP only today; a UDP path would unlock the
   UDP-only slice of the swarm.
 
@@ -278,8 +280,10 @@ Outstanding gaps:
 - [x] Exchange extension handshake with `m` dict of supported extensions ([`peer/extension.rs`](../src/peer/extension.rs))
 
 ### Peer Exchange / PEX (BEP 11)
-- [ ] Implement `ut_pex` extension message — 3h
-- [ ] Integrate new peers from PEX into PeerManager — 1h
+- [x] `ut_pex` payload parser (IPv4 `added` + IPv6 `added6`, drops zero-port entries) ([`peer/extension.rs`](../src/peer/extension.rs))
+- [x] Post-BT-handshake extension-handshake exchange so peers know our `ut_pex` id ([`peer/connection.rs`](../src/peer/connection.rs) `post_handshake_loop`)
+- [x] Engine handles `PeerEvent::Pex` and forwards to `PeerManager::try_connect_many` ([`engine.rs`](../src/engine.rs))
+- [ ] Outgoing PEX (we send peer-list updates) — small follow-up
 
 ### ut_metadata (BEP 9)  ✅
 - [x] `ut_metadata` request/data/reject codec ([`peer/extension.rs`](../src/peer/extension.rs))
