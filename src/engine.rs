@@ -481,6 +481,18 @@ impl TorrentEngine {
         let mut pex_timer = interval(Duration::from_secs(60));
         pex_timer.tick().await;
 
+        // BEP 5 announce_peer — tell the DHT we're carrying this
+        // info_hash so other DHT-using clients can find us via
+        // `get_peers`. We only announce when our public listener is
+        // actually up (otherwise peers would dial a closed port and
+        // give up on us). Cadence matches the DHT spec's 30-minute
+        // recommendation; the first announce happens shortly after the
+        // DHT has had a moment to settle so the routing table isn't
+        // empty when we publish.
+        let mut dht_announce_timer = interval(Duration::from_secs(60));
+        dht_announce_timer.tick().await;
+        let mut dht_announce_long_period = false;
+
         let result: Result<()> = loop {
             tokio::select! {
                 Some(ev) = peer_event_rx.recv() => {
@@ -592,6 +604,20 @@ impl TorrentEngine {
                 }
                 _ = pex_timer.tick(), if !self.peer_pex_ids.is_empty() => {
                     self.send_pex_to_all(&peers).await;
+                }
+                _ = dht_announce_timer.tick(), if dht.is_some() && listener_handle.is_some() => {
+                    let dht_ref = dht.as_ref().expect("guarded by `if`");
+                    let info_hash = self.torrent.info_hash;
+                    let port = self.cfg.listen_port;
+                    dht_ref.announce(info_hash, port).await;
+                    // First announce uses the short cadence (60 s) to
+                    // get us on the DHT quickly; subsequent ones drop to
+                    // the spec-recommended 30-minute interval.
+                    if !dht_announce_long_period {
+                        dht_announce_long_period = true;
+                        dht_announce_timer = interval(Duration::from_secs(1800));
+                        dht_announce_timer.tick().await;
+                    }
                 }
                 else => break Ok(()),
             }
