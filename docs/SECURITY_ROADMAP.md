@@ -50,8 +50,8 @@ protection that A-tier doesn't touch.
 | ~~C2 (Linux + macOS)~~ | ~~**OS-level sandboxing**~~ — Linux seccomp + macOS `sandbox_init` SBPL profile landed. Windows AppContainer remains open. | mostly done |
 | C3 | **µTP (BEP 29) over UDP** | Connect to peers that only speak µTP. Today we only do TCP, so a slice of the swarm is unreachable. Adds a UDP path that needs its own proxy story (or hard-off in anonymous mode, like DHT). | ~600 lines |
 | C4 | **I2P transport** | Native anonymity overlay; tiny swarms but no Tor-style exit-node trust issues. Substantial work — different transport entirely. | ~1000+ lines |
-| C5 | **Custom MSE reserved-byte fingerprint matching** | Per-peer Tor circuit + matching the *exact* handshake byte pattern of (say) qBittorrent so traffic analysis can't distinguish us by client. | ~50 lines (depends on B5) |
-| ~~C6~~ | ~~**Tracker-frequency jitter**~~ — landed. Reannounce interval is jittered upward (+0-5% normal, +5-50% anonymous) so two clients on the same tracker don't share an identical cadence fingerprint. peer_id mid-session rotation is still open. | done |
+| ~~C5~~ | ~~**Anonymous-mode peer_id rotation**~~ — landed. At every reannounce in anonymous mode the engine regenerates the peer_id (libtorrent-style prefix); existing TCP connections keep their handshaken id but every new outgoing dial uses the fresh one. Defeats the "same client signature across unrelated swarms" correlation. | done |
+| ~~C6~~ | ~~**Tracker-frequency jitter**~~ — landed. Reannounce interval is jittered upward (+0-5% normal, +5-50% anonymous) so two clients on the same tracker don't share an identical cadence fingerprint. | done |
 
 ---
 
