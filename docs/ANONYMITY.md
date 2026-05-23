@@ -30,7 +30,10 @@ every peer from your real IP.
 | MSE/PE-aware DPI (looks at byte patterns) | ❌ plain BT is trivially fingerprinted | 🟡 still fingerprintable inside the proxy tunnel if peer chose plain | ✅ if proxy is Tor or commercial VPN, transport encryption hides BT shape; `--encrypt` forces MSE outbound for additional cover |
 | Active DHT scraper enumerating swarms | ❌ your IP is in the DHT for everyone to scrape | 🟡 still exposed: DHT runs UDP, can't ride SOCKS5 CONNECT, but we leave it on unless `--anonymous` | ✅ DHT is forcibly **off** |
 | Port-scan of your IP from the peer listen port | ❌ exposed by listener bind | ❌ still bound on your real IP | ✅ listener is **not bound** |
-| Cross-session correlation by stable `peer_id` | ❌ same `-RT0100-…` prefix + 12 stable random bytes every run | ❌ peer_id still persisted | ✅ peer_id is freshly generated every run, never persisted |
+| Cross-session correlation by stable `peer_id` | ❌ same `-RT0100-…` prefix + 12 stable random bytes every run | ❌ peer_id still persisted | ✅ peer_id is freshly generated every run with a libtorrent-style `-LT2090-` prefix; rotated at every reannounce |
+| Client-name fingerprint in BEP 10 extension handshake | ❌ `v = "rustytorrent <ver>"` and `reqq = 0` distinguish us | ❌ same | ✅ both keys omitted under `--anonymous`; only `m` dict emitted |
+| Tracker User-Agent fingerprint | ❌ `rustytorrent/<ver>` | ❌ same | ✅ libtorrent-style UA sent per-announce |
+| Cleartext HTTP tracker announce body inside the proxy tunnel | ❌ exposed | ❌ tracker IP masked but announce body still readable to observers between us and the proxy | ✅ `http://` trackers refused at startup; only `https://` and (where applicable) `udp://` allowed |
 | Compromised proxy | n/a | ❌ proxy operator sees everything | ❌ proxy operator sees everything |
 | Compromised proxy + correlation with tracker IP-allocation records | n/a | ❌ deanonymizable | ❌ deanonymizable (need a different transport, e.g. I2P) |
 
