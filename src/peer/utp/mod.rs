@@ -27,4 +27,8 @@
 //! Both gaps are noted on each call site so a future contributor can
 //! tighten without first re-deriving the design.
 
+pub mod connection;
 pub mod packet;
+
+pub use connection::{Connection, State};
+pub use packet::{Packet, PacketType};
