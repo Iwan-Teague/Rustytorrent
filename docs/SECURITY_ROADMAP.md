@@ -48,7 +48,7 @@ protection that A-tier doesn't touch.
 |---|------|------------------|------|
 | ~~C1~~ | ~~**Multi-hop proxy chaining**~~ — landed. `--socks5` is now repeatable; the chain runs nested SOCKS5 CONNECTs on a single TCP stream. Credentials and Tor stream isolation attach to the last hop. Tracker HTTP still rides the first hop only (reqwest limit). | done |
 | ~~C2 (Linux + macOS)~~ | ~~**OS-level sandboxing**~~ — Linux seccomp + macOS `sandbox_init` SBPL profile landed. Windows AppContainer remains open. | mostly done |
-| C3 | **µTP (BEP 29) over UDP** | Connect to peers that only speak µTP. Today we only do TCP, so a slice of the swarm is unreachable. Adds a UDP path that needs its own proxy story (or hard-off in anonymous mode, like DHT). | ~600 lines |
+| C3 (partial) | **µTP (BEP 29) over UDP** | Packet codec and per-connection state machine landed (pure logic, unit-testable). Socket runtime + AsyncRead/AsyncWrite glue + engine integration still open — without them no real peer traffic flows over µTP yet. | partly done |
 | C4 | **I2P transport** | Native anonymity overlay; tiny swarms but no Tor-style exit-node trust issues. Substantial work — different transport entirely. | ~1000+ lines |
 | ~~C5~~ | ~~**Anonymous-mode peer_id rotation**~~ — landed. At every reannounce in anonymous mode the engine regenerates the peer_id (libtorrent-style prefix); existing TCP connections keep their handshaken id but every new outgoing dial uses the fresh one. Defeats the "same client signature across unrelated swarms" correlation. | done |
 | ~~C6~~ | ~~**Tracker-frequency jitter**~~ — landed. Reannounce interval is jittered upward (+0-5% normal, +5-50% anonymous) so two clients on the same tracker don't share an identical cadence fingerprint. | done |
@@ -116,6 +116,26 @@ _None — B2 landed alongside the multi-hop chain work._
   post-DH; the main download loop runs entirely under the chosen
   sandbox.
 - Windows AppContainer remains open.
+
+### C3 — µTP (partial)
+- ✅ Packet codec ([`src/peer/utp/packet.rs`](../src/peer/utp/packet.rs)):
+  full BEP 29 wire format including the extension chain. Tests
+  cover roundtrip, every packet-type nibble, selective-ack
+  extension, and rejection paths (short buffer, unknown type,
+  wrong version, truncated/overflowing extensions).
+- ✅ Per-connection state machine ([`src/peer/utp/connection.rs`](../src/peer/utp/connection.rs)):
+  SYN/STATE/DATA/FIN/RESET transitions, BEP 29 connection_id
+  allocation (initiator picks recv_id; send_id = recv_id + 1;
+  each side's send_id == other's recv_id), cumulative acks,
+  retransmit-on-RTO with exponential backoff, receive-side
+  reordering, and clean FIN-driven close. Pure logic — no I/O —
+  so tests drive two connections back-to-back over a perfect
+  in-memory channel.
+- ⏳ Open: UDP socket driver (demux by `(peer, connection_id)`,
+  bridge to AsyncRead/AsyncWrite); engine integration (parallel
+  TCP+µTP dial; off under `--anonymous` since UDP can't ride
+  SOCKS5); LEDBAT congestion control (we use a fixed 8-packet
+  window today); selective-ack on receive (we parse but ignore).
 
 ### B2 — `--memory-only` storage
 - ✅ In-RAM piece store; nothing persisted to disk for the lifetime of
