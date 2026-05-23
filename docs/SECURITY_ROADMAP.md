@@ -47,7 +47,7 @@ protection that A-tier doesn't touch.
 | # | Item | What it gets you | Cost |
 |---|------|------------------|------|
 | ~~C1~~ | ~~**Multi-hop proxy chaining**~~ — landed. `--socks5` is now repeatable; the chain runs nested SOCKS5 CONNECTs on a single TCP stream. Credentials and Tor stream isolation attach to the last hop. Tracker HTTP still rides the first hop only (reqwest limit). | done |
-| ~~C2 (Linux part)~~ | ~~**OS-level sandboxing**~~ — Linux seccomp landed. App-sandbox profile (macOS) and AppContainer (Windows) remain open. | partly done |
+| ~~C2 (Linux + macOS)~~ | ~~**OS-level sandboxing**~~ — Linux seccomp + macOS `sandbox_init` SBPL profile landed. Windows AppContainer remains open. | mostly done |
 | C3 | **µTP (BEP 29) over UDP** | Connect to peers that only speak µTP. Today we only do TCP, so a slice of the swarm is unreachable. Adds a UDP path that needs its own proxy story (or hard-off in anonymous mode, like DHT). | ~600 lines |
 | C4 | **I2P transport** | Native anonymity overlay; tiny swarms but no Tor-style exit-node trust issues. Substantial work — different transport entirely. | ~1000+ lines |
 | C5 | **Custom MSE reserved-byte fingerprint matching** | Per-peer Tor circuit + matching the *exact* handshake byte pattern of (say) qBittorrent so traffic analysis can't distinguish us by client. | ~50 lines (depends on B5) |
@@ -97,20 +97,25 @@ are rejected up front in that mode.
 ### B-tier remaining
 _None — B2 landed alongside the multi-hop chain work._
 
-### C2 — Linux seccomp sandbox
-- ✅ `--sandbox` engages a hand-rolled BPF whitelist installed via
-  `prctl(PR_SET_NO_NEW_PRIVS)` + `seccomp(SECCOMP_SET_MODE_FILTER,
-  TSYNC)`. The filter rejects 32-bit syscall numbers on a 64-bit
-  kernel (audit-arch check), then whitelists ~75 syscalls covering
-  tokio's runtime, rustls, and our network/storage code. Anything
-  outside the list terminates the process via SIGSYS — no
-  privilege-escalation primitives (`ptrace`, `init_module`,
-  `kexec_load`, `mount`, `swapon`, `pivot_root`, …) are reachable
-  from the address space even if an exploit lands there. Filter
-  installs late in engine startup (post-listener, post-tracker,
-  post-DH); the main download loop runs entirely under the sandbox.
-  Linux x86_64 only; other platforms refused at startup. App-sandbox
-  (macOS) and AppContainer (Windows) remain open.
+### C2 — OS-level sandboxing
+- ✅ Linux x86_64: `--sandbox` installs a hand-rolled BPF whitelist
+  via `prctl(PR_SET_NO_NEW_PRIVS)` +
+  `seccomp(SECCOMP_SET_MODE_FILTER, TSYNC)`. The filter rejects
+  32-bit syscall numbers (audit-arch check), then whitelists ~75
+  syscalls covering tokio's runtime, rustls, and our
+  network/storage code. Anything outside the list terminates the
+  process via SIGSYS.
+- ✅ macOS: `--sandbox` installs a deny-default SBPL profile via
+  `sandbox_init(3)`. Allows file-read/file-write, network*,
+  signal, mach-lookup, sysctl-read/write, ipc-posix-*. The
+  default-deny tail still includes `process-exec`, `process-fork`,
+  `system-mount`, `system-kext-*`, and the rest of the privileged
+  primitives we'd otherwise be exposed to.
+- Both backends share one entry point (`crate::sandbox::engage()`)
+  invoked late in engine startup, post-listener, post-tracker,
+  post-DH; the main download loop runs entirely under the chosen
+  sandbox.
+- Windows AppContainer remains open.
 
 ### B2 — `--memory-only` storage
 - ✅ In-RAM piece store; nothing persisted to disk for the lifetime of

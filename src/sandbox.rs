@@ -1,22 +1,35 @@
-//! Linux seccomp sandbox (C2 from the security roadmap).
+//! OS-level sandboxing (C2 from the security roadmap).
 //!
-//! Installs a BPF syscall filter that whitelists only the kernel
-//! entrypoints rustytorrent actually uses. Anything outside the list
-//! is `SECCOMP_RET_KILL_PROCESS` — the kernel terminates the whole
-//! process via SIGSYS instead of returning to the caller. Defense in
-//! depth: even if an exploit lands in our address space (e.g. a
-//! corrupt-stream bug in the bencode parser turns into RCE), the
-//! attacker can't pivot via syscalls outside this whitelist.
-//! `ptrace`, `init_module`, `kexec_load`, `mount`, `swapon`, and a
-//! long tail of other privilege-escalation entrypoints are all gone.
+//! Engaged via `--sandbox`. Defense in depth: even if an exploit
+//! lands in our address space (e.g. a corrupt-stream bug in the
+//! bencode parser turns into RCE), the attacker can't pivot via
+//! kernel primitives we explicitly forbid — `ptrace`, `init_module`,
+//! `kexec_load`, `mount`, `swapon`, `mach_kext_request`, …
 //!
-//! ## Scope
+//! Two backends share a common API (`engage()` returns `Result<()>`):
 //!
-//! Linux x86_64 only today. Other platforms (macOS, Windows, Linux
-//! ARM64) report unsupported. The audit-architecture check in the
-//! filter rejects 32-bit syscalls on a 64-bit kernel — a common
-//! evasion trick — so the whitelist is tight against the x86_64
-//! syscall numbering only.
+//! ## Linux x86_64
+//!
+//! Hand-rolled BPF seccomp filter installed via
+//! `prctl(PR_SET_NO_NEW_PRIVS)` + `seccomp(SECCOMP_SET_MODE_FILTER,
+//! TSYNC)`. Whitelists ~75 syscalls covering tokio + rustls + our
+//! networking; everything else is `SECCOMP_RET_KILL_PROCESS` so the
+//! kernel terminates the process via SIGSYS on any attempt. The
+//! audit-architecture check rejects 32-bit syscalls on a 64-bit
+//! kernel — a common evasion trick.
+//!
+//! ## macOS
+//!
+//! Apple's `sandbox_init(3)` with a deny-default SBPL (Sandbox
+//! Profile Language) profile. Allows file I/O, network, signals,
+//! mach-lookup, sysctl. Denies the entire deny-default tail
+//! including `process-exec`, `process-fork`, `system-mount`,
+//! `system-kext-load`, etc. The `sandbox_init` API is technically
+//! deprecated by Apple in favor of entitlement-driven sandboxing
+//! at code-sign time, but it's still functional and is the only
+//! way to engage post-startup from a non-bundled binary like ours.
+//!
+//! Other platforms (Windows, Linux ARM64, *BSD) report unsupported.
 //!
 //! ## When the sandbox engages
 //!
@@ -53,19 +66,22 @@
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use linux_x86_64::engage;
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(target_os = "macos")]
+pub use macos::engage;
+
+#[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")))]
 pub fn engage() -> crate::error::Result<()> {
     Err(crate::error::Error::Network(
-        "--sandbox requires Linux x86_64 (other platforms have no implementation today)".into(),
+        "--sandbox is not supported on this platform (Linux x86_64 and macOS only)".into(),
     ))
 }
 
-/// Whether the current build target supports the sandbox. Lets the
-/// engine print a "sandbox: skipped on this platform" message in
-/// the non-Linux build instead of trying to engage and failing.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// Whether the current build target has a sandbox implementation.
+/// Used by the engine startup to fail fast on unsupported platforms
+/// rather than try to engage and surface a noisy error.
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
 pub const SUPPORTED: bool = true;
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")))]
 pub const SUPPORTED: bool = false;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -409,6 +425,144 @@ mod linux_x86_64 {
                 assert!(
                     !allowed.contains(&(nr as u32)),
                     "dangerous syscall {nr} present in whitelist"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::ffi::{CStr, CString};
+    use std::os::raw::{c_char, c_int};
+    use std::ptr;
+
+    use crate::error::{Error, Result};
+
+    /// SBPL profile installed via `sandbox_init`. Deny-default with
+    /// a tight allow-list:
+    /// - file-read*/file-write*: needed for the torrent, the spool,
+    ///   the output dir, and the various system files DNS / TLS /
+    ///   tokio touch (/etc/hosts, /etc/resolv.conf, /usr/lib/*).
+    /// - network*: BitTorrent is a network app.
+    /// - signal, mach-lookup, sysctl-read/write, ipc-posix-*: the
+    ///   minimum tokio runtime + libsystem need to operate.
+    /// - system-socket, user-preference-read: smaller helpers used
+    ///   by Foundation and DNS path internally.
+    ///
+    /// Notably DENIED by the default deny rule:
+    /// - process-exec, process-fork (we never spawn children),
+    /// - system-mount, system-kext-* (privileged ops),
+    /// - mach-task-name on other processes,
+    /// - file-write* outside the user's normal directories — actually
+    ///   we allow file-write* broadly here for simplicity; tightening
+    ///   to (subpath …) of the output dir is a follow-up that needs
+    ///   to know the output dir at engage time.
+    ///
+    /// Profile syntax is SBPL (TinyScheme-like), Apple-internal.
+    /// Examples cribbed from Chromium's macOS sandbox & the Apple
+    /// open-source sandbox-exec source. Format breaks are
+    /// significant — keep the newlines.
+    const PROFILE: &str = "(version 1)
+(deny default)
+(allow file-read*)
+(allow file-write*)
+(allow network*)
+(allow signal)
+(allow ipc-posix-shm)
+(allow ipc-posix-sem)
+(allow mach-lookup)
+(allow sysctl-read)
+(allow sysctl-write)
+(allow system-socket)
+(allow user-preference-read)
+";
+
+    // SAFETY: `sandbox_init` lives in libSystem.dylib (always linked
+    // on macOS). It's deprecated by Apple in favor of entitlements
+    // declared at code-sign time, but the runtime entry point is
+    // still present and functional. Suppressing the deprecation
+    // warning isn't needed since it's a C-side warning and we're
+    // calling via raw FFI.
+    extern "C" {
+        fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
+        fn sandbox_free_error(errorbuf: *mut c_char);
+    }
+
+    pub fn engage() -> Result<()> {
+        let profile = CString::new(PROFILE).expect("profile literal contains no interior NUL");
+        let mut errorbuf: *mut c_char = ptr::null_mut();
+        // SAFETY: `profile.as_ptr()` is a valid null-terminated C
+        // string for the duration of this call. `&mut errorbuf` is
+        // a valid out-pointer. `sandbox_init` is the documented
+        // entry point.
+        let rc = unsafe { sandbox_init(profile.as_ptr(), 0, &mut errorbuf) };
+        if rc != 0 {
+            let msg = if errorbuf.is_null() {
+                "unknown sandbox_init failure".to_string()
+            } else {
+                // SAFETY: `errorbuf` is a valid null-terminated C
+                // string written by `sandbox_init` on failure, owned
+                // by the sandbox library until we free it.
+                let s = unsafe { CStr::from_ptr(errorbuf).to_string_lossy().into_owned() };
+                // SAFETY: we received `errorbuf` from `sandbox_init`
+                // and have not freed it; it must be returned via
+                // `sandbox_free_error`.
+                unsafe { sandbox_free_error(errorbuf) };
+                s
+            };
+            return Err(Error::Network(format!(
+                "sandbox: sandbox_init failed: {msg}"
+            )));
+        }
+        tracing::info!(
+            target: "sandbox",
+            profile_bytes = PROFILE.len(),
+            "macOS sandbox installed (deny-default SBPL profile)"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn profile_is_valid_cstring() {
+            // The macro at engage() expects no interior NUL bytes.
+            CString::new(PROFILE).expect("profile literal contains no NUL");
+        }
+
+        #[test]
+        fn profile_starts_with_version() {
+            assert!(
+                PROFILE.starts_with("(version 1)"),
+                "profile must declare SBPL version on the first line"
+            );
+        }
+
+        #[test]
+        fn profile_denies_by_default() {
+            assert!(
+                PROFILE.contains("(deny default)"),
+                "profile must default-deny so the allow list is meaningful"
+            );
+        }
+
+        #[test]
+        fn profile_omits_dangerous_allows() {
+            // Negative-space sanity: we must NOT have allowed any of
+            // these — they're the whole point of running under a
+            // sandbox.
+            for forbidden in [
+                "(allow process-exec",
+                "(allow process-fork",
+                "(allow system-mount",
+                "(allow system-kext",
+            ] {
+                assert!(
+                    !PROFILE.contains(forbidden),
+                    "profile must not allow `{forbidden}`"
                 );
             }
         }

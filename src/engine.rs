@@ -76,11 +76,12 @@ pub struct EngineConfig {
     /// session. The user later runs `rustytorrent decrypt` with the
     /// same passphrase to extract.
     pub paranoid: bool,
-    /// **Sandbox** (C2): on Linux x86_64, install a seccomp BPF
-    /// filter just before entering the main event loop. Whitelist
-    /// covers the syscalls tokio/our runtime use at steady state;
-    /// anything else terminates the process. Defense-in-depth.
-    /// Other platforms: refused at startup.
+    /// **Sandbox** (C2): just before entering the main event loop,
+    /// install a deny-default OS sandbox. Linux x86_64 → seccomp
+    /// BPF whitelist; macOS → `sandbox_init` SBPL profile. Other
+    /// platforms refused at startup. Defense-in-depth: even if an
+    /// exploit lands in our address space, kernel primitives like
+    /// `ptrace` / `mount` / `process-exec` are unreachable.
     pub sandbox: bool,
     /// **Memory-only storage** (B2): keep every piece in heap RAM only.
     /// Nothing is persisted to disk — when the process exits the
@@ -264,12 +265,13 @@ impl TorrentEngine {
                 "--memory-only is not supported on this platform (Linux/macOS/BSD only)".into(),
             ));
         }
-        // --sandbox is Linux x86_64 only today. Fail fast on other
-        // targets rather than silently no-op (the user asked for a
-        // sandbox, they should know if they didn't get one).
+        // --sandbox supports Linux x86_64 (seccomp) and macOS
+        // (sandbox_init SBPL profile). Other platforms fail fast
+        // rather than silently no-op (the user asked for a sandbox;
+        // they should know if they didn't get one).
         if self.cfg.sandbox && !crate::sandbox::SUPPORTED {
             return Err(Error::Network(
-                "--sandbox is not supported on this platform (Linux x86_64 only)".into(),
+                "--sandbox is not supported on this platform (Linux x86_64 and macOS only)".into(),
             ));
         }
         // In anonymous mode we never want to emit a plain `\x13BitTorrent...`

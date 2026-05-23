@@ -96,11 +96,12 @@ enum Commands {
         /// on Windows.
         #[arg(long, default_value_t = false, conflicts_with = "paranoid")]
         memory_only: bool,
-        /// Defense-in-depth: install a Linux seccomp BPF whitelist
-        /// just before entering the download loop. An exploit in our
-        /// address space can't make syscalls outside the whitelist
-        /// (no ptrace, no init_module, no mount, no kexec_load, …).
-        /// Linux x86_64 only; other platforms refuse to start.
+        /// Defense-in-depth: install an OS sandbox just before
+        /// entering the download loop. Linux x86_64 → seccomp BPF
+        /// whitelist; macOS → `sandbox_init` SBPL deny-default
+        /// profile. Either way an exploit in our address space
+        /// can't reach `ptrace`, `mount`, `process-exec`, kernel
+        /// module load, etc. Windows refused at startup.
         #[arg(long, default_value_t = false)]
         sandbox: bool,
         /// Passphrase for paranoid mode. If unset, read from the
@@ -490,7 +491,7 @@ async fn cmd_download(
         println!("Memory:     on (RAM-only spool, nothing persisted)");
     }
     if sandbox {
-        println!("Sandbox:    on (seccomp BPF whitelist installed before download loop)");
+        println!("Sandbox:    on (OS-level whitelist installed before download loop)");
     }
 
     if let Some(d) = max_down {
@@ -856,7 +857,7 @@ async fn cmd_magnet(
         println!("Memory:     on (RAM-only spool, nothing persisted)");
     }
     if sandbox {
-        println!("Sandbox:    on (seccomp BPF whitelist installed before download loop)");
+        println!("Sandbox:    on (OS-level whitelist installed before download loop)");
     }
 
     if let Some(d) = max_down {

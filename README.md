@@ -106,7 +106,7 @@ rustytorrent download <file> [OPTIONS]
   --tor-isolation           per-peer SOCKS5 username so each dial gets its own Tor circuit
   --paranoid                write encrypted spool only; plaintext never on disk
   --memory-only             keep pieces in RAM, never write to disk (Linux/macOS/BSD)
-  --sandbox                 install Linux seccomp BPF whitelist before download loop
+  --sandbox                 OS sandbox (Linux seccomp / macOS sandbox_init) before download loop
   --passphrase P            passphrase for --paranoid (or RUSTYTORRENT_PASSPHRASE env)
   --spool PATH              override the spool file path
   --max-down N              cap inbound bandwidth, KiB/s (engine-wide)
@@ -140,7 +140,7 @@ rustytorrent magnet <URI> [OPTIONS]        # download from a magnet link
 ## Development
 
 ```sh
-cargo test                            # 217 unit + integration tests
+cargo test                            # 221 unit + integration tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
