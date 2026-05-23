@@ -96,6 +96,13 @@ enum Commands {
         /// on Windows.
         #[arg(long, default_value_t = false, conflicts_with = "paranoid")]
         memory_only: bool,
+        /// Defense-in-depth: install a Linux seccomp BPF whitelist
+        /// just before entering the download loop. An exploit in our
+        /// address space can't make syscalls outside the whitelist
+        /// (no ptrace, no init_module, no mount, no kexec_load, …).
+        /// Linux x86_64 only; other platforms refuse to start.
+        #[arg(long, default_value_t = false)]
+        sandbox: bool,
         /// Passphrase for paranoid mode. If unset, read from the
         /// `RUSTYTORRENT_PASSPHRASE` environment variable. Required
         /// when --paranoid is set.
@@ -158,6 +165,9 @@ enum Commands {
         /// Memory-only storage. Same semantics as `download --memory-only`.
         #[arg(long, default_value_t = false, conflicts_with = "paranoid")]
         memory_only: bool,
+        /// seccomp sandbox. Same semantics as `download --sandbox`.
+        #[arg(long, default_value_t = false)]
+        sandbox: bool,
         #[arg(long)]
         passphrase: Option<String>,
         #[arg(long)]
@@ -222,6 +232,7 @@ async fn main() -> Result<()> {
             tor_isolation,
             paranoid,
             memory_only,
+            sandbox,
             passphrase,
             spool,
             max_down,
@@ -243,6 +254,7 @@ async fn main() -> Result<()> {
                 tor_isolation,
                 paranoid,
                 memory_only,
+                sandbox,
                 passphrase,
                 spool,
                 max_down,
@@ -271,6 +283,7 @@ async fn main() -> Result<()> {
             tor_isolation,
             paranoid,
             memory_only,
+            sandbox,
             passphrase,
             spool,
             max_down,
@@ -291,6 +304,7 @@ async fn main() -> Result<()> {
                 tor_isolation,
                 paranoid,
                 memory_only,
+                sandbox,
                 passphrase,
                 spool,
                 max_down,
@@ -413,6 +427,7 @@ async fn cmd_download(
     tor_isolation: bool,
     paranoid: bool,
     memory_only: bool,
+    sandbox: bool,
     passphrase: Option<String>,
     spool: Option<PathBuf>,
     max_down: Option<u64>,
@@ -474,6 +489,9 @@ async fn cmd_download(
     if memory_only {
         println!("Memory:     on (RAM-only spool, nothing persisted)");
     }
+    if sandbox {
+        println!("Sandbox:    on (seccomp BPF whitelist installed before download loop)");
+    }
 
     if let Some(d) = max_down {
         println!("Max down:   {d} KiB/s");
@@ -494,6 +512,7 @@ async fn cmd_download(
         bind_iface,
         paranoid,
         memory_only,
+        sandbox,
         passphrase: resolved_passphrase,
         spool_path: spool,
         max_down_bytes_per_sec: max_down.map(|k| k * 1024),
@@ -666,6 +685,7 @@ async fn cmd_magnet(
     tor_isolation: bool,
     paranoid: bool,
     memory_only: bool,
+    sandbox: bool,
     passphrase: Option<String>,
     spool: Option<PathBuf>,
     max_down: Option<u64>,
@@ -835,6 +855,9 @@ async fn cmd_magnet(
     if memory_only {
         println!("Memory:     on (RAM-only spool, nothing persisted)");
     }
+    if sandbox {
+        println!("Sandbox:    on (seccomp BPF whitelist installed before download loop)");
+    }
 
     if let Some(d) = max_down {
         println!("Max down:   {d} KiB/s");
@@ -856,6 +879,7 @@ async fn cmd_magnet(
         bind_iface,
         paranoid,
         memory_only,
+        sandbox,
         passphrase: resolved_passphrase,
         spool_path: spool,
         max_down_bytes_per_sec: max_down.map(|k| k * 1024),

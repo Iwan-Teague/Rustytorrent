@@ -76,6 +76,12 @@ pub struct EngineConfig {
     /// session. The user later runs `rustytorrent decrypt` with the
     /// same passphrase to extract.
     pub paranoid: bool,
+    /// **Sandbox** (C2): on Linux x86_64, install a seccomp BPF
+    /// filter just before entering the main event loop. Whitelist
+    /// covers the syscalls tokio/our runtime use at steady state;
+    /// anything else terminates the process. Defense-in-depth.
+    /// Other platforms: refused at startup.
+    pub sandbox: bool,
     /// **Memory-only storage** (B2): keep every piece in heap RAM only.
     /// Nothing is persisted to disk — when the process exits the
     /// download is gone. Mutually exclusive with `paranoid` (the two
@@ -118,6 +124,7 @@ impl Default for EngineConfig {
             bind_iface: None,
             paranoid: false,
             memory_only: false,
+            sandbox: false,
             passphrase: None,
             spool_path: None,
             max_down_bytes_per_sec: None,
@@ -255,6 +262,14 @@ impl TorrentEngine {
         if self.cfg.memory_only && !crate::storage::MEMSPOOL_SUPPORTED {
             return Err(Error::Network(
                 "--memory-only is not supported on this platform (Linux/macOS/BSD only)".into(),
+            ));
+        }
+        // --sandbox is Linux x86_64 only today. Fail fast on other
+        // targets rather than silently no-op (the user asked for a
+        // sandbox, they should know if they didn't get one).
+        if self.cfg.sandbox && !crate::sandbox::SUPPORTED {
+            return Err(Error::Network(
+                "--sandbox is not supported on this platform (Linux x86_64 only)".into(),
             ));
         }
         // In anonymous mode we never want to emit a plain `\x13BitTorrent...`
@@ -571,6 +586,16 @@ impl TorrentEngine {
         let mut dht_announce_timer = interval(Duration::from_secs(60));
         dht_announce_timer.tick().await;
         let mut dht_announce_long_period = false;
+
+        // C2 — engage the seccomp sandbox last in startup. By now the
+        // listener is bound, the storage task is alive, the initial
+        // tracker announce (which needs DNS) has gone out, and the
+        // DHT has bootstrapped. Everything from here on rides the
+        // syscall whitelist; an exploit that lands during the main
+        // download loop can't pivot via syscalls outside it.
+        if self.cfg.sandbox {
+            crate::sandbox::engage()?;
+        }
 
         let result: Result<()> = loop {
             tokio::select! {
