@@ -90,6 +90,12 @@ enum Commands {
         /// afterwards with the same passphrase to extract.
         #[arg(long, default_value_t = false)]
         paranoid: bool,
+        /// Memory-only storage: keep every piece in RAM, never write to
+        /// disk. Strongest "leave no trace" posture; pairs well with
+        /// --anonymous. Mutually exclusive with --paranoid. Unsupported
+        /// on Windows.
+        #[arg(long, default_value_t = false, conflicts_with = "paranoid")]
+        memory_only: bool,
         /// Passphrase for paranoid mode. If unset, read from the
         /// `RUSTYTORRENT_PASSPHRASE` environment variable. Required
         /// when --paranoid is set.
@@ -149,6 +155,9 @@ enum Commands {
         tor_isolation: bool,
         #[arg(long, default_value_t = false)]
         paranoid: bool,
+        /// Memory-only storage. Same semantics as `download --memory-only`.
+        #[arg(long, default_value_t = false, conflicts_with = "paranoid")]
+        memory_only: bool,
         #[arg(long)]
         passphrase: Option<String>,
         #[arg(long)]
@@ -212,6 +221,7 @@ async fn main() -> Result<()> {
             bind_iface,
             tor_isolation,
             paranoid,
+            memory_only,
             passphrase,
             spool,
             max_down,
@@ -232,6 +242,7 @@ async fn main() -> Result<()> {
                 bind_iface,
                 tor_isolation,
                 paranoid,
+                memory_only,
                 passphrase,
                 spool,
                 max_down,
@@ -259,6 +270,7 @@ async fn main() -> Result<()> {
             bind_iface,
             tor_isolation,
             paranoid,
+            memory_only,
             passphrase,
             spool,
             max_down,
@@ -278,6 +290,7 @@ async fn main() -> Result<()> {
                 bind_iface,
                 tor_isolation,
                 paranoid,
+                memory_only,
                 passphrase,
                 spool,
                 max_down,
@@ -399,6 +412,7 @@ async fn cmd_download(
     bind_iface: Option<String>,
     tor_isolation: bool,
     paranoid: bool,
+    memory_only: bool,
     passphrase: Option<String>,
     spool: Option<PathBuf>,
     max_down: Option<u64>,
@@ -457,6 +471,9 @@ async fn cmd_download(
     if paranoid {
         println!("Paranoid:   on (encrypted spool, plaintext never written)");
     }
+    if memory_only {
+        println!("Memory:     on (RAM-only spool, nothing persisted)");
+    }
 
     if let Some(d) = max_down {
         println!("Max down:   {d} KiB/s");
@@ -476,6 +493,7 @@ async fn cmd_download(
         anonymous,
         bind_iface,
         paranoid,
+        memory_only,
         passphrase: resolved_passphrase,
         spool_path: spool,
         max_down_bytes_per_sec: max_down.map(|k| k * 1024),
@@ -647,6 +665,7 @@ async fn cmd_magnet(
     bind_iface: Option<String>,
     tor_isolation: bool,
     paranoid: bool,
+    memory_only: bool,
     passphrase: Option<String>,
     spool: Option<PathBuf>,
     max_down: Option<u64>,
@@ -813,6 +832,9 @@ async fn cmd_magnet(
     if paranoid {
         println!("Paranoid:   on (encrypted spool, plaintext never written)");
     }
+    if memory_only {
+        println!("Memory:     on (RAM-only spool, nothing persisted)");
+    }
 
     if let Some(d) = max_down {
         println!("Max down:   {d} KiB/s");
@@ -833,6 +855,7 @@ async fn cmd_magnet(
         anonymous,
         bind_iface,
         paranoid,
+        memory_only,
         passphrase: resolved_passphrase,
         spool_path: spool,
         max_down_bytes_per_sec: max_down.map(|k| k * 1024),

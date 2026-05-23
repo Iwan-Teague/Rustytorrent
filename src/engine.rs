@@ -76,6 +76,12 @@ pub struct EngineConfig {
     /// session. The user later runs `rustytorrent decrypt` with the
     /// same passphrase to extract.
     pub paranoid: bool,
+    /// **Memory-only storage** (B2): keep every piece in heap RAM only.
+    /// Nothing is persisted to disk — when the process exits the
+    /// download is gone. Mutually exclusive with `paranoid` (the two
+    /// solve overlapping threats with different storage backends).
+    /// Unsupported on Windows; the engine refuses to start there.
+    pub memory_only: bool,
     /// Passphrase used when `paranoid` is true. Required in that mode.
     pub passphrase: Option<String>,
     /// Where to place the encrypted spool file. Defaults to
@@ -111,6 +117,7 @@ impl Default for EngineConfig {
             anonymous: false,
             bind_iface: None,
             paranoid: false,
+            memory_only: false,
             passphrase: None,
             spool_path: None,
             max_down_bytes_per_sec: None,
@@ -231,6 +238,23 @@ impl TorrentEngine {
         if self.cfg.paranoid && self.cfg.passphrase.is_none() {
             return Err(Error::Crypto(
                 "paranoid mode requires --passphrase (or RUSTYTORRENT_PASSPHRASE env)".into(),
+            ));
+        }
+        // --memory-only and --paranoid are different storage backends
+        // (in-RAM vs encrypted-on-disk). Both at once would require
+        // picking one to drive the storage task; refuse rather than
+        // silently choose.
+        if self.cfg.memory_only && self.cfg.paranoid {
+            return Err(Error::Network(
+                "--memory-only and --paranoid are mutually exclusive".into(),
+            ));
+        }
+        // --memory-only is Linux/macOS/BSD today; on Windows we'd have
+        // to either fall back to disk or implement an mmap variant.
+        // Bail explicitly so the user knows.
+        if self.cfg.memory_only && !crate::storage::MEMSPOOL_SUPPORTED {
+            return Err(Error::Network(
+                "--memory-only is not supported on this platform (Linux/macOS/BSD only)".into(),
             ));
         }
         // In anonymous mode we never want to emit a plain `\x13BitTorrent...`
@@ -373,7 +397,20 @@ impl TorrentEngine {
             p
         });
 
-        let storage_handle = if self.cfg.paranoid {
+        // Storage backend selection: memory-only > paranoid > plain disk.
+        // memory-only is the strongest "leave no trace" posture; paranoid
+        // is encrypted-at-rest; plain disk is the default.
+        let storage_handle = if self.cfg.memory_only {
+            tracing::info!(
+                target: "engine",
+                "memory-only storage: pieces live in RAM, nothing persisted to disk"
+            );
+            crate::storage::spawn_memspool_storage_task(
+                layout.clone(),
+                storage_cmd_rx,
+                storage_event_tx,
+            )
+        } else if self.cfg.paranoid {
             let passphrase = self
                 .cfg
                 .passphrase
@@ -396,10 +433,12 @@ impl TorrentEngine {
         };
 
         // Resume scan: hash-verify existing pieces (on-disk plaintext for
-        // the normal path, decrypted spool slots for paranoid) before
-        // talking to anyone.
+        // the normal path, decrypted spool slots for paranoid). Memory-only
+        // has nothing to resume from — RAM doesn't survive process exit.
         tracing::info!(target: "engine", "resume scan starting");
-        let already = if self.cfg.paranoid {
+        let already = if self.cfg.memory_only {
+            Vec::new()
+        } else if self.cfg.paranoid {
             let passphrase = self
                 .cfg
                 .passphrase
@@ -1359,6 +1398,23 @@ mod tests {
         for _ in 0..100 {
             assert!(jittered_interval(base, false) >= base);
             assert!(jittered_interval(base, true) >= base);
+        }
+    }
+
+    #[test]
+    fn memspool_platform_gate_matches_cfg() {
+        // Just a sanity assert that the platform gate is wired
+        // through — on the platforms we run CI on (Linux, macOS,
+        // Windows) this matches the cfg outcome we expect. Clippy
+        // warns about asserting a constant, but the constant is
+        // cfg-derived so its value is genuinely different across
+        // build targets.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            #[cfg(not(windows))]
+            assert!(crate::storage::MEMSPOOL_SUPPORTED);
+            #[cfg(windows)]
+            assert!(!crate::storage::MEMSPOOL_SUPPORTED);
         }
     }
 

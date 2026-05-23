@@ -35,7 +35,7 @@ protection that A-tier doesn't touch.
 | # | Item | What it gets you | Cost |
 |---|------|------------------|------|
 | B1 | **AES-GCM on-disk encryption for in-progress pieces** | The seized-laptop scenario: in-progress files on disk are the smoking gun even if every network bit was anonymous. Encrypt at the storage layer with a per-session key derived from a passphrase (Argon2). Decrypt on read; rewrite plaintext only when complete, or never with `--paranoid`. | ~150 lines + `aes-gcm` + `argon2` |
-| B2 | **`--memory-only` downloads** | Stream into RAM (Linux `/dev/shm`, macOS `MAP_ANON`, Windows named-pipe-style). No persistent artifacts at all. Combined with `--anonymous` this is the closest you get to "leave-no-trace". | ~100 lines, cross-platform tricky |
+| ~~B2~~ | ~~**`--memory-only` downloads**~~ — landed. Pieces live in a heap `Vec<Option<Vec<u8>>>`; nothing on disk. Linux/macOS/BSD only — Windows refused at startup. Mutex with `--paranoid`. | done |
 | B3 | **Per-peer Request rate limit** | Token-bucket on inbound `Request` so a single peer can't DoS the disk by spamming requests faster than we can read. | ~50 lines, no deps |
 | B4 | **Per-IP connection-rate limit on the listener** | Cap inbound connection attempts per source IP per minute. Reject the rest. Cheap protection against SYN-flood style abuse. | ~40 lines |
 | B5 | **MSE/PE reserved-bit fingerprint reduction** | The reserved-bytes pattern in handshake leaks client identity. Randomize the unused bits we don't need to set, or match libtorrent's pattern to blend in. | ~20 lines |
@@ -95,8 +95,15 @@ are rejected up front in that mode.
   the all-zero "I support nothing" pattern.
 
 ### B-tier remaining
-- B2: `--memory-only` (tmpfs / MAP_ANON) — partly subsumed by B1; left open
-  as a no-spool variant for sessions that fit in RAM.
+_None — B2 landed alongside the multi-hop chain work._
+
+### B2 — `--memory-only` storage
+- ✅ In-RAM piece store; nothing persisted to disk for the lifetime of
+  the process. Mutually exclusive with `--paranoid`. Engine startup
+  picker prefers memory-only > paranoid > plain disk. Unsupported on
+  Windows (clear error at startup rather than silent disk fallback).
+  Pairs well with `--anonymous` for the strongest "leave-no-trace"
+  posture available.
 
 ### B-tier additional
 - ✅ B4: per-source-IP rate limit on inbound listener (10-burst, 1/sec
