@@ -8,8 +8,22 @@ pub type PeerId = [u8; 20];
 /// The eight-char prefix identifies client and version; the
 /// remainder is random per session.
 pub fn generate() -> PeerId {
+    generate_with_prefix(b"-RT0100-")
+}
+
+/// Generate a peer_id that *looks like* libtorrent 2.0.9 to any tracker
+/// or peer reading the prefix. Used in anonymous mode so the
+/// Azureus-style prefix doesn't immediately identify us as
+/// rustytorrent in `peer_id` correlation across swarms or in tracker
+/// logs. Trailing 12 bytes are random ASCII as for the regular
+/// generator.
+pub fn generate_libtorrent_lookalike() -> PeerId {
+    generate_with_prefix(b"-LT2090-")
+}
+
+fn generate_with_prefix(prefix: &[u8; 8]) -> PeerId {
     let mut id = [0u8; 20];
-    id[..8].copy_from_slice(b"-RT0100-");
+    id[..8].copy_from_slice(prefix);
     let mut rng = rand::thread_rng();
     const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     for slot in &mut id[8..] {
@@ -127,6 +141,20 @@ mod tests {
     fn all_bytes_printable() {
         let id = generate();
         assert!(id.iter().all(|&c| c.is_ascii_graphic()));
+    }
+
+    #[test]
+    fn libtorrent_lookalike_has_lt_prefix() {
+        let id = generate_libtorrent_lookalike();
+        assert_eq!(&id[..8], b"-LT2090-");
+    }
+
+    #[test]
+    fn libtorrent_lookalike_trailing_bytes_random() {
+        let a = generate_libtorrent_lookalike();
+        let b = generate_libtorrent_lookalike();
+        assert_ne!(&a[8..], &b[8..]);
+        assert!(a.iter().all(|&c| c.is_ascii_graphic()));
     }
 
     fn temp_path(suffix: &str) -> PathBuf {

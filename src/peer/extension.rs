@@ -54,8 +54,14 @@ pub const EXT_HANDSHAKE_ID: u8 = 0;
 /// ignore today — no harm) and ut_pex peer-list updates (which we
 /// parse and route to the engine's PeerManager).
 ///
-/// `v` ("client version string") is conventional and helps debugging.
-pub fn build_handshake_payload() -> Vec<u8> {
+/// `anonymous = true` emits only the `m` dict — no `v` client version
+/// string, no `reqq` (which we set to `0`, a value real libtorrent
+/// peers never advertise). Both are byte-level fingerprints that
+/// uniquely identify us as rustytorrent even to a passive observer
+/// who can read the extension payload, so anonymous mode drops them
+/// to look indistinguishable from a libtorrent peer that simply
+/// hasn't advertised those optional keys.
+pub fn build_handshake_payload(anonymous: bool) -> Vec<u8> {
     let mut m_map = BTreeMap::new();
     m_map.insert(
         b"ut_metadata".to_vec(),
@@ -65,14 +71,19 @@ pub fn build_handshake_payload() -> Vec<u8> {
 
     let mut root = BTreeMap::new();
     root.insert(b"m".to_vec(), BencodeValue::Dict(m_map));
-    root.insert(
-        b"v".to_vec(),
-        BencodeValue::Bytes(format!("rustytorrent {}", env!("CARGO_PKG_VERSION")).into_bytes()),
-    );
-    // `reqq` advertises how many outstanding metadata requests we'll
-    // accept; we don't serve metadata yet (no info dict to share when
-    // bootstrapping via magnet ourselves), so 0 is honest.
-    root.insert(b"reqq".to_vec(), BencodeValue::Int(0));
+    if !anonymous {
+        root.insert(
+            b"v".to_vec(),
+            BencodeValue::Bytes(format!("rustytorrent {}", env!("CARGO_PKG_VERSION")).into_bytes()),
+        );
+        // `reqq` advertises how many outstanding metadata requests we'll
+        // accept; we don't serve metadata yet (no info dict to share when
+        // bootstrapping via magnet ourselves), so 0 is honest. Real
+        // libtorrent peers advertise large positive values here, so
+        // anonymous mode omits the key entirely rather than emit a
+        // distinguishing zero.
+        root.insert(b"reqq".to_vec(), BencodeValue::Int(0));
+    }
     BencodeValue::Dict(root).to_bytes()
 }
 
@@ -376,7 +387,7 @@ mod tests {
 
     #[test]
     fn handshake_payload_is_parseable_and_lists_ut_metadata() {
-        let bytes = build_handshake_payload();
+        let bytes = build_handshake_payload(false);
         // Round-trip: peer-side parse of our payload should see our ID.
         let info = parse_handshake_payload(&bytes).unwrap();
         // Our advertised m dict has ut_metadata, so a peer parsing
@@ -386,6 +397,33 @@ mod tests {
             info.metadata_size.is_none(),
             "we don't advertise a metadata_size since we have none to share"
         );
+    }
+
+    #[test]
+    fn anonymous_handshake_payload_omits_v_and_reqq() {
+        let bytes = build_handshake_payload(true);
+        let v = BencodeValue::parse_all(&bytes).unwrap();
+        let d = v.as_dict().unwrap();
+        // m is still present — peers need our ut_pex / ut_metadata ids.
+        assert!(d.contains_key(b"m".as_slice()));
+        // v and reqq are the distinguishing fingerprints; they must be gone.
+        assert!(
+            !d.contains_key(b"v".as_slice()),
+            "anonymous payload must not advertise v"
+        );
+        assert!(
+            !d.contains_key(b"reqq".as_slice()),
+            "anonymous payload must not advertise reqq"
+        );
+    }
+
+    #[test]
+    fn non_anonymous_handshake_payload_has_v_and_reqq() {
+        let bytes = build_handshake_payload(false);
+        let v = BencodeValue::parse_all(&bytes).unwrap();
+        let d = v.as_dict().unwrap();
+        assert!(d.contains_key(b"v".as_slice()));
+        assert!(d.contains_key(b"reqq".as_slice()));
     }
 
     #[test]
@@ -477,7 +515,7 @@ mod tests {
 
     #[test]
     fn handshake_payload_advertises_ut_pex_too() {
-        let bytes = build_handshake_payload();
+        let bytes = build_handshake_payload(false);
         let v = BencodeValue::parse_all(&bytes).unwrap();
         let m = v.dict_get(b"m").unwrap().as_dict().unwrap();
         assert_eq!(

@@ -142,6 +142,7 @@ pub type PeerHandle = mpsc::Sender<PeerCommand>;
 /// the signature failure of an MSE-only peer (we send `\x13BitTorrent…`,
 /// they immediately drop the connection) the caller is silently retried
 /// over MSE/PE.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct dial-time knob
 pub async fn run_outgoing(
     addr: SocketAddr,
     info_hash: [u8; 20],
@@ -150,6 +151,7 @@ pub async fn run_outgoing(
     cmd_rx: mpsc::Receiver<PeerCommand>,
     proxy: Option<ProxyConfig>,
     bind_iface: Option<String>,
+    anonymous: bool,
 ) -> Result<()> {
     tracing::debug!(target: "peer", %addr, via_proxy = proxy.is_some(), bind = ?bind_iface, "dialing (plain)");
     let iface = bind_iface.as_deref();
@@ -163,7 +165,16 @@ pub async fn run_outgoing(
                     peer_id: theirs.peer_id,
                 })
                 .await;
-            post_handshake_loop(reader, writer, addr, event_tx.clone(), cmd_rx, supports_ext).await
+            post_handshake_loop(
+                reader,
+                writer,
+                addr,
+                event_tx.clone(),
+                cmd_rx,
+                supports_ext,
+                anonymous,
+            )
+            .await
         }
         Err(e) if is_likely_mse_signal(&e) => {
             tracing::debug!(target: "peer", %addr, reason = %e, "plain failed, retrying with MSE");
@@ -184,6 +195,7 @@ pub async fn run_outgoing(
                         event_tx.clone(),
                         cmd_rx,
                         supports_ext,
+                        anonymous,
                     )
                     .await
                 }
@@ -207,6 +219,7 @@ pub async fn run_outgoing(
 /// Run an outgoing peer connection forcing MSE/PE — no plain attempt.
 /// Useful when the swarm is known to be MSE-only, or to drive the
 /// encrypted path in self-tests.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct dial-time knob
 pub async fn run_outgoing_mse_only(
     addr: SocketAddr,
     info_hash: [u8; 20],
@@ -215,6 +228,7 @@ pub async fn run_outgoing_mse_only(
     cmd_rx: mpsc::Receiver<PeerCommand>,
     proxy: Option<ProxyConfig>,
     bind_iface: Option<String>,
+    anonymous: bool,
 ) -> Result<()> {
     tracing::debug!(target: "peer", %addr, via_proxy = proxy.is_some(), bind = ?bind_iface, "dialing (MSE-only)");
     let outcome = match mse_handshake_outgoing(
@@ -235,7 +249,16 @@ pub async fn run_outgoing_mse_only(
                     peer_id: theirs.peer_id,
                 })
                 .await;
-            post_handshake_loop(reader, writer, addr, event_tx.clone(), cmd_rx, supports_ext).await
+            post_handshake_loop(
+                reader,
+                writer,
+                addr,
+                event_tx.clone(),
+                cmd_rx,
+                supports_ext,
+                anonymous,
+            )
+            .await
         }
         Err(e) => Err(e),
     };
@@ -396,6 +419,7 @@ async fn mse_handshake_outgoing(
 /// Run a peer task on an already-connected stream from an inbound TCP
 /// accept. Peeks the first byte to decide between plain BT (0x13) and MSE
 /// (anything else — the start of `Ya`), then dispatches.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct dial-time knob
 pub async fn run_with_stream(
     stream: TcpStream,
     addr: SocketAddr,
@@ -404,6 +428,7 @@ pub async fn run_with_stream(
     event_tx: mpsc::Sender<PeerEvent>,
     cmd_rx: mpsc::Receiver<PeerCommand>,
     outgoing: bool,
+    anonymous: bool,
 ) -> Result<()> {
     let outcome = if outgoing {
         // Outgoing-on-existing-stream is only used by tests today; keep it
@@ -416,10 +441,20 @@ pub async fn run_with_stream(
             event_tx.clone(),
             cmd_rx,
             true,
+            anonymous,
         )
         .await
     } else {
-        run_incoming_dispatch(stream, addr, info_hash, peer_id, event_tx.clone(), cmd_rx).await
+        run_incoming_dispatch(
+            stream,
+            addr,
+            info_hash,
+            peer_id,
+            event_tx.clone(),
+            cmd_rx,
+            anonymous,
+        )
+        .await
     };
 
     let reason = outcome
@@ -435,6 +470,7 @@ pub async fn run_with_stream(
 
 /// Plain BT handshake on an already-connected stream, then the standard
 /// post-handshake loop.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct dial-time knob
 async fn run_plain_on_stream(
     mut stream: TcpStream,
     addr: SocketAddr,
@@ -443,6 +479,7 @@ async fn run_plain_on_stream(
     event_tx: mpsc::Sender<PeerEvent>,
     cmd_rx: mpsc::Receiver<PeerCommand>,
     outgoing: bool,
+    anonymous: bool,
 ) -> Result<()> {
     let theirs = match timeout(HANDSHAKE_TIMEOUT, async {
         if outgoing {
@@ -464,7 +501,16 @@ async fn run_plain_on_stream(
         })
         .await;
     let (reader, writer) = stream.into_split();
-    post_handshake_loop(reader, writer, addr, event_tx, cmd_rx, supports_ext).await
+    post_handshake_loop(
+        reader,
+        writer,
+        addr,
+        event_tx,
+        cmd_rx,
+        supports_ext,
+        anonymous,
+    )
+    .await
 }
 
 /// Inbound connection dispatcher: peek the first byte and pick the right path.
@@ -475,6 +521,7 @@ async fn run_incoming_dispatch(
     peer_id: PeerId,
     event_tx: mpsc::Sender<PeerEvent>,
     cmd_rx: mpsc::Receiver<PeerCommand>,
+    anonymous: bool,
 ) -> Result<()> {
     // MSG_PEEK lets us inspect the byte without consuming it. tokio's
     // `TcpStream::peek` returns the number of bytes copied; 0 means EOF.
@@ -489,10 +536,16 @@ async fn run_incoming_dispatch(
     }
     if peek_buf[0] == crate::peer::handshake::PSTRLEN {
         // 0x13 → plain BT.
-        run_plain_on_stream(stream, addr, info_hash, peer_id, event_tx, cmd_rx, false).await
+        run_plain_on_stream(
+            stream, addr, info_hash, peer_id, event_tx, cmd_rx, false, anonymous,
+        )
+        .await
     } else {
         // Anything else → assume MSE/PE; the peeked byte is the first byte of Ya.
-        run_mse_on_stream(stream, addr, info_hash, peer_id, event_tx, cmd_rx).await
+        run_mse_on_stream(
+            stream, addr, info_hash, peer_id, event_tx, cmd_rx, anonymous,
+        )
+        .await
     }
 }
 
@@ -505,6 +558,7 @@ async fn run_mse_on_stream(
     peer_id: PeerId,
     event_tx: mpsc::Sender<PeerEvent>,
     cmd_rx: mpsc::Receiver<PeerCommand>,
+    anonymous: bool,
 ) -> Result<()> {
     let info_hashes = [info_hash];
     let (mut enc, _matched) = match timeout(
@@ -540,7 +594,16 @@ async fn run_mse_on_stream(
     let (read_half, write_half) = raw.into_split();
     let reader = mse::Rc4Reader::new(read_half, in_cipher);
     let writer = mse::Rc4Writer::new(write_half, out_cipher);
-    post_handshake_loop(reader, writer, addr, event_tx, cmd_rx, supports_ext).await
+    post_handshake_loop(
+        reader,
+        writer,
+        addr,
+        event_tx,
+        cmd_rx,
+        supports_ext,
+        anonymous,
+    )
+    .await
 }
 
 /// The generic post-handshake event loop. The read side runs on its own
@@ -558,6 +621,7 @@ async fn post_handshake_loop<R, W>(
     event_tx: mpsc::Sender<PeerEvent>,
     mut cmd_rx: mpsc::Receiver<PeerCommand>,
     peer_supports_extension: bool,
+    anonymous: bool,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -568,8 +632,10 @@ where
     // to use when forwarding us PEX (and ut_metadata, which we
     // silently ignore today). Peers that didn't advertise BEP 10 may
     // close the connection on an unknown id=20 frame, so we gate.
+    // Anonymous mode strips the `v` and `reqq` fields from the payload
+    // — those uniquely fingerprint us as rustytorrent.
     if peer_supports_extension {
-        let payload = crate::peer::extension::build_handshake_payload();
+        let payload = crate::peer::extension::build_handshake_payload(anonymous);
         let msg = Message::Extended {
             ext_id: crate::peer::extension::EXT_HANDSHAKE_ID,
             payload,

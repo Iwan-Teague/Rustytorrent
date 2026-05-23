@@ -82,6 +82,7 @@ pub async fn fetch_metadata(
     info_hash: [u8; 20],
     peer_pool: Vec<SocketAddr>,
     proxy: Option<ProxyConfig>,
+    anonymous: bool,
 ) -> Result<Vec<u8>> {
     if peer_pool.is_empty() {
         return Err(Error::Network(
@@ -89,7 +90,14 @@ pub async fn fetch_metadata(
         ));
     }
 
-    let our_peer_id = crate::peer_id::generate();
+    // Anonymous bootstrap: use a libtorrent-style peer_id so the prefix
+    // doesn't immediately leak the client name even before the engine
+    // takes over.
+    let our_peer_id = if anonymous {
+        crate::peer_id::generate_libtorrent_lookalike()
+    } else {
+        crate::peer_id::generate()
+    };
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCH));
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
 
@@ -103,7 +111,7 @@ pub async fn fetch_metadata(
                 Ok(p) => p,
                 Err(_) => return,
             };
-            match try_fetch_from(addr, info_hash, our_peer_id, proxy.as_ref()).await {
+            match try_fetch_from(addr, info_hash, our_peer_id, proxy.as_ref(), anonymous).await {
                 Ok(bytes) => {
                     // tx is bounded(1) — first sender wins; subsequent
                     // sends short-circuit because the receiver has
@@ -153,6 +161,7 @@ async fn try_fetch_from(
     info_hash: [u8; 20],
     our_peer_id: PeerId,
     proxy: Option<&ProxyConfig>,
+    anonymous: bool,
 ) -> Result<Vec<u8>> {
     // Attempt 1: plain BT handshake on a fresh TcpStream.
     let plain_result = async {
@@ -173,7 +182,7 @@ async fn try_fetch_from(
                 "peer lacks BEP 10 extension protocol".into(),
             ));
         }
-        exchange_metadata(&mut stream, info_hash, addr).await
+        exchange_metadata(&mut stream, info_hash, addr, anonymous).await
     }
     .await;
 
@@ -215,7 +224,7 @@ async fn try_fetch_from(
             "peer (over MSE) lacks BEP 10 extension protocol".into(),
         ));
     }
-    exchange_metadata(&mut enc, info_hash, addr).await
+    exchange_metadata(&mut enc, info_hash, addr, anonymous).await
 }
 
 /// Heuristic: did the plain BT handshake fail in a way that suggests the
@@ -242,6 +251,7 @@ async fn exchange_metadata<S>(
     stream: &mut S,
     info_hash: [u8; 20],
     addr: SocketAddr,
+    anonymous: bool,
 ) -> Result<Vec<u8>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -251,7 +261,7 @@ where
     // Have/etc. that legitimately also appear early).
     let our_ext = Message::Extended {
         ext_id: EXT_HANDSHAKE_ID,
-        payload: build_handshake_payload(),
+        payload: build_handshake_payload(anonymous),
     };
     write_message(stream, &our_ext)
         .await

@@ -205,6 +205,22 @@ impl TorrentEngine {
                 "anonymous mode requires --socks5; refusing to dial clearnet".into(),
             ));
         }
+        // Anonymous mode refuses cleartext `http://` trackers — a passive
+        // observer between us and the proxy would see the announce body
+        // even when the dial itself is masked. https:// is encrypted in
+        // transport; udp:// is already implicitly rejected because it
+        // can't ride SOCKS5 CONNECT. We check every URL we'd ever try
+        // (announce-list tiers + the single `announce` fallback) up
+        // front rather than per-tier so the user gets one clear error
+        // instead of a quiet skip-of-all-trackers later.
+        if self.cfg.anonymous {
+            if let Some(msg) = check_anonymous_tracker_urls(
+                &self.torrent.announce_list,
+                self.torrent.announce.as_deref(),
+            ) {
+                return Err(Error::Network(msg));
+            }
+        }
         // Paranoid mode needs a passphrase to derive the spool key. Fail
         // closed here rather than later inside the storage task spawn.
         if self.cfg.paranoid && self.cfg.passphrase.is_none() {
@@ -245,6 +261,7 @@ impl TorrentEngine {
         peers.set_force_outgoing_mse(self.cfg.force_outgoing_mse);
         peers.set_proxy(self.cfg.proxy.clone());
         peers.set_bind_iface(self.cfg.bind_iface.clone());
+        peers.set_anonymous(self.cfg.anonymous);
 
         // Bind incoming-connection listener — unless anonymous mode (the
         // listener would expose our real IP on the configured port).
@@ -401,11 +418,12 @@ impl TorrentEngine {
             Duration::from_secs(900)
         } else {
             let req = self.announce_request(Event::Started);
-            match tracker::announce_with_fallback(
+            match tracker::announce_with_fallback_anon(
                 &self.torrent.announce_list,
                 self.torrent.announce.as_deref(),
                 &req,
                 self.cfg.proxy.as_ref(),
+                self.cfg.anonymous,
             )
             .await
             {
@@ -519,16 +537,20 @@ impl TorrentEngine {
                     // fresh id. Defeats the "same client signature
                     // across unrelated swarms" correlation.
                     if self.cfg.anonymous {
-                        self.peer_id = crate::peer_id::generate();
+                        // Use the libtorrent-style prefix so the
+                        // rotation doesn't expose us as rustytorrent
+                        // via the Azureus prefix on every reannounce.
+                        self.peer_id = crate::peer_id::generate_libtorrent_lookalike();
                         peers.set_peer_id(self.peer_id);
                         tracing::debug!(target: "engine", "anonymous mode: rotated peer_id for new dials");
                     }
                     let req = self.announce_request(Event::None);
-                    let res = tracker::announce_with_fallback(
+                    let res = tracker::announce_with_fallback_anon(
                         &self.torrent.announce_list,
                         self.torrent.announce.as_deref(),
                         &req,
                         self.cfg.proxy.as_ref(),
+                        self.cfg.anonymous,
                     ).await;
                     match res {
                         Ok((_, resp)) => {
@@ -626,11 +648,12 @@ impl TorrentEngine {
         // Final stopped event.
         if !self.cfg.no_tracker {
             let req = self.announce_request(Event::Stopped);
-            let _ = tracker::announce_with_fallback(
+            let _ = tracker::announce_with_fallback_anon(
                 &self.torrent.announce_list,
                 self.torrent.announce.as_deref(),
                 &req,
                 self.cfg.proxy.as_ref(),
+                self.cfg.anonymous,
             )
             .await;
         }
@@ -1251,6 +1274,38 @@ fn bind_dual_stack_listener(port: u16) -> std::io::Result<tokio::net::TcpListene
     }
 }
 
+/// Return an error message if the torrent's tracker URLs include any
+/// cleartext `http://` entries — anonymous mode refuses those because
+/// the announce body is observable inside the proxied TCP stream.
+/// Returns `None` when every URL is safe (`https://` or `udp://`,
+/// which the higher layer handles separately).
+fn check_anonymous_tracker_urls(
+    announce_list: &[Vec<String>],
+    announce: Option<&str>,
+) -> Option<String> {
+    let mut bad: Vec<&str> = Vec::new();
+    for tier in announce_list {
+        for url in tier {
+            if url.starts_with("http://") {
+                bad.push(url.as_str());
+            }
+        }
+    }
+    if let Some(u) = announce {
+        if u.starts_with("http://") {
+            bad.push(u);
+        }
+    }
+    if bad.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "anonymous mode refuses cleartext http:// trackers: {}",
+            bad.join(", ")
+        ))
+    }
+}
+
 /// Compute a jittered re-announce interval (C6).
 ///
 /// We always jitter **upward** — going below the tracker's stated
@@ -1283,6 +1338,30 @@ mod tests {
             assert!(jittered_interval(base, false) >= base);
             assert!(jittered_interval(base, true) >= base);
         }
+    }
+
+    #[test]
+    fn anonymous_tracker_check_accepts_https_and_udp() {
+        let tiers = vec![
+            vec!["https://t.example/announce".into()],
+            vec!["udp://t.example:6969".into()],
+        ];
+        assert!(check_anonymous_tracker_urls(&tiers, None).is_none());
+    }
+
+    #[test]
+    fn anonymous_tracker_check_rejects_http() {
+        let tiers = vec![vec!["http://insecure.example/announce".into()]];
+        let msg = check_anonymous_tracker_urls(&tiers, None).expect("expected refusal");
+        assert!(msg.contains("http://insecure.example/announce"));
+    }
+
+    #[test]
+    fn anonymous_tracker_check_rejects_http_in_announce_fallback() {
+        let tiers: Vec<Vec<String>> = Vec::new();
+        let single = "http://fallback.example/announce";
+        let msg = check_anonymous_tracker_urls(&tiers, Some(single)).expect("expected refusal");
+        assert!(msg.contains(single));
     }
 
     #[test]

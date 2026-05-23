@@ -70,6 +70,19 @@ pub async fn announce_with_proxy(
     req: &AnnounceRequest,
     proxy: Option<&crate::socks5::ProxyConfig>,
 ) -> Result<AnnounceResponse> {
+    announce_with_proxy_anon(url, req, proxy, false).await
+}
+
+/// As `announce_with_proxy`, but when `anonymous` is true the HTTP
+/// announce sends a libtorrent-style User-Agent instead of the
+/// default `rustytorrent/<ver>` — the default UA is otherwise a
+/// trivially-distinctive fingerprint at the tracker.
+pub async fn announce_with_proxy_anon(
+    url: &str,
+    req: &AnnounceRequest,
+    proxy: Option<&crate::socks5::ProxyConfig>,
+    anonymous: bool,
+) -> Result<AnnounceResponse> {
     if url.starts_with("udp://") {
         if proxy.is_some() {
             return Err(crate::error::Error::Tracker(format!(
@@ -78,7 +91,7 @@ pub async fn announce_with_proxy(
         }
         udp::announce(url, req).await
     } else if url.starts_with("http://") || url.starts_with("https://") {
-        http::announce_with_proxy(url, req, proxy).await
+        http::announce_with_proxy_anon(url, req, proxy, anonymous).await
     } else {
         Err(crate::error::Error::Tracker(format!(
             "unsupported tracker scheme: {url}"
@@ -95,10 +108,23 @@ pub async fn announce_with_fallback(
     req: &AnnounceRequest,
     proxy: Option<&crate::socks5::ProxyConfig>,
 ) -> Result<(String, AnnounceResponse)> {
+    announce_with_fallback_anon(tiers, fallback_single, req, proxy, false).await
+}
+
+/// Anonymous-aware variant of `announce_with_fallback`: forwards the
+/// `anonymous` flag down to the per-URL announce so HTTP requests
+/// adopt the libtorrent-style User-Agent when set.
+pub async fn announce_with_fallback_anon(
+    tiers: &[Vec<String>],
+    fallback_single: Option<&str>,
+    req: &AnnounceRequest,
+    proxy: Option<&crate::socks5::ProxyConfig>,
+    anonymous: bool,
+) -> Result<(String, AnnounceResponse)> {
     let mut last_err: Option<crate::error::Error> = None;
     for tier in tiers {
         for url in tier {
-            match announce_with_proxy(url, req, proxy).await {
+            match announce_with_proxy_anon(url, req, proxy, anonymous).await {
                 Ok(r) => return Ok((url.clone(), r)),
                 Err(e) => {
                     tracing::warn!(url = %url, error = %e, "tracker announce failed");
@@ -108,7 +134,7 @@ pub async fn announce_with_fallback(
         }
     }
     if let Some(url) = fallback_single {
-        match announce_with_proxy(url, req, proxy).await {
+        match announce_with_proxy_anon(url, req, proxy, anonymous).await {
             Ok(r) => return Ok((url.to_string(), r)),
             Err(e) => {
                 tracing::warn!(url = %url, error = %e, "tracker announce failed");

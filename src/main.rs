@@ -451,9 +451,12 @@ async fn cmd_download(
     };
 
     // Anonymous mode insists on a fresh, non-persisted peer_id every run —
-    // a stable id across sessions would let observers correlate.
+    // a stable id across sessions would let observers correlate. The
+    // libtorrent-style prefix masks the rustytorrent identity that the
+    // default `-RT0100-` prefix would otherwise leak in every announce
+    // and handshake.
     let peer_id = if anonymous {
-        rustytorrent::peer_id::generate()
+        rustytorrent::peer_id::generate_libtorrent_lookalike()
     } else {
         rustytorrent::peer_id::load_or_generate(&rustytorrent::peer_id::default_path())
     };
@@ -663,7 +666,7 @@ async fn cmd_magnet(
     let proxy = resolve_proxy(socks5, socks5_user, socks5_pass, tor_isolation).await?;
 
     let peer_id = if anonymous {
-        rustytorrent::peer_id::generate()
+        rustytorrent::peer_id::generate_libtorrent_lookalike()
     } else {
         rustytorrent::peer_id::load_or_generate(&rustytorrent::peer_id::default_path())
     };
@@ -697,7 +700,14 @@ async fn cmd_magnet(
             num_want: 50,
         };
         for url in &magnet.trackers {
-            match rustytorrent::tracker::announce_with_proxy(url, &req, proxy.as_ref()).await {
+            match rustytorrent::tracker::announce_with_proxy_anon(
+                url,
+                &req,
+                proxy.as_ref(),
+                anonymous,
+            )
+            .await
+            {
                 Ok(resp) => {
                     tracing::info!(
                         target: "magnet",
@@ -754,10 +764,14 @@ async fn cmd_magnet(
     pool.dedup();
     println!("Bootstrap:  {} candidate peer(s)", pool.len());
 
-    let info_bytes =
-        rustytorrent::peer::metadata_fetch::fetch_metadata(magnet.info_hash, pool, proxy.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("magnet bootstrap: {e}"))?;
+    let info_bytes = rustytorrent::peer::metadata_fetch::fetch_metadata(
+        magnet.info_hash,
+        pool,
+        proxy.clone(),
+        anonymous,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("magnet bootstrap: {e}"))?;
     println!("Fetched:    {} bytes of info dict", info_bytes.len());
 
     // Shut down the bootstrap DHT before the engine spawns its own on

@@ -7,7 +7,7 @@
 
 Phases 1–6 implemented and verified, plus the MSE/PE encrypted-handshake and
 BEP-5 DHT slices of Phase 7. The build is clean (`cargo clippy -D warnings`
-and `cargo fmt --check` both pass), and **121** unit + integration tests run
+and `cargo fmt --check` both pass), and **199** unit + integration tests run
 green.
 
 End-to-end download is verified by:

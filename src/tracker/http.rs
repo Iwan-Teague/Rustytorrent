@@ -91,11 +91,45 @@ pub async fn announce_with_proxy(
     req: &AnnounceRequest,
     proxy: Option<&ProxyConfig>,
 ) -> Result<AnnounceResponse> {
+    announce_inner(base_url, req, proxy, None).await
+}
+
+/// User-Agent string we send when anonymized: matches libtorrent 2.0.9
+/// so a tracker (or any HTTP observer that sees the request) can't
+/// pick us out by UA alone. Real libtorrent emits exactly this string,
+/// so blending in here costs us nothing functionally.
+const LIBTORRENT_LOOKALIKE_UA: &str = "libtorrent/2.0.9";
+
+/// As `announce_with_proxy`, but additionally overrides the User-Agent
+/// header on the outbound request. Used by the engine in anonymous
+/// mode to avoid leaking the `rustytorrent/<ver>` UA we'd otherwise
+/// emit by default.
+pub async fn announce_with_proxy_anon(
+    base_url: &str,
+    req: &AnnounceRequest,
+    proxy: Option<&ProxyConfig>,
+    anonymous: bool,
+) -> Result<AnnounceResponse> {
+    let ua_override = if anonymous {
+        Some(LIBTORRENT_LOOKALIKE_UA)
+    } else {
+        None
+    };
+    announce_inner(base_url, req, proxy, ua_override).await
+}
+
+async fn announce_inner(
+    base_url: &str,
+    req: &AnnounceRequest,
+    proxy: Option<&ProxyConfig>,
+    ua_override: Option<&str>,
+) -> Result<AnnounceResponse> {
     let url = build_url(base_url, req);
     tracing::debug!(
         target: "tracker::http",
         url = %base_url,
         via_proxy = proxy.is_some(),
+        ua_override = ua_override.is_some(),
         "announcing"
     );
     let client_owned;
@@ -106,8 +140,13 @@ pub async fn announce_with_proxy(
         }
         None => direct_client(),
     };
-    let bytes = client
-        .get(&url)
+    let mut builder = client.get(&url);
+    if let Some(ua) = ua_override {
+        // Per-request header takes precedence over the client's default
+        // user_agent setting, so we don't have to rebuild the client.
+        builder = builder.header(reqwest::header::USER_AGENT, ua);
+    }
+    let bytes = builder
         .send()
         .await
         .map_err(|e| Error::Tracker(format!("http send: {e}")))?
@@ -323,5 +362,78 @@ mod tests {
         let r = parse_response(body).unwrap();
         assert_eq!(r.peers.len(), 1);
         assert_eq!(r.peers[0].to_string(), "127.0.0.1:6881");
+    }
+
+    /// Spin a tiny "HTTP server" that reads the request, captures the
+    /// User-Agent header, and replies with a minimal valid tracker
+    /// response. Returns the captured UA via a oneshot.
+    async fn spawn_ua_capture() -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            // Headers are case-insensitive; reqwest sends "User-Agent: ".
+            let ua = req
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("user-agent: ")
+                        .or(l.strip_prefix("User-Agent: "))
+                })
+                .unwrap_or("")
+                .to_string();
+            let _ = tx.send(ua);
+            // Minimal bencoded response: interval only, empty peer list.
+            let body = b"d8:intervali900e5:peers0:e";
+            let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.write_all(body).await;
+            let _ = sock.shutdown().await;
+        });
+        (addr, rx)
+    }
+
+    fn dummy_req() -> AnnounceRequest {
+        AnnounceRequest {
+            info_hash: [0; 20],
+            peer_id: [0; 20],
+            port: 0,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            event: crate::tracker::Event::None,
+            num_want: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_uses_libtorrent_ua() {
+        let (addr, rx) = spawn_ua_capture().await;
+        let url = format!("http://{addr}/announce");
+        let _ = announce_with_proxy_anon(&url, &dummy_req(), None, true)
+            .await
+            .unwrap();
+        let ua = rx.await.unwrap();
+        assert_eq!(ua, LIBTORRENT_LOOKALIKE_UA);
+    }
+
+    #[tokio::test]
+    async fn non_anonymous_uses_default_ua() {
+        let (addr, rx) = spawn_ua_capture().await;
+        let url = format!("http://{addr}/announce");
+        let _ = announce_with_proxy_anon(&url, &dummy_req(), None, false)
+            .await
+            .unwrap();
+        let ua = rx.await.unwrap();
+        assert!(
+            ua.starts_with("rustytorrent/"),
+            "expected default rustytorrent UA, got {ua:?}"
+        );
     }
 }

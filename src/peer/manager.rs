@@ -23,6 +23,10 @@ pub struct PeerManager {
     force_outgoing_mse: bool,
     proxy: Option<ProxyConfig>,
     bind_iface: Option<String>,
+    /// Anonymous-mode flag passed through to each peer task so the
+    /// BEP 10 extension handshake omits the `v` (client version) and
+    /// `reqq` fields that uniquely fingerprint us as rustytorrent.
+    anonymous: bool,
 }
 
 struct PeerSlot {
@@ -46,6 +50,7 @@ impl PeerManager {
             force_outgoing_mse: false,
             proxy: None,
             bind_iface: None,
+            anonymous: false,
         }
     }
 
@@ -63,6 +68,10 @@ impl PeerManager {
 
     pub fn set_bind_iface(&mut self, iface: Option<String>) {
         self.bind_iface = iface;
+    }
+
+    pub fn set_anonymous(&mut self, anonymous: bool) {
+        self.anonymous = anonymous;
     }
 
     /// Replace the peer_id used on every *future* outgoing dial. Already-
@@ -141,15 +150,16 @@ impl PeerManager {
         let force_mse = self.force_outgoing_mse;
         let proxy = self.proxy.clone();
         let bind_iface = self.bind_iface.clone();
+        let anonymous = self.anonymous;
         let task = tokio::spawn(async move {
             let res = if force_mse {
                 run_outgoing_mse_only(
-                    addr, info_hash, peer_id, event_tx, cmd_rx, proxy, bind_iface,
+                    addr, info_hash, peer_id, event_tx, cmd_rx, proxy, bind_iface, anonymous,
                 )
                 .await
             } else {
                 run_outgoing(
-                    addr, info_hash, peer_id, event_tx, cmd_rx, proxy, bind_iface,
+                    addr, info_hash, peer_id, event_tx, cmd_rx, proxy, bind_iface, anonymous,
                 )
                 .await
             };
@@ -179,9 +189,10 @@ impl PeerManager {
         let info_hash = self.info_hash;
         let peer_id = self.our_peer_id;
         let event_tx = self.event_tx.clone();
+        let anonymous = self.anonymous;
         let task = tokio::spawn(async move {
             if let Err(e) = crate::peer::connection::run_with_stream(
-                stream, addr, info_hash, peer_id, event_tx, cmd_rx, false,
+                stream, addr, info_hash, peer_id, event_tx, cmd_rx, false, anonymous,
             )
             .await
             {

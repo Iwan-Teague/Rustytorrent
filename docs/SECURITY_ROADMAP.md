@@ -68,8 +68,13 @@ protection that A-tier doesn't touch.
 
 ## Status
 
-Last updated: 2026-05-20. **A-tier complete; B-tier trio (B1+B3+B5) landed**
-in a follow-up pass — see git log. B2/B4 and C-tier remain open.
+Last updated: 2026-05-23. **A-tier complete; B1+B3+B4+B5 landed; most of
+C-tier (C5+C6) landed; full Phase 7 (BEP 10/11/9 + magnet) landed; bandwidth
+limiter, DHT announce_peer, dual-stack IPv6 listener, MSE on magnet
+bootstrap landed.** Anonymity-fingerprint pass (Stage 1) landed: the BEP 10
+extension handshake, peer_id prefix, and tracker User-Agent now blend in
+as libtorrent 2.0.9 under `--anonymous`, and cleartext `http://` trackers
+are rejected up front in that mode.
 
 ### A-tier landed
 - ✅ A1: DH parameter validation in MSE handshake — rejects degenerate Y values.
@@ -112,3 +117,19 @@ in a follow-up pass — see git log. B2/B4 and C-tier remain open.
 - ✅ Engine-wide bandwidth limiter (`--max-down` / `--max-up`) — token
   bucket on Request issuance and `serve_request`. Not a security item
   per se but lands alongside the C-tier work.
+
+### Anonymity-fingerprint pass (Stage 1)
+- ✅ BEP 10 extension handshake: under `--anonymous`, drop the `v`
+  (client version) and `reqq` (request queue depth) keys that
+  uniquely identify us as rustytorrent. Only the `m` dict is sent.
+- ✅ peer_id prefix: anonymous mode uses `-LT2090-` (libtorrent 2.0.9)
+  instead of the default `-RT0100-`. Applies to the initial id, the
+  magnet-bootstrap dial, and the mid-session reannounce rotation.
+- ✅ Tracker HTTP `User-Agent`: anonymous mode sends
+  `libtorrent/2.0.9` instead of the default `rustytorrent/<ver>`
+  per-announce, without rebuilding the cached HTTP client.
+- ✅ Cleartext `http://` trackers rejected up front under
+  `--anonymous` (an observer between us and the proxy can read the
+  HTTP body even when the dial itself is masked). `https://` and
+  `udp://` are unaffected (`udp://` is already blocked separately
+  because UDP can't ride SOCKS5 CONNECT).
