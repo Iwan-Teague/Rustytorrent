@@ -5,6 +5,7 @@ pub mod manager;
 pub mod message;
 pub mod metadata_fetch;
 pub mod mse;
+pub mod utp;
 
 pub use handshake::Handshake;
 pub use message::Message;
