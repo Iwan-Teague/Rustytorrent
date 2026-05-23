@@ -321,23 +321,17 @@ async fn dial(
 ) -> Result<TcpStream> {
     if !proxies.is_empty() {
         // Through a SOCKS5 chain: we connect to the first hop's IP, not
-        // the peer's. The bind-iface decision applies to the FIRST hop's
-        // TCP connection only (intermediate hops ride that single
-        // stream). socks5::connect_chain does its own TcpStream::connect
-        // under the hood — to enforce the bound iface we'd need to wire
-        // it through socks5. For now, refuse the combination loudly
-        // rather than silently leak via the default route.
-        if bind_iface.is_some() {
-            return Err(Error::Network(
-                "--bind-iface + --socks5 not yet supported together".into(),
-            ));
-        }
+        // the peer's. With --bind-iface set, the FIRST hop's TCP dial
+        // rides netbind so the kernel route to the proxy is forced
+        // onto the bound interface (intermediate hops ride that
+        // single TCP stream, so they inherit the binding for free).
+        //
         // Materialize the per-dial config for each hop: when stream
         // isolation is on this generates a fresh random SOCKS5
         // username on that hop so Tor puts this dial on its own
         // circuit. Hops without isolation are cloned as-is.
         let effective: Vec<ProxyConfig> = proxies.iter().map(|p| p.for_dial()).collect();
-        return socks5::connect_chain(&effective, addr)
+        return socks5::connect_chain(&effective, addr, bind_iface)
             .await
             .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}")));
     }

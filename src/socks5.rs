@@ -140,7 +140,7 @@ pub type Result<T> = std::result::Result<T, Socks5Error>;
 /// Dial `target` through `proxy`. Returns the underlying TCP stream which
 /// is, post-handshake, a transparent byte-pipe to `target`.
 pub async fn connect(proxy: &ProxyConfig, target: SocketAddr) -> Result<TcpStream> {
-    connect_chain(std::slice::from_ref(proxy), target).await
+    connect_chain(std::slice::from_ref(proxy), target, None).await
 }
 
 /// Dial `target` through a *chain* of SOCKS5 proxies. The client opens
@@ -151,9 +151,19 @@ pub async fn connect(proxy: &ProxyConfig, target: SocketAddr) -> Result<TcpStrea
 /// CONNECTs to `target`. RFC 1928 nests cleanly — each hop sees
 /// nothing but bytes flowing toward the next hop's address.
 ///
+/// When `bind_iface` is set the TCP socket to the FIRST hop is bound
+/// to that network interface (the VPN kill switch). Intermediate
+/// hops ride the same TCP stream and don't need their own binding —
+/// the bind affects which kernel route the bytes take to the first
+/// hop, which is the only thing observable to a non-tunnel link.
+///
 /// Chains of length 1 behave identically to the single-proxy `connect`.
 /// Chains of length 0 are rejected — that's a programming error.
-pub async fn connect_chain(chain: &[ProxyConfig], target: SocketAddr) -> Result<TcpStream> {
+pub async fn connect_chain(
+    chain: &[ProxyConfig],
+    target: SocketAddr,
+    bind_iface: Option<&str>,
+) -> Result<TcpStream> {
     if chain.is_empty() {
         return Err(Socks5Error::Protocol(
             "connect_chain called with empty chain".into(),
@@ -165,16 +175,28 @@ pub async fn connect_chain(chain: &[ProxyConfig], target: SocketAddr) -> Result<
     let total = PROXY_HANDSHAKE_TIMEOUT
         .checked_mul(chain.len() as u32)
         .unwrap_or(PROXY_HANDSHAKE_TIMEOUT);
-    match timeout(total, do_connect_chain(chain, target)).await {
+    match timeout(total, do_connect_chain(chain, target, bind_iface)).await {
         Ok(r) => r,
         Err(_) => Err(Socks5Error::Timeout),
     }
 }
 
-async fn do_connect_chain(chain: &[ProxyConfig], target: SocketAddr) -> Result<TcpStream> {
+async fn do_connect_chain(
+    chain: &[ProxyConfig],
+    target: SocketAddr,
+    bind_iface: Option<&str>,
+) -> Result<TcpStream> {
     // Open the TCP socket to the first proxy. Every subsequent hop's
-    // bytes flow through this same stream.
-    let mut stream = TcpStream::connect(chain[0].addr).await?;
+    // bytes flow through this same stream. With --bind-iface set, the
+    // first-hop dial goes via netbind so the kernel route to the
+    // proxy is forced onto the bound interface (fails closed if it
+    // goes away — the VPN kill switch invariant).
+    let mut stream = match bind_iface {
+        Some(iface) => crate::netbind::connect_via_interface(chain[0].addr, iface)
+            .await
+            .map_err(Socks5Error::Io)?,
+        None => TcpStream::connect(chain[0].addr).await?,
+    };
     let _ = stream.set_nodelay(true);
 
     // For hop i, the SOCKS5 CONNECT target is hop i+1's address; the
@@ -674,7 +696,7 @@ mod tests {
                 isolation: false,
             },
         ];
-        let mut stream = connect_chain(&chain, final_target).await.unwrap();
+        let mut stream = connect_chain(&chain, final_target, None).await.unwrap();
         // Post-chain the tunnel is transparent — the bytes we write
         // should appear at hop B's "trailing" buffer.
         stream.write_all(b"chain").await.unwrap();
@@ -688,8 +710,32 @@ mod tests {
     #[tokio::test]
     async fn connect_chain_rejects_empty_chain() {
         let target: SocketAddr = "1.1.1.1:80".parse().unwrap();
-        let res = connect_chain(&[], target).await;
+        let res = connect_chain(&[], target, None).await;
         assert!(matches!(res, Err(Socks5Error::Protocol(_))));
+    }
+
+    /// Verify the bind-iface plumbing reaches netbind: passing a
+    /// nonsense interface name fails the first-hop TCP dial with an
+    /// Io error from the netbind layer rather than silently falling
+    /// back to the default route. Cross-platform: every platform
+    /// either reports "iface not found" (Linux/macOS/BSD) or
+    /// "Unsupported" (Windows), and we just need *some* IO error.
+    #[tokio::test]
+    async fn connect_chain_with_unknown_bind_iface_errors() {
+        let target: SocketAddr = "1.1.1.1:80".parse().unwrap();
+        // Use a SOCKS5 hop address that would succeed if we ever
+        // reached it — the bind failure must short-circuit before
+        // we get there.
+        let chain = vec![ProxyConfig {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            credentials: None,
+            isolation: false,
+        }];
+        let res = connect_chain(&chain, target, Some("rt_nonexistent_iface_xyz123")).await;
+        assert!(
+            matches!(res, Err(Socks5Error::Io(_))),
+            "expected Io error from netbind, got {res:?}"
+        );
     }
 
     /// Proxy returns a non-success REP — caller surfaces it.

@@ -128,6 +128,15 @@ are rejected up front in that mode.
   reqwest's SOCKS5 support is single-hop. Length-1 chains behave
   identically to the previous single-proxy code path.
 
+### `--bind-iface` + `--socks5` combination
+- ✅ Previously refused at engine startup. Now supported: the TCP
+  dial to the first SOCKS5 hop itself rides netbind, so the kernel
+  route to the proxy is forced onto the bound interface (the VPN
+  kill-switch invariant: if the tunnel drops, dials fail closed
+  instead of falling back to the default route). Intermediate hops
+  in a multi-hop chain inherit the binding for free because they
+  ride the same TCP stream.
+
 ### Anonymity-fingerprint pass (Stage 1)
 - ✅ BEP 10 extension handshake: under `--anonymous`, drop the `v`
   (client version) and `reqq` (request queue depth) keys that

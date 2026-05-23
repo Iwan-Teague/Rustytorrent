@@ -428,8 +428,10 @@ async fn dial(addr: SocketAddr, proxies: &[ProxyConfig]) -> Result<TcpStream> {
         // Per-hop materialization so Tor stream isolation refreshes the
         // SOCKS5 username for this dial; non-isolated hops are cloned
         // as-is. The chain can be a single proxy (length 1) or many.
+        // No --bind-iface here: the magnet bootstrap path doesn't
+        // currently take an iface; if it ever does, plumb it down.
         let effective: Vec<ProxyConfig> = proxies.iter().map(|p| p.for_dial()).collect();
-        return timeout(DIAL_TIMEOUT, socks5::connect_chain(&effective, addr))
+        return timeout(DIAL_TIMEOUT, socks5::connect_chain(&effective, addr, None))
             .await
             .map_err(|_| Error::Network(format!("socks5 dial {addr}: timeout")))?
             .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}")));
