@@ -21,7 +21,9 @@ pub struct PeerManager {
     banned: HashSet<std::net::IpAddr>,
     max_peers: usize,
     force_outgoing_mse: bool,
-    proxy: Option<ProxyConfig>,
+    /// SOCKS5 chain for outgoing peer dials. Empty = direct (clearnet).
+    /// Length 1 = single hop. Length 2+ = nested SOCKS5 CONNECTs.
+    proxies: Vec<ProxyConfig>,
     bind_iface: Option<String>,
     /// Anonymous-mode flag passed through to each peer task so the
     /// BEP 10 extension handshake omits the `v` (client version) and
@@ -48,7 +50,7 @@ impl PeerManager {
             banned: HashSet::new(),
             max_peers: DEFAULT_MAX_PEERS,
             force_outgoing_mse: false,
-            proxy: None,
+            proxies: Vec::new(),
             bind_iface: None,
             anonymous: false,
         }
@@ -62,8 +64,8 @@ impl PeerManager {
         self.force_outgoing_mse = on;
     }
 
-    pub fn set_proxy(&mut self, proxy: Option<ProxyConfig>) {
-        self.proxy = proxy;
+    pub fn set_proxies(&mut self, proxies: Vec<ProxyConfig>) {
+        self.proxies = proxies;
     }
 
     pub fn set_bind_iface(&mut self, iface: Option<String>) {
@@ -148,18 +150,18 @@ impl PeerManager {
         let peer_id = self.our_peer_id;
         let event_tx = self.event_tx.clone();
         let force_mse = self.force_outgoing_mse;
-        let proxy = self.proxy.clone();
+        let proxies = self.proxies.clone();
         let bind_iface = self.bind_iface.clone();
         let anonymous = self.anonymous;
         let task = tokio::spawn(async move {
             let res = if force_mse {
                 run_outgoing_mse_only(
-                    addr, info_hash, peer_id, event_tx, cmd_rx, proxy, bind_iface, anonymous,
+                    addr, info_hash, peer_id, event_tx, cmd_rx, proxies, bind_iface, anonymous,
                 )
                 .await
             } else {
                 run_outgoing(
-                    addr, info_hash, peer_id, event_tx, cmd_rx, proxy, bind_iface, anonymous,
+                    addr, info_hash, peer_id, event_tx, cmd_rx, proxies, bind_iface, anonymous,
                 )
                 .await
             };

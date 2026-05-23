@@ -140,16 +140,66 @@ pub type Result<T> = std::result::Result<T, Socks5Error>;
 /// Dial `target` through `proxy`. Returns the underlying TCP stream which
 /// is, post-handshake, a transparent byte-pipe to `target`.
 pub async fn connect(proxy: &ProxyConfig, target: SocketAddr) -> Result<TcpStream> {
-    match timeout(PROXY_HANDSHAKE_TIMEOUT, do_connect(proxy, target)).await {
+    connect_chain(std::slice::from_ref(proxy), target).await
+}
+
+/// Dial `target` through a *chain* of SOCKS5 proxies. The client opens
+/// one TCP stream to `chain[0]` and then issues nested SOCKS5
+/// handshakes on that same stream: the first hop CONNECTs to
+/// `chain[1].addr`, the second hop (visible through the first hop's
+/// tunnel) CONNECTs to `chain[2].addr`, and so on, until the last hop
+/// CONNECTs to `target`. RFC 1928 nests cleanly — each hop sees
+/// nothing but bytes flowing toward the next hop's address.
+///
+/// Chains of length 1 behave identically to the single-proxy `connect`.
+/// Chains of length 0 are rejected — that's a programming error.
+pub async fn connect_chain(chain: &[ProxyConfig], target: SocketAddr) -> Result<TcpStream> {
+    if chain.is_empty() {
+        return Err(Socks5Error::Protocol(
+            "connect_chain called with empty chain".into(),
+        ));
+    }
+    // Scale the timeout with hop count so a 3-hop chain doesn't fail on
+    // the cumulative handshake budget. Each hop gets the same per-hop
+    // budget as a single proxy would have.
+    let total = PROXY_HANDSHAKE_TIMEOUT
+        .checked_mul(chain.len() as u32)
+        .unwrap_or(PROXY_HANDSHAKE_TIMEOUT);
+    match timeout(total, do_connect_chain(chain, target)).await {
         Ok(r) => r,
         Err(_) => Err(Socks5Error::Timeout),
     }
 }
 
-async fn do_connect(proxy: &ProxyConfig, target: SocketAddr) -> Result<TcpStream> {
-    let mut stream = TcpStream::connect(proxy.addr).await?;
+async fn do_connect_chain(chain: &[ProxyConfig], target: SocketAddr) -> Result<TcpStream> {
+    // Open the TCP socket to the first proxy. Every subsequent hop's
+    // bytes flow through this same stream.
+    let mut stream = TcpStream::connect(chain[0].addr).await?;
     let _ = stream.set_nodelay(true);
 
+    // For hop i, the SOCKS5 CONNECT target is hop i+1's address; the
+    // final hop's CONNECT target is the actual destination.
+    for (i, hop) in chain.iter().enumerate() {
+        let hop_target = if i + 1 < chain.len() {
+            chain[i + 1].addr
+        } else {
+            target
+        };
+        do_handshake_on_stream(&mut stream, hop, hop_target).await?;
+    }
+    Ok(stream)
+}
+
+/// Drive one SOCKS5 handshake (method negotiation + optional
+/// USER/PASS + CONNECT) over an already-open stream. The stream may
+/// be a raw TCP socket (first hop) or the tunneled byte-pipe from a
+/// previous hop's CONNECT (subsequent hops in a chain) — the
+/// handshake is wire-identical either way.
+async fn do_handshake_on_stream(
+    stream: &mut TcpStream,
+    proxy: &ProxyConfig,
+    target: SocketAddr,
+) -> Result<()> {
     // Step 1 — method negotiation.
     // We always offer NO_AUTH (cheap fallback for proxies that ignore creds).
     // If we have creds, we additionally offer USER/PASS; the proxy picks one.
@@ -178,7 +228,7 @@ async fn do_connect(proxy: &ProxyConfig, target: SocketAddr) -> Result<TcpStream
             let creds = proxy.credentials.as_ref().ok_or_else(|| {
                 Socks5Error::Protocol("proxy demanded USER/PASS but none provided".into())
             })?;
-            do_userpass_auth(&mut stream, creds).await?;
+            do_userpass_auth(stream, creds).await?;
         }
         METHOD_NONE_ACCEPTABLE => return Err(Socks5Error::AuthFailed),
         other => {
@@ -207,8 +257,8 @@ async fn do_connect(proxy: &ProxyConfig, target: SocketAddr) -> Result<TcpStream
     // Drain BIND.ADDR + BIND.PORT according to ATYP — we don't actually use
     // these values, but we need to consume them so the stream is byte-aligned
     // for application traffic.
-    drain_bind_addr_port(&mut stream, head[3]).await?;
-    Ok(stream)
+    drain_bind_addr_port(stream, head[3]).await?;
+    Ok(())
 }
 
 async fn do_userpass_auth(stream: &mut TcpStream, creds: &Credentials) -> Result<()> {
@@ -548,6 +598,98 @@ mod tests {
         .await;
         assert!(matches!(res, Err(Socks5Error::AuthFailed)));
         server.await.unwrap();
+    }
+
+    /// Spawn a SOCKS5 mock that, after a successful CONNECT, opens a
+    /// TCP connection to whatever address the client asked for and
+    /// proxies bytes bidirectionally. Lets us chain real mocks: the
+    /// middle hop genuinely forwards to the next hop's address, which
+    /// is what makes a multi-hop chain test meaningful.
+    async fn spawn_forwarding_mock_socks5() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            // Method negotiation.
+            let mut greeting = [0u8; 2];
+            client.read_exact(&mut greeting).await.unwrap();
+            let mut methods = vec![0u8; greeting[1] as usize];
+            client.read_exact(&mut methods).await.unwrap();
+            client
+                .write_all(&[VER_SOCKS5, METHOD_NO_AUTH])
+                .await
+                .unwrap();
+            // CONNECT request.
+            let mut req_head = [0u8; 4];
+            client.read_exact(&mut req_head).await.unwrap();
+            let mut addr_buf = [0u8; 6];
+            client.read_exact(&mut addr_buf).await.unwrap();
+            let next: SocketAddr = SocketAddr::from((
+                [addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3]],
+                u16::from_be_bytes([addr_buf[4], addr_buf[5]]),
+            ));
+            // Reply success.
+            client
+                .write_all(&[VER_SOCKS5, REP_SUCCEEDED, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            // Open the upstream connection and bidirectionally copy.
+            let upstream = TcpStream::connect(next).await.unwrap();
+            let (mut cr, mut cw) = client.into_split();
+            let (mut ur, mut uw) = upstream.into_split();
+            let a = tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut cr, &mut uw).await;
+            });
+            let b = tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut ur, &mut cw).await;
+            });
+            let _ = a.await;
+            let _ = b.await;
+        });
+        (addr, handle)
+    }
+
+    /// Two-hop chain end-to-end: client → hop A (forwarding) → hop B →
+    /// target. Hop A actually relays the next hop's bytes; hop B is
+    /// the terminating mock and captures the application-level
+    /// trailing bytes the client sends through both hops.
+    #[tokio::test]
+    async fn connect_chain_two_hops() {
+        // Final target the client wants to reach.
+        let final_target: SocketAddr = "9.9.9.9:6881".parse().unwrap();
+        // Hop B sits at the end and must be told its target is the final.
+        let (hop_b_addr, hop_b) = spawn_mock_socks5(false, final_target).await;
+        // Hop A is the first hop — it forwards to hop B.
+        let (hop_a_addr, _hop_a) = spawn_forwarding_mock_socks5().await;
+
+        let chain = vec![
+            ProxyConfig {
+                addr: hop_a_addr,
+                credentials: None,
+                isolation: false,
+            },
+            ProxyConfig {
+                addr: hop_b_addr,
+                credentials: None,
+                isolation: false,
+            },
+        ];
+        let mut stream = connect_chain(&chain, final_target).await.unwrap();
+        // Post-chain the tunnel is transparent — the bytes we write
+        // should appear at hop B's "trailing" buffer.
+        stream.write_all(b"chain").await.unwrap();
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"chain");
+        let b_result = hop_b.await.unwrap();
+        assert_eq!(b_result.trailing, b"chain");
+    }
+
+    #[tokio::test]
+    async fn connect_chain_rejects_empty_chain() {
+        let target: SocketAddr = "1.1.1.1:80".parse().unwrap();
+        let res = connect_chain(&[], target).await;
+        assert!(matches!(res, Err(Socks5Error::Protocol(_))));
     }
 
     /// Proxy returns a non-success REP — caller surfaces it.

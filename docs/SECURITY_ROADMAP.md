@@ -46,7 +46,7 @@ protection that A-tier doesn't touch.
 
 | # | Item | What it gets you | Cost |
 |---|------|------------------|------|
-| C1 | **Multi-hop proxy chaining** | SOCKS5 → SOCKS5 → target. Defeats single-proxy compromise even when the user doesn't trust their VPN. | ~60 lines |
+| ~~C1~~ | ~~**Multi-hop proxy chaining**~~ — landed. `--socks5` is now repeatable; the chain runs nested SOCKS5 CONNECTs on a single TCP stream. Credentials and Tor stream isolation attach to the last hop. Tracker HTTP still rides the first hop only (reqwest limit). | done |
 | C2 | **OS-level sandboxing** | seccomp filter (Linux), app sandbox profile (macOS), AppContainer (Windows). Defense-in-depth: even if an exploit lands, blast radius is contained. | platform-specific, ~200+ lines |
 | C3 | **µTP (BEP 29) over UDP** | Connect to peers that only speak µTP. Today we only do TCP, so a slice of the swarm is unreachable. Adds a UDP path that needs its own proxy story (or hard-off in anonymous mode, like DHT). | ~600 lines |
 | C4 | **I2P transport** | Native anonymity overlay; tiny swarms but no Tor-style exit-node trust issues. Substantial work — different transport entirely. | ~1000+ lines |
@@ -117,6 +117,16 @@ are rejected up front in that mode.
 - ✅ Engine-wide bandwidth limiter (`--max-down` / `--max-up`) — token
   bucket on Request issuance and `serve_request`. Not a security item
   per se but lands alongside the C-tier work.
+
+### C1 — Multi-hop SOCKS5 chaining
+- ✅ `--socks5` is repeatable; the chain runs nested SOCKS5 CONNECTs
+  on a single TCP stream (RFC 1928 nests cleanly). The first
+  `--socks5` is the entry hop, the last is the exit. Credentials and
+  `--tor-isolation` attach to the last hop only (typically the one
+  that actually enforces auth or where circuit isolation is
+  meaningful). Tracker HTTP rides only the first hop because
+  reqwest's SOCKS5 support is single-hop. Length-1 chains behave
+  identically to the previous single-proxy code path.
 
 ### Anonymity-fingerprint pass (Stage 1)
 - ✅ BEP 10 extension handshake: under `--anonymous`, drop the `v`

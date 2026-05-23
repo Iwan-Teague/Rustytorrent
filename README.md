@@ -25,7 +25,7 @@ Cross-platform: Linux, macOS (Intel + Apple Silicon), and Windows.
 | Choke algorithm (BEP 3: 3 regular + 1 optimistic, 20 s rolling window) | ✅ |
 | Resume scan on startup + DHT routing-table persistence | ✅ |
 | LRU upload-cache (32 pieces) to keep popular pieces in RAM | ✅ |
-| SOCKS5 outgoing proxy (RFC 1928 + RFC 1929 auth) for peer + tracker traffic | ✅ |
+| SOCKS5 outgoing proxy (RFC 1928 + RFC 1929 auth); repeatable for multi-hop chains | ✅ |
 | `--anonymous` bundle: DHT off, listener off, ephemeral peer_id, `port=0` | ✅ |
 | BEP 10 extension protocol + BEP 9 ut_metadata + magnet links | ✅ |
 | BEP 11 PEX — bidirectional: receive incoming peer lists + send delta updates every 60 s | ✅ |
@@ -97,9 +97,10 @@ rustytorrent download <file> [OPTIONS]
   --no-tracker              skip the .torrent's tracker list
   --dht                     enable BEP 5 DHT
   --encrypt                 force outgoing MSE/PE (skip plain attempt)
-  --socks5 host:port        route everything through SOCKS5
-  --socks5-user U           SOCKS5 username (requires --socks5)
-  --socks5-pass P           SOCKS5 password (requires --socks5-user)
+  --socks5 host:port        route through SOCKS5; repeat to chain hops
+                            (first = entry, last = exit; last hop sees creds)
+  --socks5-user U           SOCKS5 username for the LAST hop (requires --socks5)
+  --socks5-pass P           SOCKS5 password for the LAST hop (requires --socks5-user)
   --anonymous               strict bundle (requires --socks5; DHT/listener off)
   --bind-iface IFACE        VPN kill switch — bind outgoing sockets to IFACE
   --tor-isolation           per-peer SOCKS5 username so each dial gets its own Tor circuit
@@ -137,7 +138,7 @@ rustytorrent magnet <URI> [OPTIONS]        # download from a magnet link
 ## Development
 
 ```sh
-cargo test                            # 199 unit + integration tests
+cargo test                            # 201 unit + integration tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

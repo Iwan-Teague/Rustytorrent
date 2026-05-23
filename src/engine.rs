@@ -49,11 +49,16 @@ pub struct EngineConfig {
     pub enable_dht: bool,
     /// DHT bootstrap addresses (host:port). Empty → use built-in defaults.
     pub dht_bootstrap: Vec<String>,
-    /// SOCKS5 proxy for all outgoing peer dials and tracker HTTP. `None` →
-    /// direct connections (clearnet). When set, the swarm only sees the
-    /// proxy's IP; pair with `anonymous = true` to also close DHT/listener
-    /// side-channels that would otherwise leak the real IP.
-    pub proxy: Option<crate::socks5::ProxyConfig>,
+    /// SOCKS5 proxy chain for all outgoing peer dials. Empty → direct
+    /// connections (clearnet). Length 1 → single-hop proxy (the typical
+    /// `--socks5 host:port` case). Length 2+ → multi-hop chain: bytes
+    /// flow client → proxies[0] → proxies[1] → … → target via nested
+    /// SOCKS5 CONNECTs on a single TCP stream. Defeats single-proxy
+    /// compromise (C1).
+    ///
+    /// Tracker HTTP traffic uses only `proxies[0]` (reqwest's SOCKS5
+    /// support is single-hop). Peer dials use the full chain.
+    pub proxies: Vec<crate::socks5::ProxyConfig>,
     /// Bind every outbound socket to this network interface (e.g. `utun0`,
     /// `tun0`). Acts as a VPN kill switch — if the interface goes away,
     /// dials fail closed instead of falling back to the default route.
@@ -102,7 +107,7 @@ impl Default for EngineConfig {
             force_outgoing_mse: false,
             enable_dht: false,
             dht_bootstrap: Vec::new(),
-            proxy: None,
+            proxies: Vec::new(),
             anonymous: false,
             bind_iface: None,
             paranoid: false,
@@ -200,7 +205,7 @@ impl TorrentEngine {
     pub async fn run(mut self) -> Result<()> {
         // Anonymous mode is strict: without a proxy we'd leak the real IP on
         // every dial. Refuse to start rather than silently downgrade.
-        if self.cfg.anonymous && self.cfg.proxy.is_none() {
+        if self.cfg.anonymous && self.cfg.proxies.is_empty() {
             return Err(Error::Network(
                 "anonymous mode requires --socks5; refusing to dial clearnet".into(),
             ));
@@ -240,8 +245,25 @@ impl TorrentEngine {
                 "anonymous mode: DHT off, listener off, port=0 in announces, MSE-only outgoing"
             );
         }
-        if let Some(p) = &self.cfg.proxy {
-            tracing::info!(target: "engine", proxy = %p.addr, "routing peer + tracker traffic through SOCKS5");
+        if !self.cfg.proxies.is_empty() {
+            let hops: Vec<String> = self
+                .cfg
+                .proxies
+                .iter()
+                .map(|p| p.addr.to_string())
+                .collect();
+            tracing::info!(
+                target: "engine",
+                hops = ?hops,
+                "routing peer traffic through SOCKS5 chain ({} hop(s))",
+                self.cfg.proxies.len()
+            );
+            if self.cfg.proxies.len() > 1 {
+                tracing::info!(
+                    target: "engine",
+                    "tracker HTTP uses only the first hop (reqwest is single-hop SOCKS5)"
+                );
+            }
         }
 
         // B5 — advertise the extensions we actually implement in the
@@ -259,7 +281,7 @@ impl TorrentEngine {
         let mut peers = PeerManager::new(self.torrent.info_hash, self.peer_id, peer_event_tx);
         peers.set_max_peers(self.cfg.max_peers);
         peers.set_force_outgoing_mse(self.cfg.force_outgoing_mse);
-        peers.set_proxy(self.cfg.proxy.clone());
+        peers.set_proxies(self.cfg.proxies.clone());
         peers.set_bind_iface(self.cfg.bind_iface.clone());
         peers.set_anonymous(self.cfg.anonymous);
 
@@ -422,7 +444,7 @@ impl TorrentEngine {
                 &self.torrent.announce_list,
                 self.torrent.announce.as_deref(),
                 &req,
-                self.cfg.proxy.as_ref(),
+                self.cfg.proxies.first(),
                 self.cfg.anonymous,
             )
             .await
@@ -549,7 +571,7 @@ impl TorrentEngine {
                         &self.torrent.announce_list,
                         self.torrent.announce.as_deref(),
                         &req,
-                        self.cfg.proxy.as_ref(),
+                        self.cfg.proxies.first(),
                         self.cfg.anonymous,
                     ).await;
                     match res {
@@ -652,7 +674,7 @@ impl TorrentEngine {
                 &self.torrent.announce_list,
                 self.torrent.announce.as_deref(),
                 &req,
-                self.cfg.proxy.as_ref(),
+                self.cfg.proxies.first(),
                 self.cfg.anonymous,
             )
             .await;

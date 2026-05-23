@@ -45,12 +45,18 @@ enum Commands {
         /// Enable the BEP 5 DHT for trackerless peer discovery.
         #[arg(long, default_value_t = false)]
         dht: bool,
-        /// SOCKS5 proxy address (host:port). All outgoing peer dials and HTTP-tracker
-        /// requests will be routed through it. Use `127.0.0.1:9050` for Tor's
-        /// local SOCKS port, or your VPN's loopback SOCKS endpoint.
+        /// SOCKS5 proxy address (host:port). Repeat to build a chain
+        /// `client → proxy1 → proxy2 → … → target` for multi-hop
+        /// anonymity (C1) — each hop runs nested SOCKS5 CONNECTs on a
+        /// single TCP stream. Use `127.0.0.1:9050` for Tor's local
+        /// SOCKS port, or your VPN's loopback SOCKS endpoint. First
+        /// `--socks5` is closest to us; last is closest to the
+        /// destination.
         #[arg(long)]
-        socks5: Option<String>,
-        /// Optional SOCKS5 username (paired with --socks5-pass for RFC 1929 auth).
+        socks5: Vec<String>,
+        /// Optional SOCKS5 username. Applied to the LAST hop only
+        /// (typically the Tor / VPN endpoint that actually validates
+        /// auth). Paired with --socks5-pass for RFC 1929 auth.
         #[arg(long, requires = "socks5")]
         socks5_user: Option<String>,
         /// Optional SOCKS5 password. Required if --socks5-user is set.
@@ -127,7 +133,7 @@ enum Commands {
         #[arg(long, default_value_t = true)]
         dht: bool,
         #[arg(long)]
-        socks5: Option<String>,
+        socks5: Vec<String>,
         #[arg(long, requires = "socks5")]
         socks5_user: Option<String>,
         #[arg(long, requires = "socks5_user")]
@@ -386,7 +392,7 @@ async fn cmd_download(
     no_tracker: bool,
     encrypt: bool,
     dht: bool,
-    socks5: Option<String>,
+    socks5: Vec<String>,
     socks5_user: Option<String>,
     socks5_pass: Option<String>,
     anonymous: bool,
@@ -418,37 +424,11 @@ async fn cmd_download(
         parsed_peers.push(addr);
     }
 
-    // Resolve the SOCKS5 proxy if requested. We resolve the host once at
-    // startup so we don't emit DNS queries on the clearnet for every dial.
-    let proxy = match socks5 {
-        None => None,
-        Some(spec) => {
-            // Accept either "host:port" or "ip:port".
-            let addr = tokio::net::lookup_host(spec.as_str())
-                .await
-                .with_context(|| format!("resolving SOCKS5 proxy {spec}"))?
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("SOCKS5 proxy {spec} did not resolve"))?;
-            let credentials = match (socks5_user, socks5_pass) {
-                (Some(u), Some(p)) => Some(rustytorrent::socks5::Credentials {
-                    username: u,
-                    password: p,
-                }),
-                (None, None) => None,
-                _ => anyhow::bail!("--socks5-user and --socks5-pass must be set together"),
-            };
-            if tor_isolation {
-                println!("Proxy:      {addr} (SOCKS5, Tor stream isolation on)");
-            } else {
-                println!("Proxy:      {addr} (SOCKS5)");
-            }
-            Some(rustytorrent::socks5::ProxyConfig {
-                addr,
-                credentials,
-                isolation: tor_isolation,
-            })
-        }
-    };
+    // Resolve the SOCKS5 chain. Each --socks5 becomes one hop; the first
+    // is closest to us, the last is closest to the destination. We
+    // resolve the hosts once at startup so we don't emit DNS queries on
+    // the clearnet for every dial.
+    let proxies = resolve_proxy_chain(socks5, socks5_user, socks5_pass, tor_isolation).await?;
 
     // Anonymous mode insists on a fresh, non-persisted peer_id every run —
     // a stable id across sessions would let observers correlate. The
@@ -492,7 +472,7 @@ async fn cmd_download(
         no_tracker,
         force_outgoing_mse: encrypt,
         enable_dht: dht,
-        proxy,
+        proxies,
         anonymous,
         bind_iface,
         paranoid,
@@ -588,23 +568,28 @@ async fn cmd_decrypt(
     Ok(())
 }
 
-/// Resolve a `--socks5` flag value to a `ProxyConfig`, including
-/// optional credentials and the Tor isolation knob. Shared by
-/// `cmd_download` and `cmd_magnet`.
-async fn resolve_proxy(
-    socks5: Option<String>,
+/// Resolve a list of `--socks5` flag values to a SOCKS5 chain. The
+/// chain is the dial path from us to the destination: hop 0 dials hop
+/// 1, hop 1 dials hop 2, … hop N-1 dials the actual target. Empty
+/// input → empty chain (direct dial). Shared by `cmd_download` and
+/// `cmd_magnet`.
+///
+/// Credentials and Tor stream isolation are applied to the LAST hop
+/// only — typically the Tor / VPN endpoint that actually enforces
+/// auth or where circuit isolation is meaningful. Earlier hops are
+/// usually just transit (e.g. a corporate VPN) that doesn't need auth.
+async fn resolve_proxy_chain(
+    socks5: Vec<String>,
     socks5_user: Option<String>,
     socks5_pass: Option<String>,
     tor_isolation: bool,
-) -> Result<Option<rustytorrent::socks5::ProxyConfig>> {
-    let Some(spec) = socks5 else {
-        return Ok(None);
-    };
-    let addr = tokio::net::lookup_host(spec.as_str())
-        .await
-        .with_context(|| format!("resolving SOCKS5 proxy {spec}"))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("SOCKS5 proxy {spec} did not resolve"))?;
+) -> Result<Vec<rustytorrent::socks5::ProxyConfig>> {
+    if socks5.is_empty() {
+        if socks5_user.is_some() || socks5_pass.is_some() || tor_isolation {
+            anyhow::bail!("--socks5-user / --socks5-pass / --tor-isolation require --socks5");
+        }
+        return Ok(Vec::new());
+    }
     let credentials = match (socks5_user, socks5_pass) {
         (Some(u), Some(p)) => Some(rustytorrent::socks5::Credentials {
             username: u,
@@ -613,16 +598,38 @@ async fn resolve_proxy(
         (None, None) => None,
         _ => anyhow::bail!("--socks5-user and --socks5-pass must be set together"),
     };
-    if tor_isolation {
-        println!("Proxy:      {addr} (SOCKS5, Tor stream isolation on)");
-    } else {
-        println!("Proxy:      {addr} (SOCKS5)");
+    let last_idx = socks5.len() - 1;
+    let mut chain = Vec::with_capacity(socks5.len());
+    for (i, spec) in socks5.iter().enumerate() {
+        let addr = tokio::net::lookup_host(spec.as_str())
+            .await
+            .with_context(|| format!("resolving SOCKS5 proxy {spec}"))?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("SOCKS5 proxy {spec} did not resolve"))?;
+        let is_last = i == last_idx;
+        let creds = if is_last { credentials.clone() } else { None };
+        let iso = if is_last { tor_isolation } else { false };
+        let role = if last_idx == 0 {
+            "SOCKS5"
+        } else if i == 0 {
+            "SOCKS5 hop 1 (entry)"
+        } else if is_last {
+            "SOCKS5 last hop (exit)"
+        } else {
+            "SOCKS5 mid hop"
+        };
+        if iso {
+            println!("Proxy:      {addr} ({role}, Tor stream isolation on)");
+        } else {
+            println!("Proxy:      {addr} ({role})");
+        }
+        chain.push(rustytorrent::socks5::ProxyConfig {
+            addr,
+            credentials: creds,
+            isolation: iso,
+        });
     }
-    Ok(Some(rustytorrent::socks5::ProxyConfig {
-        addr,
-        credentials,
-        isolation: tor_isolation,
-    }))
+    Ok(chain)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -633,7 +640,7 @@ async fn cmd_magnet(
     extra_peers: Vec<String>,
     encrypt: bool,
     dht: bool,
-    socks5: Option<String>,
+    socks5: Vec<String>,
     socks5_user: Option<String>,
     socks5_pass: Option<String>,
     anonymous: bool,
@@ -663,7 +670,7 @@ async fn cmd_magnet(
         rustytorrent::peer::handshake::extension_bytes_from(dht && !anonymous, true),
     );
 
-    let proxy = resolve_proxy(socks5, socks5_user, socks5_pass, tor_isolation).await?;
+    let proxies = resolve_proxy_chain(socks5, socks5_user, socks5_pass, tor_isolation).await?;
 
     let peer_id = if anonymous {
         rustytorrent::peer_id::generate_libtorrent_lookalike()
@@ -703,7 +710,7 @@ async fn cmd_magnet(
             match rustytorrent::tracker::announce_with_proxy_anon(
                 url,
                 &req,
-                proxy.as_ref(),
+                proxies.first(),
                 anonymous,
             )
             .await
@@ -767,7 +774,7 @@ async fn cmd_magnet(
     let info_bytes = rustytorrent::peer::metadata_fetch::fetch_metadata(
         magnet.info_hash,
         pool,
-        proxy.clone(),
+        proxies.clone(),
         anonymous,
     )
     .await
@@ -822,7 +829,7 @@ async fn cmd_magnet(
         no_tracker: false,
         force_outgoing_mse: encrypt,
         enable_dht: dht,
-        proxy,
+        proxies,
         anonymous,
         bind_iface,
         paranoid,

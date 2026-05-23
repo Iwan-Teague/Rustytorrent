@@ -81,7 +81,7 @@ const FETCH_MAX_FRAME_LEN: u32 = (METADATA_PIECE_SIZE as u32) + 1024;
 pub async fn fetch_metadata(
     info_hash: [u8; 20],
     peer_pool: Vec<SocketAddr>,
-    proxy: Option<ProxyConfig>,
+    proxies: Vec<ProxyConfig>,
     anonymous: bool,
 ) -> Result<Vec<u8>> {
     if peer_pool.is_empty() {
@@ -105,13 +105,13 @@ pub async fn fetch_metadata(
     for addr in peer_pool {
         let sem = sem.clone();
         let tx = tx.clone();
-        let proxy = proxy.clone();
+        let proxies = proxies.clone();
         let handle = tokio::spawn(async move {
             let permit = match sem.acquire().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
-            match try_fetch_from(addr, info_hash, our_peer_id, proxy.as_ref(), anonymous).await {
+            match try_fetch_from(addr, info_hash, our_peer_id, &proxies, anonymous).await {
                 Ok(bytes) => {
                     // tx is bounded(1) — first sender wins; subsequent
                     // sends short-circuit because the receiver has
@@ -160,12 +160,12 @@ async fn try_fetch_from(
     addr: SocketAddr,
     info_hash: [u8; 20],
     our_peer_id: PeerId,
-    proxy: Option<&ProxyConfig>,
+    proxies: &[ProxyConfig],
     anonymous: bool,
 ) -> Result<Vec<u8>> {
     // Attempt 1: plain BT handshake on a fresh TcpStream.
     let plain_result = async {
-        let mut stream = dial(addr, proxy).await?;
+        let mut stream = dial(addr, proxies).await?;
         let _ = stream.set_nodelay(true);
         let theirs = match timeout(
             HANDSHAKE_TIMEOUT,
@@ -197,7 +197,7 @@ async fn try_fetch_from(
     // Attempt 2: MSE handshake on a fresh TcpStream. The first TCP
     // attempt is now in some intermediate state (we sent the plain pstr
     // and got a reject or EOF), so we redial cleanly.
-    let stream = dial(addr, proxy).await?;
+    let stream = dial(addr, proxies).await?;
     let _ = stream.set_nodelay(true);
     let mut enc = match timeout(
         HANDSHAKE_TIMEOUT,
@@ -423,20 +423,21 @@ where
     }
 }
 
-async fn dial(addr: SocketAddr, proxy: Option<&ProxyConfig>) -> Result<TcpStream> {
-    match proxy {
-        Some(p) => {
-            let effective = p.for_dial();
-            timeout(DIAL_TIMEOUT, socks5::connect(&effective, addr))
-                .await
-                .map_err(|_| Error::Network(format!("socks5 dial {addr}: timeout")))?
-                .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}")))
-        }
-        None => timeout(DIAL_TIMEOUT, TcpStream::connect(addr))
+async fn dial(addr: SocketAddr, proxies: &[ProxyConfig]) -> Result<TcpStream> {
+    if !proxies.is_empty() {
+        // Per-hop materialization so Tor stream isolation refreshes the
+        // SOCKS5 username for this dial; non-isolated hops are cloned
+        // as-is. The chain can be a single proxy (length 1) or many.
+        let effective: Vec<ProxyConfig> = proxies.iter().map(|p| p.for_dial()).collect();
+        return timeout(DIAL_TIMEOUT, socks5::connect_chain(&effective, addr))
             .await
-            .map_err(|_| Error::Network(format!("connect {addr}: timeout")))?
-            .map_err(|e| Error::Network(format!("connect {addr}: {e}"))),
+            .map_err(|_| Error::Network(format!("socks5 dial {addr}: timeout")))?
+            .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}")));
     }
+    timeout(DIAL_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| Error::Network(format!("connect {addr}: timeout")))?
+        .map_err(|e| Error::Network(format!("connect {addr}: {e}")))
 }
 
 // `HANDSHAKE_LEN` is part of the `handshake` API; reference it so the
