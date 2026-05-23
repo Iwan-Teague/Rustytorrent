@@ -140,7 +140,7 @@ rustytorrent magnet <URI> [OPTIONS]        # download from a magnet link
 ## Development
 
 ```sh
-cargo test                            # 209 unit + integration tests
+cargo test                            # 217 unit + integration tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

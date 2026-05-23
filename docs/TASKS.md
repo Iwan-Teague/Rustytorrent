@@ -7,7 +7,7 @@
 
 Phases 1–6 implemented and verified, plus the MSE/PE encrypted-handshake and
 BEP-5 DHT slices of Phase 7. The build is clean (`cargo clippy -D warnings`
-and `cargo fmt --check` both pass), and **209** unit + integration tests run
+and `cargo fmt --check` both pass), and **217** unit + integration tests run
 green.
 
 End-to-end download is verified by:
@@ -233,7 +233,7 @@ Outstanding gaps:
 ### Peer Banning
 - [x] Maintain `HashSet<IpAddr>` of banned peers (`PeerManager::banned`)
 - [x] Ban peer on hash mismatch (in engine's Block handler)
-- [ ] Ban peer on repeated protocol violations — currently bans only on SHA1 mismatch; protocol-error escalation not yet implemented
+- [x] Ban peer on repeated protocol violations — per-IP rolling-window counter (3 strikes in 60 s) covers bad pstr, info_hash mismatch, oversized frame, malformed message, bitfield spare-bit violations; benign network errors (EOF, timeout, reset) don't count
 - [x] Skip banned peers when connecting (and accepting)
 
 ### Incoming Connections (`src/engine.rs`)

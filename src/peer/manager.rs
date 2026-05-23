@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -11,6 +12,14 @@ use crate::socks5::ProxyConfig;
 pub const DEFAULT_MAX_PEERS: usize = 50;
 pub const PER_PEER_CMD_BUFFER: usize = 64;
 
+/// Per-IP protocol-violation counter window. After this many
+/// violations within `VIOLATION_WINDOW` the IP is banned.
+pub const VIOLATION_BAN_THRESHOLD: u32 = 3;
+/// Rolling window for the violation counter. Violations older than
+/// this contribute nothing — long-running sessions don't accumulate
+/// stale strikes against peers that only had a single transient bug.
+pub const VIOLATION_WINDOW: Duration = Duration::from_secs(60);
+
 /// Pool of active peer connections. The engine owns one of these and
 /// uses `handle()` to send commands to specific peers.
 pub struct PeerManager {
@@ -18,7 +27,7 @@ pub struct PeerManager {
     our_peer_id: PeerId,
     event_tx: mpsc::Sender<PeerEvent>,
     peers: HashMap<SocketAddr, PeerSlot>,
-    banned: HashSet<std::net::IpAddr>,
+    banned: HashSet<IpAddr>,
     max_peers: usize,
     force_outgoing_mse: bool,
     /// SOCKS5 chain for outgoing peer dials. Empty = direct (clearnet).
@@ -29,6 +38,12 @@ pub struct PeerManager {
     /// BEP 10 extension handshake omits the `v` (client version) and
     /// `reqq` fields that uniquely fingerprint us as rustytorrent.
     anonymous: bool,
+    /// Per-IP protocol-violation timestamps within the rolling
+    /// `VIOLATION_WINDOW`. When the count reaches
+    /// `VIOLATION_BAN_THRESHOLD` the IP joins the ban set. The map
+    /// only grows for IPs that have actually violated; clean peers
+    /// never appear here. Entries are pruned lazily on insert.
+    violations: HashMap<IpAddr, Vec<Instant>>,
 }
 
 struct PeerSlot {
@@ -53,6 +68,7 @@ impl PeerManager {
             proxies: Vec::new(),
             bind_iface: None,
             anonymous: false,
+            violations: HashMap::new(),
         }
     }
 
@@ -97,7 +113,47 @@ impl PeerManager {
         self.peers.keys()
     }
 
-    pub fn ban(&mut self, ip: std::net::IpAddr) {
+    /// Record a BEP 3 protocol violation observed from `ip` (bad
+    /// pstr, frame too large, malformed message, etc.). If the
+    /// rolling-window count reaches `VIOLATION_BAN_THRESHOLD`, ban
+    /// the IP immediately and drop any active connections from it.
+    ///
+    /// Returns `true` when the call resulted in a ban (so the
+    /// caller can log it once). Idempotent: subsequent violations
+    /// from an already-banned IP still get counted but the return
+    /// value is false.
+    pub fn record_violation(&mut self, ip: IpAddr) -> bool {
+        if self.banned.contains(&ip) {
+            // Already banned — keep counting (cheap) but don't fire
+            // again. Cleanup happens at the GC tick below.
+            return false;
+        }
+        let now = Instant::now();
+        let entry = self.violations.entry(ip).or_default();
+        entry.retain(|t| now.duration_since(*t) <= VIOLATION_WINDOW);
+        entry.push(now);
+        let count = entry.len() as u32;
+        if count >= VIOLATION_BAN_THRESHOLD {
+            tracing::warn!(
+                target: "peer::manager",
+                %ip,
+                violations = count,
+                "protocol violations exceeded threshold; banning IP"
+            );
+            self.ban(ip);
+            return true;
+        }
+        tracing::debug!(
+            target: "peer::manager",
+            %ip,
+            count,
+            threshold = VIOLATION_BAN_THRESHOLD,
+            "protocol violation recorded"
+        );
+        false
+    }
+
+    pub fn ban(&mut self, ip: IpAddr) {
         tracing::info!(target: "peer::manager", %ip, "banning peer");
         self.banned.insert(ip);
         let to_drop: Vec<SocketAddr> = self
@@ -111,7 +167,7 @@ impl PeerManager {
         }
     }
 
-    pub fn is_banned(&self, ip: &std::net::IpAddr) -> bool {
+    pub fn is_banned(&self, ip: &IpAddr) -> bool {
         self.banned.contains(ip)
     }
 
@@ -233,6 +289,44 @@ mod tests {
         m.ban(addr.ip());
         assert_eq!(m.connected_count(), 0);
         assert!(m.is_banned(&addr.ip()));
+    }
+
+    #[tokio::test]
+    async fn one_violation_does_not_ban() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut m = PeerManager::new([0u8; 20], [0u8; 20], tx);
+        let ip: IpAddr = "10.0.0.42".parse().unwrap();
+        let banned_now = m.record_violation(ip);
+        assert!(!banned_now);
+        assert!(!m.is_banned(&ip));
+    }
+
+    #[tokio::test]
+    async fn threshold_violations_ban_ip() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut m = PeerManager::new([0u8; 20], [0u8; 20], tx);
+        let ip: IpAddr = "10.0.0.42".parse().unwrap();
+        for _ in 0..VIOLATION_BAN_THRESHOLD - 1 {
+            assert!(!m.record_violation(ip));
+        }
+        // Final strike crosses the threshold.
+        assert!(m.record_violation(ip));
+        assert!(m.is_banned(&ip));
+    }
+
+    #[tokio::test]
+    async fn violation_drops_existing_connection() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut m = PeerManager::new([0u8; 20], [0u8; 20], tx);
+        let addr: SocketAddr = "10.0.0.42:6881".parse().unwrap();
+        m.spawn_outgoing(addr);
+        assert_eq!(m.connected_count(), 1);
+        for _ in 0..VIOLATION_BAN_THRESHOLD {
+            m.record_violation(addr.ip());
+        }
+        // After ban, the existing connection should be torn down.
+        assert!(m.is_banned(&addr.ip()));
+        assert_eq!(m.connected_count(), 0);
     }
 
     #[tokio::test]

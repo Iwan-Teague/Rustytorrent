@@ -43,6 +43,13 @@ pub enum PeerEvent {
     Disconnected {
         addr: SocketAddr,
         reason: String,
+        /// True when the disconnect was caused by a clear BEP 3
+        /// protocol violation — bad pstr, wrong info_hash, oversized
+        /// frame, malformed message — rather than a benign network
+        /// event (EOF mid-read, timeout, reset). Drives the
+        /// per-IP "ban on repeated protocol violations" escalation
+        /// in [`crate::peer::manager::PeerManager`].
+        violation: bool,
     },
     Bitfield {
         addr: SocketAddr,
@@ -205,15 +212,26 @@ pub async fn run_outgoing(
         Err(e) => Err(e),
     };
 
-    let reason = outcome
-        .as_ref()
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_else(|| "closed".to_string());
+    let (reason, violation) = classify_outcome(&outcome);
     let _ = event_tx
-        .send(PeerEvent::Disconnected { addr, reason })
+        .send(PeerEvent::Disconnected {
+            addr,
+            reason,
+            violation,
+        })
         .await;
     outcome
+}
+
+/// Build the `(reason, violation)` pair for a `PeerEvent::Disconnected`
+/// event from the per-peer task's final Result. Wraps the duplicated
+/// `outcome.as_ref().err().map(...)` pattern at every Disconnected
+/// emission site so the violation classification stays in one place.
+fn classify_outcome(outcome: &Result<()>) -> (String, bool) {
+    match outcome.as_ref().err() {
+        Some(e) => (e.to_string(), is_protocol_violation(e)),
+        None => ("closed".to_string(), false),
+    }
 }
 
 /// Run an outgoing peer connection forcing MSE/PE — no plain attempt.
@@ -257,13 +275,13 @@ pub async fn run_outgoing_mse_only(
             }
             Err(e) => Err(e),
         };
-    let reason = outcome
-        .as_ref()
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_else(|| "closed".to_string());
+    let (reason, violation) = classify_outcome(&outcome);
     let _ = event_tx
-        .send(PeerEvent::Disconnected { addr, reason })
+        .send(PeerEvent::Disconnected {
+            addr,
+            reason,
+            violation,
+        })
         .await;
     outcome
 }
@@ -283,6 +301,42 @@ fn is_likely_mse_signal(e: &Error) -> bool {
         Error::Network(s) => s.contains("Connection reset"),
         _ => false,
     }
+}
+
+/// Classify a disconnect cause as a BEP 3 protocol violation that
+/// merits the per-IP ban-on-repeats escalation, vs a benign network
+/// event we shouldn't punish the peer for.
+///
+/// We deliberately only flag *unambiguous* violations:
+/// - `bad pstrlen` / `bad protocol string`: incoming connection
+///   sent a malformed handshake preamble (or wrong protocol byte).
+/// - `info_hash mismatch`: peer claims to be in a different swarm
+///   on a stream that has already passed the pstrlen check.
+/// - `frame too large`: peer sent a length-prefix beyond
+///   `MAX_FRAME_LEN`; the spec caps blocks at 16 KiB so this is
+///   either a bug or an attempt to OOM us.
+/// - `decode:` / `bad bitfield`: malformed message body — message
+///   IDs out of range, bitfield with spare bits set, etc.
+///
+/// We pointedly do NOT flag: timeouts, `early eof`, "connection
+/// reset" — all common with MSE-only peers and network instability.
+fn is_protocol_violation(e: &Error) -> bool {
+    let s = match e {
+        Error::Handshake(s) => s.as_str(),
+        Error::Network(s) => s.as_str(),
+        _ => return false,
+    };
+    // Handshake-layer violations.
+    s.contains("bad pstrlen")
+        || s.contains("bad protocol string")
+        || s.contains("info_hash mismatch")
+        // Wire-codec violations from `peer/message.rs`.
+        || s.contains("frame too large")
+        || s.contains("unknown message id")
+        || s.contains("bitfield spare bits not zero")
+        || s.contains("have payload")
+        || s.contains("piece short")
+        || s.contains("extended payload empty")
 }
 
 /// Open a TCP connection (direct or via SOCKS5 chain), perform the plain
@@ -446,13 +500,13 @@ pub async fn run_with_stream(
         .await
     };
 
-    let reason = outcome
-        .as_ref()
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_else(|| "closed".to_string());
+    let (reason, violation) = classify_outcome(&outcome);
     let _ = event_tx
-        .send(PeerEvent::Disconnected { addr, reason })
+        .send(PeerEvent::Disconnected {
+            addr,
+            reason,
+            violation,
+        })
         .await;
     outcome
 }
@@ -821,5 +875,75 @@ fn msg_to_event(addr: SocketAddr, msg: Message) -> Option<PeerEvent> {
         // by sending them. BEP 10 spec explicitly permits ignoring
         // extension messages we don't understand.
         Message::Extended { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_handshake_violations() {
+        assert!(is_protocol_violation(&Error::Handshake(
+            "bad pstrlen: 0".into()
+        )));
+        assert!(is_protocol_violation(&Error::Handshake(
+            "bad protocol string".into()
+        )));
+        assert!(is_protocol_violation(&Error::Handshake(
+            "info_hash mismatch".into()
+        )));
+    }
+
+    #[test]
+    fn classifies_wire_codec_violations() {
+        assert!(is_protocol_violation(&Error::Network(
+            "frame too large: 999999".into()
+        )));
+        assert!(is_protocol_violation(&Error::Network(
+            "unknown message id 99".into()
+        )));
+        assert!(is_protocol_violation(&Error::Network(
+            "bitfield spare bits not zero".into()
+        )));
+        assert!(is_protocol_violation(&Error::Network(
+            "have payload 3 != 4".into()
+        )));
+        assert!(is_protocol_violation(&Error::Network(
+            "piece short: 6".into()
+        )));
+    }
+
+    #[test]
+    fn benign_errors_are_not_violations() {
+        // These are network instability or MSE-only-peer signals,
+        // not deliberate misbehavior. Banning on these would
+        // punish honest peers.
+        assert!(!is_protocol_violation(&Error::Handshake("timeout".into())));
+        assert!(!is_protocol_violation(&Error::Handshake(
+            "read: early eof".into()
+        )));
+        assert!(!is_protocol_violation(&Error::Network(
+            "connect 1.2.3.4:6881: Connection reset by peer".into()
+        )));
+        assert!(!is_protocol_violation(&Error::Network(
+            "frame body: io error".into()
+        )));
+    }
+
+    #[test]
+    fn classify_outcome_flags_violations() {
+        let outcome: Result<()> = Err(Error::Network("frame too large: 99".into()));
+        let (reason, violation) = classify_outcome(&outcome);
+        assert!(violation);
+        assert!(reason.contains("frame too large"));
+    }
+
+    #[test]
+    fn classify_outcome_clean_close_is_not_violation() {
+        let outcome: Result<()> = Ok(());
+        let (reason, violation) = classify_outcome(&outcome);
+        assert!(!violation);
+        assert_eq!(reason, "closed");
     }
 }

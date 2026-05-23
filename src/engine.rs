@@ -796,8 +796,18 @@ impl TorrentEngine {
                     }
                 }
             }
-            PeerEvent::Disconnected { addr, reason } => {
-                tracing::debug!(target: "engine", %addr, reason, "peer disconnected");
+            PeerEvent::Disconnected {
+                addr,
+                reason,
+                violation,
+            } => {
+                tracing::debug!(target: "engine", %addr, reason, violation, "peer disconnected");
+                if violation {
+                    // Record under the IP, not the SocketAddr — a peer
+                    // that reconnects from a fresh source port keeps
+                    // its strike history against us.
+                    peers.record_violation(addr.ip());
+                }
                 self.cleanup_disconnected_peer(addr);
                 peers.forget(&addr);
             }
