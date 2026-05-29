@@ -2,6 +2,18 @@ use std::collections::BTreeMap;
 
 use crate::error::{Error, Result};
 
+/// Maximum container-nesting depth the parser will descend before
+/// bailing. Bencode parsing is recursive (a list/dict recurses into
+/// `parse_value` for each element), so unbounded input nesting —
+/// `llll…` or `dddd…` — would overflow the stack and crash the
+/// process. Untrusted bencode reaches this parser from DHT KRPC
+/// messages, tracker responses, and peer extension/ut_metadata
+/// payloads, so an attacker controls the nesting. Real BitTorrent
+/// structures are shallow (a torrent's `info` dict is ~3–4 levels;
+/// KRPC messages ~2–3), so 100 is far above any legitimate need while
+/// keeping the recursion well within the stack.
+const MAX_DEPTH: usize = 100;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BencodeValue {
     Int(i64),
@@ -109,13 +121,22 @@ impl BencodeValue {
 }
 
 fn parse_value(input: &[u8]) -> Result<(BencodeValue, &[u8])> {
+    parse_value_depth(input, 0)
+}
+
+fn parse_value_depth(input: &[u8], depth: usize) -> Result<(BencodeValue, &[u8])> {
+    if depth > MAX_DEPTH {
+        return Err(Error::Bencode(format!(
+            "nesting exceeds max depth {MAX_DEPTH}"
+        )));
+    }
     let first = *input
         .first()
         .ok_or_else(|| Error::Bencode("unexpected EOF".into()))?;
     match first {
         b'i' => parse_int(input),
-        b'l' => parse_list(input),
-        b'd' => parse_dict(input),
+        b'l' => parse_list(input, depth),
+        b'd' => parse_dict(input, depth),
         b'0'..=b'9' => parse_bytes(input),
         c => Err(Error::Bencode(format!("unexpected byte 0x{c:02x}"))),
     }
@@ -167,7 +188,7 @@ fn parse_bytes(input: &[u8]) -> Result<(BencodeValue, &[u8])> {
     Ok((BencodeValue::Bytes(val.to_vec()), rest))
 }
 
-fn parse_list(input: &[u8]) -> Result<(BencodeValue, &[u8])> {
+fn parse_list(input: &[u8], depth: usize) -> Result<(BencodeValue, &[u8])> {
     debug_assert_eq!(input[0], b'l');
     let mut rest = &input[1..];
     let mut items = Vec::new();
@@ -176,7 +197,7 @@ fn parse_list(input: &[u8]) -> Result<(BencodeValue, &[u8])> {
             Some(b'e') => return Ok((BencodeValue::List(items), &rest[1..])),
             None => return Err(Error::Bencode("unterminated list".into())),
             _ => {
-                let (v, r) = parse_value(rest)?;
+                let (v, r) = parse_value_depth(rest, depth + 1)?;
                 items.push(v);
                 rest = r;
             }
@@ -184,7 +205,7 @@ fn parse_list(input: &[u8]) -> Result<(BencodeValue, &[u8])> {
     }
 }
 
-fn parse_dict(input: &[u8]) -> Result<(BencodeValue, &[u8])> {
+fn parse_dict(input: &[u8], depth: usize) -> Result<(BencodeValue, &[u8])> {
     debug_assert_eq!(input[0], b'd');
     let mut rest = &input[1..];
     let mut map: BTreeMap<Vec<u8>, BencodeValue> = BTreeMap::new();
@@ -204,7 +225,7 @@ fn parse_dict(input: &[u8]) -> Result<(BencodeValue, &[u8])> {
                         return Err(Error::Bencode("dict keys not sorted or duplicated".into()));
                     }
                 }
-                let (v, r) = parse_value(r)?;
+                let (v, r) = parse_value_depth(r, depth + 1)?;
                 prev_key = Some(key.clone());
                 map.insert(key, v);
                 rest = r;
@@ -325,6 +346,43 @@ mod tests {
         assert_eq!(skip_value(b"4:spam").unwrap(), 6);
         assert_eq!(skip_value(b"le").unwrap(), 2);
         assert_eq!(skip_value(b"d3:cow3:mooe").unwrap(), 12);
+    }
+
+    /// A pathologically deep nesting must be rejected with an error,
+    /// not crash the process via stack overflow. Build `l`×N … `e`×N
+    /// well past MAX_DEPTH.
+    #[test]
+    fn rejects_excessive_nesting() {
+        let depth = MAX_DEPTH + 50;
+        let mut buf = vec![b'l'; depth];
+        buf.extend(std::iter::repeat_n(b'e', depth));
+        let res = BencodeValue::parse_all(&buf);
+        assert!(res.is_err(), "deep nesting must be rejected, not panic");
+    }
+
+    /// The same applies to dicts (each level needs a key). Far past the
+    /// limit must error cleanly.
+    #[test]
+    fn rejects_excessive_dict_nesting() {
+        // d1:a d1:a d1:a … i0e e e e — nest dicts under a single key.
+        let depth = MAX_DEPTH + 50;
+        let mut buf = Vec::new();
+        for _ in 0..depth {
+            buf.extend_from_slice(b"d1:a");
+        }
+        buf.extend_from_slice(b"i0e");
+        buf.extend(std::iter::repeat_n(b'e', depth));
+        assert!(BencodeValue::parse_all(&buf).is_err());
+    }
+
+    /// Nesting within the limit still parses successfully — the cap
+    /// must not reject legitimate (shallow) structures.
+    #[test]
+    fn accepts_nesting_within_limit() {
+        let depth = 50; // comfortably below MAX_DEPTH
+        let mut buf = vec![b'l'; depth];
+        buf.extend(std::iter::repeat_n(b'e', depth));
+        assert!(BencodeValue::parse_all(&buf).is_ok());
     }
 
     #[test]
