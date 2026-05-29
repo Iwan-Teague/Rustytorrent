@@ -23,6 +23,7 @@ use super::krpc::{Message, Query, Response};
 use super::node_id::NodeId;
 use super::routing::{Contact, RoutingTable, K};
 use super::DhtCommand;
+use crate::ratelimit::TokenBucket;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOKUP_BUDGET: Duration = Duration::from_secs(15);
@@ -45,6 +46,22 @@ const ANNOUNCE_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_INFO_HASHES: usize = 16_384;
 /// How often we sweep the peer store for TTL-expired entries.
 const PEER_STORE_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Per-source-IP inbound-query rate limit. A KRPC response is larger
+/// than the query, so a public DHT node is a reflection/amplification
+/// vector: an attacker spoofs a victim's IP as the source of many
+/// `get_peers` queries and we send the amplified replies *to the
+/// victim*. Because every forged query shares the victim's source IP,
+/// a per-IP token bucket caps how much traffic we can be made to
+/// reflect at any single target — removing the amplification gain.
+/// Generous enough that real nodes (which query us only occasionally,
+/// even mid-lookup) never hit it.
+const QUERY_BURST: f64 = 20.0;
+const QUERY_RATE_PER_SEC: f64 = 5.0;
+/// Soft cap on the per-IP query-limiter map; idle (refilled) buckets
+/// are GC'd lazily once we exceed it so the map can't grow without
+/// bound under a distributed (many distinct source IPs) flood.
+const MAX_QUERY_LIMIT_IPS: usize = 4096;
 
 /// `info_hash → list of (peer-addr, when-we-learned)`. Used by the
 /// inbound get_peers handler to return values we've seen via prior
@@ -95,6 +112,9 @@ struct SharedState {
     peer_store: Mutex<PeerStore>,
     /// Secret salt for issuing get_peers tokens. Rotated every TOKEN_TTL.
     token_state: Mutex<TokenState>,
+    /// Per-source-IP token buckets gating how fast we answer inbound
+    /// queries — anti-reflection (see `QUERY_BURST`).
+    query_limits: Mutex<HashMap<IpAddr, TokenBucket>>,
 }
 
 struct PendingQuery {
@@ -133,7 +153,25 @@ impl SharedState {
                 previous,
                 last_rotated: Instant::now(),
             }),
+            query_limits: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Per-source-IP rate gate for inbound queries (anti-reflection).
+    /// Returns `true` if we should answer. Lazily GCs idle buckets once
+    /// the map grows past `MAX_QUERY_LIMIT_IPS` so a distributed flood
+    /// can't grow it without bound.
+    async fn allow_query_from(&self, ip: IpAddr) -> bool {
+        let mut limits = self.query_limits.lock().await;
+        if limits.len() > MAX_QUERY_LIMIT_IPS {
+            // Drop buckets that have refilled (idle sources); keeps the
+            // map bounded without forgetting actively-limited IPs.
+            limits.retain(|_, b| b.available() < QUERY_BURST - 1.0);
+        }
+        limits
+            .entry(ip)
+            .or_insert_with(|| TokenBucket::new(QUERY_BURST, QUERY_RATE_PER_SEC))
+            .try_consume(1.0)
     }
 
     /// Issue a token for `addr` derived from our current secret + their IP.
@@ -350,7 +388,16 @@ async fn handle_datagram(state: &SharedState, sock: &UdpSocket, from: SocketAddr
         Message::Query {
             transaction_id,
             query,
-        } => answer_query(state, sock, from, transaction_id, query).await,
+        } => {
+            // Anti-reflection: rate-limit answers per source IP. Forged
+            // queries spoofing a victim's IP all share that IP's bucket,
+            // capping how much we can be made to reflect at the victim.
+            if !state.allow_query_from(from.ip()).await {
+                tracing::trace!(target: "dht", %from, "inbound query rate limit; dropping");
+                return;
+            }
+            answer_query(state, sock, from, transaction_id, query).await
+        }
         Message::Response {
             transaction_id,
             response,
@@ -749,5 +796,24 @@ mod tests {
             !store.contains_key(&stale_hash),
             "fully-stale info_hash must be removed entirely"
         );
+    }
+
+    #[tokio::test]
+    async fn query_rate_limit_caps_burst_from_one_ip() {
+        let state = SharedState::new(NodeId([0u8; 20]));
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        // The first QUERY_BURST queries are allowed; beyond that, within
+        // the same instant (no refill), further queries are dropped.
+        let mut allowed = 0;
+        for _ in 0..(QUERY_BURST as usize + 50) {
+            if state.allow_query_from(ip).await {
+                allowed += 1;
+            }
+        }
+        assert!(
+            allowed <= QUERY_BURST as usize,
+            "allowed {allowed} > burst {QUERY_BURST}"
+        );
+        assert!(allowed >= 1, "the burst must permit at least some queries");
     }
 }
