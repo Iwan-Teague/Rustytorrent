@@ -83,6 +83,27 @@ encryption-of-record.** The RC4 cipher it uses is cryptographically broken;
 treat MSE as protecting against trivial DPI fingerprinting, not against a
 serious adversary.
 
+### `--bind-iface IFACE`
+
+VPN kill switch: pins outbound sockets to a specific interface (e.g. `utun0`)
+so that if the tunnel drops, traffic fails closed instead of falling back to
+the default route and leaking your real IP.
+
+**Coverage — read this before relying on it:**
+
+- ✅ **Peer dials** (TCP, and the first hop of a SOCKS5 chain) are bound to
+  the interface. If it disappears, the dial fails rather than re-routing.
+- ✅ **DHT is force-disabled** when `--bind-iface` is set. Its UDP socket
+  isn't interface-bound, so leaving it on could leak past the kill switch;
+  we fail closed.
+- ✅ **µTP is force-disabled** likewise (UDP, not interface-bound).
+- ⚠️ **Tracker HTTP is NOT interface-bound.** The HTTP client (`reqwest`)
+  doesn't expose per-interface binding, so tracker announces ride the OS's
+  normal routing. For a complete kill switch, **pair `--bind-iface` with
+  `--socks5`** so the tracker rides the proxy (and point the proxy at the
+  tunnel), or use `--no-tracker`. `--anonymous` (which requires `--socks5`)
+  gives the strongest posture.
+
 ---
 
 ## Combining with Tor

@@ -496,6 +496,9 @@ async fn cmd_download(
 
     if let Some(iface) = &bind_iface {
         println!("Bound to:   {iface} (VPN kill switch)");
+        println!("            note: peer dials are bound to {iface} and DHT is disabled,");
+        println!("            but tracker HTTP (reqwest) can't be interface-bound — pair");
+        println!("            with --socks5 for a tracker that also rides the tunnel.");
     }
 
     let resolved_passphrase = if paranoid {
@@ -881,6 +884,9 @@ async fn cmd_magnet(
     }
     if let Some(iface) = &bind_iface {
         println!("Bound to:   {iface} (VPN kill switch)");
+        println!("            note: peer dials are bound to {iface} and DHT is disabled,");
+        println!("            but tracker HTTP (reqwest) can't be interface-bound — pair");
+        println!("            with --socks5 for a tracker that also rides the tunnel.");
     }
     let resolved_passphrase = if paranoid {
         Some(resolve_passphrase(passphrase)?)

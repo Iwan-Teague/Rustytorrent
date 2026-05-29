@@ -326,13 +326,23 @@ impl TorrentEngine {
         if private && self.cfg.enable_dht {
             tracing::info!(target: "engine", "private torrent (BEP 27): DHT disabled despite --dht");
         }
+        // VPN kill switch: --bind-iface forces every outbound socket
+        // onto the bound interface so traffic fails closed if the tunnel
+        // drops. DHT runs over a UDP socket we don't (yet) interface-bind,
+        // so it would leak the real IP on the default route — disable it
+        // when a bind interface is set, the same fail-closed stance
+        // anonymous mode takes.
+        let bound_iface = self.cfg.bind_iface.is_some();
+        if bound_iface && self.cfg.enable_dht {
+            tracing::info!(target: "engine", "--bind-iface set: DHT disabled (its UDP socket isn't interface-bound; would leak past the kill switch)");
+        }
 
         // B5 — advertise the extensions we actually implement in the
         // handshake reserved bytes. Anonymous mode never enables DHT, so
         // we honor that here too. BEP 10 (extension protocol) is always
         // on — it's how we accept ut_metadata/ut_pex without breaking
         // peers that expect us to opt in.
-        let dht_enabled = self.cfg.enable_dht && !self.cfg.anonymous && !private;
+        let dht_enabled = self.cfg.enable_dht && !self.cfg.anonymous && !private && !bound_iface;
         crate::peer::handshake::set_extension_bytes(crate::peer::handshake::extension_bytes_from(
             dht_enabled,
             true,
@@ -598,7 +608,7 @@ impl TorrentEngine {
         // DHT cannot ride through SOCKS5 CONNECT (it's UDP), and announcing
         // ourselves onto the DHT leaks the real IP. Anonymous mode forces
         // it off regardless of `enable_dht`.
-        let dht_wanted = self.cfg.enable_dht && !self.cfg.anonymous && !private;
+        let dht_wanted = self.cfg.enable_dht && !self.cfg.anonymous && !private && !bound_iface;
         if self.cfg.enable_dht && self.cfg.anonymous {
             tracing::info!(target: "engine", "anonymous mode: ignoring --dht request");
         }
