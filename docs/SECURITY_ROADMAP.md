@@ -183,10 +183,17 @@ _None — B2 landed alongside the multi-hop chain work._
   isn't interface-bound, so allowing it there would leak past the proxy
   / kill switch. End-to-end smoke test: two peers complete a real BT
   handshake over µTP loopback.
+- ✅ Inbound µTP DoS bound: the driver caps total connections at
+  `MAX_CONNS` and drops new inbound SYNs past it. UDP sources are
+  spoofable (so B4's per-IP limit can't help), and the driver created
+  a connection entry per forged SYN — an unbounded remote OOM. The cap
+  bounds steady-state memory regardless of flood rate; half-open forged
+  entries reap at `HARD_TIMEOUT`.
 - ⏳ Open: LEDBAT congestion control (fixed 8-packet window today);
-  selective-ack on receive (we parse but ignore); per-source-IP rate
-  limit on the inbound µTP accept path (TCP has B4; µTP relies on the
-  max-peer cap today).
+  selective-ack on receive (we parse but ignore); anti-spoofing accept
+  (we mark a receiver `Connected` on the SYN before confirming the
+  return path, so a forged SYN can occupy a peer slot for one handshake
+  timeout — bounded by the peer cap, same class as a TCP SYN).
 
 ### B2 — `--memory-only` storage
 - ✅ In-RAM piece store; nothing persisted to disk for the lifetime of

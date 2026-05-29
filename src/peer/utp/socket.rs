@@ -60,6 +60,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// jumbo/garbage datagram is truncated rather than mis-parsed.
 const RECV_BUF: usize = 65_535;
 
+/// Hard cap on the number of connections the driver will hold at once.
+/// UDP source addresses are spoofable, so a flood of forged SYNs —
+/// each from a distinct `(addr, connection_id)` — would otherwise
+/// create an unbounded number of receiver-side connection entries
+/// (and queued accepts), a cheap remote OOM that the per-source-IP
+/// TCP rate limit (B4) can't defend because the sources are forged.
+/// Once we're at the cap we drop new *inbound* SYNs; outbound dials
+/// (engine-initiated, already bounded by the peer cap) are unaffected
+/// because they're created via the command channel, not here. A
+/// half-open forged entry is reaped at `HARD_TIMEOUT`, so the cap
+/// bounds steady-state memory regardless of flood rate. Sized well
+/// above any legitimate peer set + in-flight dial races.
+const MAX_CONNS: usize = 1024;
+
 /// `(peer address, our recv_id)` — the key every connection is stored
 /// under. Inbound packets for an established connection always carry
 /// our `recv_id` as their `connection_id`, so this is also the lookup
@@ -374,6 +388,12 @@ impl Driver {
                     }
                 }
                 self.collect_after(&recv_key, now, &mut outgoing);
+            } else if self.conns.len() >= MAX_CONNS {
+                // At the connection cap — drop this inbound SYN rather
+                // than let a forged-source flood grow state without
+                // bound. The peer (if real) will retransmit; by then a
+                // half-open entry may have been reaped.
+                tracing::debug!(target: "utp", %peer, "connection cap reached; dropping inbound SYN");
             } else if let Some((conn, state)) = Connection::new_receiver(&pkt, now) {
                 let (dtx, drx) = mpsc::unbounded_channel();
                 let stream = UtpStream::new(recv_key, self.cmd_tx.clone(), drx);
@@ -554,6 +574,49 @@ mod tests {
         c.write_all(&payload).await.unwrap();
         c.flush().await.unwrap();
         srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbound_syn_flood_is_capped() {
+        use super::super::packet::{Packet, PacketType};
+        let server = UtpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let saddr = server.local_addr();
+
+        // One raw UDP socket fires many forged SYNs, each with a
+        // distinct connection_id (so each looks like a brand-new
+        // inbound connection to the driver).
+        let attacker = tokio::net::UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let n = (MAX_CONNS as u32) + 300;
+        for cid in 0..n {
+            let syn = Packet::new(PacketType::Syn, cid as u16, 1, 0);
+            let _ = attacker.send_to(&syn.encode(), saddr).await;
+            // connection_id is u16, so reuse wraps — but distinct cids
+            // within 0..65536 are plenty to exceed the cap.
+            if cid >= 65000 {
+                break;
+            }
+        }
+
+        // Drain accepts until the queue goes idle. The driver must not
+        // have created more than MAX_CONNS connections, so we can't
+        // accept more than that.
+        let mut accepted = 0usize;
+        while let Ok(Ok(_)) =
+            tokio::time::timeout(Duration::from_millis(200), server.accept()).await
+        {
+            accepted += 1;
+            if accepted > MAX_CONNS + 200 {
+                break; // safety valve — a bug shouldn't spin this forever
+            }
+        }
+        assert!(
+            accepted <= MAX_CONNS,
+            "accepted {accepted} connections, cap is {MAX_CONNS}"
+        );
     }
 
     #[tokio::test]
