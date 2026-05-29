@@ -146,6 +146,18 @@ impl TorrentFile {
     }
 }
 
+/// Reject a path component that could escape the download root when
+/// joined onto it: empty, the current/parent dir, or anything bearing a
+/// path separator (which would turn one component into several, or make
+/// the join absolute — `root.join("/etc/x")` discards `root` entirely).
+/// Applied to BOTH the torrent `name` and every multi-file path
+/// segment, since both are attacker-controlled (a `.torrent`, or magnet
+/// metadata fetched from untrusted peers) and both are joined onto the
+/// output directory in `storage::Layout`.
+fn is_unsafe_path_component(s: &str) -> bool {
+    s.is_empty() || s == "." || s == ".." || s.contains('/') || s.contains('\\')
+}
+
 impl Info {
     fn from_value(v: &BencodeValue) -> Result<Self> {
         let d = v.as_dict()?;
@@ -154,6 +166,13 @@ impl Info {
             .ok_or_else(|| Error::Bencode("info missing name".into()))?
             .as_str()?
             .to_string();
+        // The `name` becomes the top-level file (single-file) or
+        // directory (multi-file) under the output root. It is a single
+        // component per BEP 3 — reject separators / traversal so a
+        // hostile torrent can't write outside the download directory.
+        if is_unsafe_path_component(&name) {
+            return Err(Error::Bencode(format!("unsafe torrent name: {name:?}")));
+        }
         let piece_length = u64::try_from(
             d.get(&b"piece length".to_vec())
                 .ok_or_else(|| Error::Bencode("info missing piece length".into()))?
@@ -203,8 +222,7 @@ impl Info {
                 let mut p = PathBuf::new();
                 for seg in path_list {
                     let s = seg.as_str()?;
-                    if s.is_empty() || s == "." || s == ".." || s.contains('/') || s.contains('\\')
-                    {
+                    if is_unsafe_path_component(s) {
                         return Err(Error::Bencode(format!("unsafe path segment: {s}")));
                     }
                     p.push(s);
@@ -387,5 +405,57 @@ mod tests {
         out.extend_from_slice(&[0u8; 20]);
         out.extend_from_slice(b"eee");
         assert!(TorrentFile::from_bytes(&out).is_err());
+    }
+
+    /// A `name` containing a path separator (or `..`, or an absolute
+    /// path) must be rejected — otherwise `Layout` would join it onto
+    /// the output root and write outside the download directory. Covers
+    /// single-file torrents.
+    #[test]
+    fn rejects_unsafe_name_single_file() {
+        // name = "../evil" (7 bytes). Single-file (has `length`, no `files`).
+        let mut out = Vec::new();
+        out.extend_from_slice(b"d4:infod6:lengthi1e4:name7:../evil12:piece lengthi1e6:pieces20:");
+        out.extend_from_slice(&[0u8; 20]);
+        out.extend_from_slice(b"ee");
+        assert!(
+            TorrentFile::from_bytes(&out).is_err(),
+            "name with traversal must be rejected"
+        );
+
+        // name = "/etc/passwd" (11 bytes) — absolute join would discard root.
+        let mut out = Vec::new();
+        out.extend_from_slice(
+            b"d4:infod6:lengthi1e4:name11:/etc/passwd12:piece lengthi1e6:pieces20:",
+        );
+        out.extend_from_slice(&[0u8; 20]);
+        out.extend_from_slice(b"ee");
+        assert!(
+            TorrentFile::from_bytes(&out).is_err(),
+            "absolute name must be rejected"
+        );
+    }
+
+    /// Same protection for the multi-file directory `name`.
+    #[test]
+    fn rejects_unsafe_name_multi_file() {
+        // name = ".." with a valid file entry.
+        let mut out = Vec::new();
+        out.extend_from_slice(
+            b"d4:infod5:filesld6:lengthi1e4:pathl5:a.txteee4:name2:..12:piece lengthi1e6:pieces20:",
+        );
+        out.extend_from_slice(&[0u8; 20]);
+        out.extend_from_slice(b"ee");
+        assert!(
+            TorrentFile::from_bytes(&out).is_err(),
+            "multi-file name traversal must be rejected"
+        );
+    }
+
+    /// A normal name still parses (guard against the check being too strict).
+    #[test]
+    fn accepts_normal_name() {
+        let t = TorrentFile::from_bytes(&build_single_file_torrent()).unwrap();
+        assert_eq!(t.info.name, "test.bin");
     }
 }
