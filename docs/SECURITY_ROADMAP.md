@@ -107,6 +107,36 @@ UDP source, constant-time hash compares).
   work) — the initiator treated the receiver's first DATA as a
   duplicate (STATE seq_nr names the peer's *next* seq, not a delivered
   one), silently dropping it. Fixed and regression-tested.
+- ✅ **path traversal via `name`** — multi-file path *segments* were
+  sanitized but the torrent `name` field was not, and `storage::Layout`
+  joins it onto the output root (`root/name`, `root/name/seg`). A
+  hostile `.torrent` (or magnet metadata from untrusted peers) with
+  `name = "../../.bashrc"` or `/etc/cron.d/evil` escaped the download
+  dir → arbitrary file write. Now rejects empty / `.` / `..` /
+  separators on both `name` and segments.
+- ✅ **piece length bound** — `piece_length` came straight from the
+  torrent (only negative-checked). Zero is degenerate; an enormous
+  value overflows `piece_index * piece_length` (debug panic / release
+  wrap) and drives huge allocations. Capped at 1 GiB, reject 0.
+- ✅ **µTP connection cap** — UDP sources are spoofable, so a forged-SYN
+  flood created unbounded receiver-side connection state (B4's per-IP
+  limit can't help). Driver caps total connections at `MAX_CONNS`.
+- ✅ **PeerManager violation-map GC** — the per-IP protocol-violation
+  map shed stale timestamps only for IPs that re-offended; an IP that
+  violated once and vanished kept its entry forever. Engine now sweeps
+  it on a 60 s tick. (`banned` is intentionally permanent — proven
+  malicious; growth self-limiting.)
+- ✅ **DHT peer-store bound + expiry** — the store capped each
+  info_hash's peer list (256) but never bounded the *number* of
+  info_hashes and never expired entries. Added a 5 min TTL GC
+  (`ANNOUNCE_TTL` 30 min) + an insert-time cap of `MAX_INFO_HASHES`.
+- ✅ **DHT anti-reflection** — a KRPC reply is larger than the query, so
+  the public DHT node could be used to reflect amplified traffic at a
+  spoofed-source victim. Per-source-IP token bucket (20 burst, 5/s) on
+  inbound query answers caps reflection at any single target.
+- Panic audit: every `unwrap`/`expect`/`unreachable` in non-test code is
+  guarded by a real invariant — the "no panics in production" principle
+  holds; no changes needed.
 
 ### A-tier landed
 - ✅ A1: DH parameter validation in MSE handshake — rejects degenerate Y values.
