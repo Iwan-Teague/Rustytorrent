@@ -104,9 +104,10 @@ enum Commands {
         /// module load, etc. Windows refused at startup.
         #[arg(long, default_value_t = false)]
         sandbox: bool,
-        /// Passphrase for paranoid mode. If unset, read from the
-        /// `RUSTYTORRENT_PASSPHRASE` environment variable. Required
-        /// when --paranoid is set.
+        /// Passphrase for paranoid mode. Required when --paranoid is set.
+        /// Prefer the `RUSTYTORRENT_PASSPHRASE` environment variable:
+        /// passing it here exposes it in the process list and shell
+        /// history.
         #[arg(long)]
         passphrase: Option<String>,
         /// Override the spool file path. Defaults to
@@ -169,6 +170,9 @@ enum Commands {
         /// seccomp sandbox. Same semantics as `download --sandbox`.
         #[arg(long, default_value_t = false)]
         sandbox: bool,
+        /// Passphrase for paranoid mode. Prefer `RUSTYTORRENT_PASSPHRASE`
+        /// — passing it here exposes it in the process list and shell
+        /// history.
         #[arg(long)]
         passphrase: Option<String>,
         #[arg(long)]
@@ -195,7 +199,8 @@ enum Commands {
         /// `<output>/<torrent-name>.rustytorrent-spool`.
         #[arg(long)]
         spool: Option<PathBuf>,
-        /// Passphrase. If unset, read from `RUSTYTORRENT_PASSPHRASE`.
+        /// Passphrase. Prefer `RUSTYTORRENT_PASSPHRASE` — passing it here
+        /// exposes it in the process list and shell history.
         #[arg(long)]
         passphrase: Option<String>,
     },
@@ -531,8 +536,24 @@ async fn cmd_download(
 
 /// Resolve the paranoid-mode passphrase from CLI flag → env var → error.
 /// We never log it; just pass it to the engine to derive the spool key.
+///
+/// Order is deliberate: the `--passphrase` flag wins for scripting, but
+/// it is the *least* private source — a CLI argument is visible to every
+/// other process on the machine via the process table
+/// (`ps auxww` / `/proc/<pid>/cmdline`) and is typically saved to shell
+/// history. For a feature whose whole point is the seized-laptop /
+/// hostile-local-observer threat model, that's a real leak, so we warn
+/// loudly and point at the env var. `RUSTYTORRENT_PASSPHRASE` is not
+/// perfect either (readable via `/proc/<pid>/environ` by the same user
+/// or root) but it stays out of the process argument list and shell
+/// history, which is the common-case exposure.
 fn resolve_passphrase(flag: Option<String>) -> Result<String> {
     if let Some(p) = flag {
+        eprintln!(
+            "warning: passing the passphrase via --passphrase exposes it in the process \
+             list (ps/proc) and shell history. Prefer the RUSTYTORRENT_PASSPHRASE \
+             environment variable."
+        );
         return Ok(p);
     }
     if let Ok(p) = std::env::var("RUSTYTORRENT_PASSPHRASE") {
