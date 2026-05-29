@@ -31,6 +31,7 @@ Cross-platform: Linux, macOS (Intel + Apple Silicon), and Windows.
 | BEP 11 PEX — bidirectional: receive incoming peer lists + send delta updates every 60 s | ✅ |
 | Engine-wide bandwidth limiter (`--max-down`, `--max-up`) | ✅ |
 | µTP transport (BEP 29) — `--utp`: parallel TCP+µTP dial + inbound µTP | ✅ |
+| Private torrents (BEP 27) — DHT + PEX disabled when `private` is set | ✅ |
 | Web UI | ❌ — Phase 8 work |
 
 ## Quick start

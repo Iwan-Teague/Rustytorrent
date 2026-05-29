@@ -317,12 +317,22 @@ impl TorrentEngine {
             }
         }
 
+        // BEP 27 — a private torrent must not use peer-discovery
+        // mechanisms outside the tracker (DHT, PEX, LSD): doing so leaks
+        // peer addresses to the wider network and gets users banned from
+        // private trackers. We force DHT and PEX off whenever the info
+        // dict's `private` flag is set, regardless of CLI flags.
+        let private = self.torrent.info.private;
+        if private && self.cfg.enable_dht {
+            tracing::info!(target: "engine", "private torrent (BEP 27): DHT disabled despite --dht");
+        }
+
         // B5 — advertise the extensions we actually implement in the
         // handshake reserved bytes. Anonymous mode never enables DHT, so
         // we honor that here too. BEP 10 (extension protocol) is always
         // on — it's how we accept ut_metadata/ut_pex without breaking
         // peers that expect us to opt in.
-        let dht_enabled = self.cfg.enable_dht && !self.cfg.anonymous;
+        let dht_enabled = self.cfg.enable_dht && !self.cfg.anonymous && !private;
         crate::peer::handshake::set_extension_bytes(crate::peer::handshake::extension_bytes_from(
             dht_enabled,
             true,
@@ -588,7 +598,7 @@ impl TorrentEngine {
         // DHT cannot ride through SOCKS5 CONNECT (it's UDP), and announcing
         // ourselves onto the DHT leaks the real IP. Anonymous mode forces
         // it off regardless of `enable_dht`.
-        let dht_wanted = self.cfg.enable_dht && !self.cfg.anonymous;
+        let dht_wanted = self.cfg.enable_dht && !self.cfg.anonymous && !private;
         if self.cfg.enable_dht && self.cfg.anonymous {
             tracing::info!(target: "engine", "anonymous mode: ignoring --dht request");
         }
@@ -1009,7 +1019,9 @@ impl TorrentEngine {
                 // knows where to address outgoing peer-exchange
                 // messages. Anonymous mode skips this entirely — we
                 // never want to broadcast our peer set in that posture.
-                if !self.cfg.anonymous {
+                // Private torrents (BEP 27) skip it too: PEX would leak
+                // peers outside the tracker.
+                if !self.cfg.anonymous && !self.torrent.info.private {
                     if let Some(id) = their_ut_pex_id {
                         self.peer_pex_ids.insert(addr, id);
                     }
@@ -1023,13 +1035,14 @@ impl TorrentEngine {
                 // already-connected addresses; PeerManager handles
                 // dedupe + max-peers cap. In anonymous mode we ignore
                 // PEX entirely: peers shared via PEX could be honeypot
-                // entries trying to enumerate the swarm.
-                if self.cfg.anonymous {
+                // entries trying to enumerate the swarm. Private torrents
+                // (BEP 27) ignore PEX too — only tracker peers are allowed.
+                if self.cfg.anonymous || self.torrent.info.private {
                     tracing::debug!(
                         target: "engine",
                         from = %addr,
                         n = pex_peers.len(),
-                        "ignoring PEX in anonymous mode"
+                        "ignoring PEX (anonymous or private torrent)"
                     );
                 } else {
                     let started = peers.try_connect_many(pex_peers);

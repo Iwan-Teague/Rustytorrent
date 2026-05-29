@@ -471,6 +471,25 @@ mod tests {
         assert_eq!(t.info.name, "test.bin");
     }
 
+    /// The `private` flag (BEP 27) must be parsed so the engine can
+    /// disable DHT/PEX for private torrents. `private=1` → true; absent
+    /// or `0` → false.
+    #[test]
+    fn parses_private_flag() {
+        // Absent → false (uses the standard single-file builder).
+        let t = TorrentFile::from_bytes(&build_single_file_torrent()).unwrap();
+        assert!(!t.info.private);
+
+        // private=1 → true. Dict keys must stay lexicographically sorted:
+        // length < name < piece length < pieces < private.
+        let mut out = Vec::new();
+        out.extend_from_slice(b"d4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:");
+        out.extend_from_slice(&[0u8; 20]);
+        out.extend_from_slice(b"7:privatei1eee");
+        let t = TorrentFile::from_bytes(&out).unwrap();
+        assert!(t.info.private, "private=1 must parse as true");
+    }
+
     /// piece length of 0 is degenerate and must be rejected.
     #[test]
     fn rejects_zero_piece_length() {
