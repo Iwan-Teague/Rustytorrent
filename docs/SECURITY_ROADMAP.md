@@ -68,6 +68,9 @@ protection that A-tier doesn't touch.
 
 ## Status
 
+Last updated: 2026-05-29. **Untrusted-input hardening pass + SOCKS5
+auth-downgrade fix landed (see "Hardening pass" below).**
+
 Last updated: 2026-05-23. **A-tier complete; B1+B3+B4+B5 landed; most of
 C-tier (C5+C6) landed; full Phase 7 (BEP 10/11/9 + magnet) landed; bandwidth
 limiter, DHT announce_peer, dual-stack IPv6 listener, MSE on magnet
@@ -75,6 +78,35 @@ bootstrap landed.** Anonymity-fingerprint pass (Stage 1) landed: the BEP 10
 extension handshake, peer_id prefix, and tracker User-Agent now blend in
 as libtorrent 2.0.9 under `--anonymous`, and cleartext `http://` trackers
 are rejected up front in that mode.
+
+### Hardening pass (2026-05-29)
+
+Audit of every untrusted-input parser (bencode, peer wire, KRPC,
+ut_metadata/ut_pex, UDP tracker, handshake). Found and fixed two real
+remote-DoS holes and one privacy downgrade; the rest were already
+well-defended (length-checked, bounded allocations, kernel-filtered
+UDP source, constant-time hash compares).
+
+- ✅ **bencode recursion cap** — `parse_value` recursed with no depth
+  bound; a deeply nested payload (`llll…`/`dddd…`) overflowed the
+  stack and crashed the process. Untrusted bencode arrives from DHT
+  nodes, trackers, and peer extension/ut_metadata messages, so the
+  nesting is attacker-controlled. Now capped at depth 100.
+- ✅ **µTP reorder-buffer cap** — the per-connection `pending_in`
+  out-of-order buffer was unbounded; a peer that withholds one seq_nr
+  and floods higher ones forced unbounded memory growth (remote OOM).
+  Capped at `MAX_PENDING_IN`; excess is dropped and re-requested via
+  the cumulative ack.
+- ✅ **SOCKS5 auth-downgrade fix** — when credentials were present we
+  offered `[NO_AUTH, USERPASS]`, letting the proxy pick NO_AUTH and
+  silently ignore the credentials. With `--tor-isolation` that means
+  the per-dial random username never reaches Tor and every dial rides
+  one circuit — the correlation defense silently lost. Now offer
+  USER/PASS only when creds are set; fail closed otherwise.
+- ✅ **µTP state-machine off-by-one** (correctness, found during socket
+  work) — the initiator treated the receiver's first DATA as a
+  duplicate (STATE seq_nr names the peer's *next* seq, not a delivered
+  one), silently dropping it. Fixed and regression-tested.
 
 ### A-tier landed
 - ✅ A1: DH parameter validation in MSE handshake — rejects degenerate Y values.
