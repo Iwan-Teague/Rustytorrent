@@ -16,10 +16,15 @@
 //!   cumulative-ack sequencing, fixed-window send pacing, retransmit
 //!   on RTO (with exponential backoff), receive-side reordering,
 //!   clean FIN-driven close.
+//! - **Selective ack (BEP 29)**: a receiver holding out-of-order
+//!   packets attaches a SACK bitmask to its acks (`build_sack`); a
+//!   sender prunes selectively-acked packets from its retransmit queue
+//!   (`process_sack`) so a later RTO resends only the true gap, not the
+//!   whole window.
 //! - **Not implemented**: LEDBAT congestion control (we use a fixed
-//!   send window of `INITIAL_WINDOW_PACKETS`); selective-ack
-//!   processing (we emit cumulative acks only; SACK on receive is
-//!   parsed by the codec but ignored here); sequence-number
+//!   send window of `INITIAL_WINDOW_PACKETS`); SACK-driven *fast*
+//!   retransmit (we prune the queue but still wait for the gap packet's
+//!   RTO rather than resending it immediately); sequence-number
 //!   wraparound (16-bit seq_nr wraps after 65 536 packets — a real
 //!   long-lived connection would need to handle it, the typical
 //!   BitTorrent block-exchange session won't).
@@ -27,7 +32,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use super::packet::{Packet, PacketType};
+use super::packet::{Extension, Packet, PacketType, EXT_SELECTIVE_ACK};
 
 /// Initial retransmission timeout — first re-send of an unacked
 /// packet fires this long after the original send. The RTO doubles
@@ -293,6 +298,17 @@ impl Connection {
                 break;
             }
         }
+        // Selective ack (BEP 29): if the peer reported receiving packets
+        // *beyond* the cumulative gap, drop those from the retransmit
+        // queue so a future RTO resends only the genuinely-missing
+        // packet(s) instead of the whole window.
+        if let Some(sack) = packet
+            .extensions
+            .iter()
+            .find(|e| e.kind == EXT_SELECTIVE_ACK)
+        {
+            self.process_sack(acked_through, &sack.data);
+        }
         match packet.packet_type {
             PacketType::Syn => {
                 // We're already the receiver of this SYN; a
@@ -469,9 +485,69 @@ impl Connection {
             // advance it.
             seq_nr: self.next_seq_nr,
             ack_nr: self.peer_seq_nr_acked,
-            extensions: Vec::new(),
+            // Attach a selective-ack bitmask when we're holding
+            // out-of-order packets, so the sender can fast-recover the
+            // single missing packet rather than the whole window.
+            extensions: self.build_sack().into_iter().collect(),
             payload: Vec::new(),
         }
+    }
+
+    /// Build the BEP 29 selective-ack extension from the out-of-order
+    /// receive buffer, or `None` if there's nothing buffered. The
+    /// bitmask's bit `n` (LSB-first within each byte, matching
+    /// libtorrent) represents `ack_nr + 2 + n`; `ack_nr + 1` is the gap
+    /// we're waiting on and is never represented. Length is a multiple
+    /// of 4 bytes per spec, capped so a sparse far-future packet can't
+    /// inflate it.
+    fn build_sack(&self) -> Option<Extension> {
+        if self.pending_in.is_empty() {
+            return None;
+        }
+        /// 64 bytes = 512 packets of SACK range — vastly more than our
+        /// send window; anything past it just waits for RTO.
+        const MAX_SACK_BYTES: usize = 64;
+        let base = self.peer_seq_nr_acked.wrapping_add(2);
+        let mut mask: Vec<u8> = vec![0u8; 4];
+        for &seq in self.pending_in.keys() {
+            let offset = seq.wrapping_sub(base) as usize;
+            let byte = offset / 8;
+            if byte >= MAX_SACK_BYTES {
+                continue;
+            }
+            if byte >= mask.len() {
+                // Grow to the next multiple of 4 bytes that covers `byte`.
+                let new_len = (((byte / 4) + 1) * 4).min(MAX_SACK_BYTES);
+                mask.resize(new_len, 0);
+                if byte >= mask.len() {
+                    continue;
+                }
+            }
+            mask[byte] |= 1 << (offset % 8);
+        }
+        if mask.iter().all(|&b| b == 0) {
+            return None;
+        }
+        Some(Extension {
+            kind: EXT_SELECTIVE_ACK,
+            data: mask,
+        })
+    }
+
+    /// Drop in-flight packets the peer selectively acknowledged.
+    /// `ack_nr` is the packet's cumulative ack; bit `n` of `mask`
+    /// (LSB-first) marks `ack_nr + 2 + n` as received. Packets at or
+    /// below the cumulative gap (`ack_nr + 1`) are never represented, so
+    /// their `wrapping_sub(base)` lands outside the mask and they're
+    /// correctly retained for retransmit.
+    fn process_sack(&mut self, ack_nr: u16, mask: &[u8]) {
+        let base = ack_nr.wrapping_add(2);
+        self.in_flight.retain(|entry| {
+            let offset = entry.seq_nr.wrapping_sub(base) as usize;
+            let byte = offset / 8;
+            let sacked = byte < mask.len() && (mask[byte] >> (offset % 8)) & 1 == 1;
+            !sacked
+        });
     }
 }
 
@@ -699,6 +775,76 @@ mod tests {
         // Nothing was delivered in order (the gap at seq 2 is still open).
         assert!(recv.take_received(usize::MAX).is_empty());
         let _ = init;
+    }
+
+    /// When the receiver holds an out-of-order packet, its ack must
+    /// carry a SACK extension with the bit for the buffered seq set.
+    #[test]
+    fn receiver_emits_sack_for_out_of_order() {
+        let t = now();
+        let (_init, syn) = Connection::new_initiator(800, t);
+        let (mut recv, _state) = Connection::new_receiver(&syn, t).unwrap();
+        let recv_id = recv.recv_id;
+        // SYN seq was 1 → next expected is 2. Deliver seq 4 (gap at 2,3).
+        let pkt = Packet {
+            packet_type: PacketType::Data,
+            connection_id: recv_id,
+            timestamp_micros: 0,
+            timestamp_diff_micros: 0,
+            wnd_size: RECV_WINDOW_BYTES,
+            seq_nr: 4,
+            ack_nr: 0,
+            extensions: Vec::new(),
+            payload: b"x".to_vec(),
+        };
+        let ack = recv.handle_incoming(&pkt, t).expect("ack expected");
+        let sack = ack
+            .extensions
+            .iter()
+            .find(|e| e.kind == EXT_SELECTIVE_ACK)
+            .expect("ack must carry a SACK when holding out-of-order data");
+        // base = ack_nr(1) + 2 = 3. seq 4 → offset 1 → byte 0, bit 1.
+        assert_eq!(ack.ack_nr, 1, "cumulative ack still stuck at the gap");
+        assert_eq!(sack.data[0] & 0b0000_0010, 0b0000_0010, "bit for seq 4 set");
+        assert_eq!(sack.data[0] & 0b0000_0001, 0, "seq 3 (the gap) not set");
+    }
+
+    /// The sender, on receiving a SACK, drops the selectively-acked
+    /// packets from its retransmit queue but keeps the genuine gap.
+    #[test]
+    fn sender_prunes_inflight_on_sack() {
+        let t = now();
+        let (mut init, syn) = Connection::new_initiator(810, t);
+        let (_recv, state) = Connection::new_receiver(&syn, t).unwrap();
+        let _ = init.handle_incoming(&state, t);
+        // Queue 4 DATA packets (seqs 2,3,4,5 — SYN took seq 1).
+        init.enqueue_send(&vec![0u8; MAX_DATA_PAYLOAD * 4]);
+        let sent = init.pending_send_packets(t);
+        assert_eq!(sent.len(), 4);
+        assert_eq!(init.in_flight.len(), 4);
+
+        // Peer cumulatively acks through seq 1 (nothing new) but SACKs
+        // seqs 3,4,5 as received — only seq 2 is the real gap.
+        // base = ack_nr(1)+2 = 3. seqs 3,4,5 → offsets 0,1,2 → bits 0,1,2.
+        let sack = Extension {
+            kind: EXT_SELECTIVE_ACK,
+            data: vec![0b0000_0111, 0, 0, 0],
+        };
+        let ack = Packet {
+            packet_type: PacketType::State,
+            connection_id: init.recv_id,
+            timestamp_micros: 0,
+            timestamp_diff_micros: 0,
+            wnd_size: RECV_WINDOW_BYTES,
+            seq_nr: 1,
+            ack_nr: 1,
+            extensions: vec![sack],
+            payload: Vec::new(),
+        };
+        let _ = init.handle_incoming(&ack, t);
+        // seqs 3,4,5 pruned; only seq 2 (the gap) remains for retransmit.
+        assert_eq!(init.in_flight.len(), 1);
+        assert_eq!(init.in_flight.front().unwrap().seq_nr, 2);
     }
 
     #[test]

@@ -22,9 +22,11 @@
 //!   AIMD that targets a constant queuing delay; we use a much
 //!   simpler fixed-window approach. Means we won't be as friendly to
 //!   coexisting TCP flows under load, but data still moves.
-//! - The Selective Ack extension is parsed but not yet acted on.
-//!   Lost-packet recovery is via the cumulative ack_nr only;
-//!   re-sending the entire window starting at ack_nr+1.
+//! - Selective Ack (BEP 29) IS acted on: the receiver emits a SACK
+//!   bitmask and the sender prunes selectively-acked packets from its
+//!   retransmit queue. What's still missing is SACK-driven *fast*
+//!   retransmit — we prune the queue but wait for the gap packet's RTO
+//!   rather than resending it the moment a SACK reveals the gap.
 //!
 //! Both gaps are noted on each call site so a future contributor can
 //! tighten without first re-deriving the design.
