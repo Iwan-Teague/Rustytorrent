@@ -179,6 +179,18 @@ impl Info {
                 .as_int()?,
         )
         .map_err(|_| Error::Bencode("piece length negative".into()))?;
+        // Bound the (attacker-controlled) piece length. Zero is
+        // degenerate (every piece would map to offset 0); an enormous
+        // value overflows the `piece_index * piece_length` offset math
+        // (a panic in debug → crash DoS, a silent wrap in release) and
+        // would drive oversized per-piece allocations. Real torrents top
+        // out around 16–32 MiB, so 1 GiB is a generous ceiling.
+        const MAX_PIECE_LENGTH: u64 = 1 << 30;
+        if piece_length == 0 || piece_length > MAX_PIECE_LENGTH {
+            return Err(Error::Bencode(format!(
+                "implausible piece length: {piece_length}"
+            )));
+        }
         let pieces_raw = d
             .get(&b"pieces".to_vec())
             .ok_or_else(|| Error::Bencode("info missing pieces".into()))?
@@ -457,5 +469,28 @@ mod tests {
     fn accepts_normal_name() {
         let t = TorrentFile::from_bytes(&build_single_file_torrent()).unwrap();
         assert_eq!(t.info.name, "test.bin");
+    }
+
+    /// piece length of 0 is degenerate and must be rejected.
+    #[test]
+    fn rejects_zero_piece_length() {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"d4:infod6:lengthi1e4:name1:x12:piece lengthi0e6:pieces20:");
+        out.extend_from_slice(&[0u8; 20]);
+        out.extend_from_slice(b"ee");
+        assert!(TorrentFile::from_bytes(&out).is_err());
+    }
+
+    /// An absurd piece length (overflow / huge-alloc vector) is rejected.
+    #[test]
+    fn rejects_oversized_piece_length() {
+        // piece length = 9999999999 (~9.3 GiB) > 1 GiB cap.
+        let mut out = Vec::new();
+        out.extend_from_slice(
+            b"d4:infod6:lengthi1e4:name1:x12:piece lengthi9999999999e6:pieces20:",
+        );
+        out.extend_from_slice(&[0u8; 20]);
+        out.extend_from_slice(b"ee");
+        assert!(TorrentFile::from_bytes(&out).is_err());
     }
 }
