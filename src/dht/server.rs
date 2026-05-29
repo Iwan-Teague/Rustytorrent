@@ -32,6 +32,20 @@ const ALPHA: usize = 3;
 const TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_DATAGRAM: usize = 1500;
 
+/// How long an announced peer stays in the store before being pruned.
+/// BEP 5 clients re-announce roughly every 15 min; 30 min gives a 2×
+/// margin so a still-active peer isn't dropped between its announces.
+const ANNOUNCE_TTL: Duration = Duration::from_secs(30 * 60);
+/// Hard cap on the number of distinct info_hashes we'll hold peers for.
+/// Each announce needs a valid token (a get_peers round-trip from a real
+/// IP), but a real attacker — or just organic DHT load on a long-running
+/// node — would otherwise grow the key set without bound. Once at the
+/// cap we stop accepting announces for *new* info_hashes (existing ones
+/// still update). Periodic TTL pruning keeps us below it in practice.
+const MAX_INFO_HASHES: usize = 16_384;
+/// How often we sweep the peer store for TTL-expired entries.
+const PEER_STORE_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 /// `info_hash → list of (peer-addr, when-we-learned)`. Used by the
 /// inbound get_peers handler to return values we've seen via prior
 /// announce_peer queries.
@@ -141,6 +155,19 @@ impl SharedState {
         let t_prev = token_for(addr, &ts.previous);
         token == t_now.as_slice() || token == t_prev.as_slice()
     }
+
+    /// Drop announced peers older than `ANNOUNCE_TTL` and any info_hash
+    /// whose list is then empty, bounding the peer store's memory on a
+    /// long-running node (and limiting how long a flood of distinct-hash
+    /// announces can occupy it).
+    async fn prune_peer_store(&self) {
+        let now = Instant::now();
+        let mut store = self.peer_store.lock().await;
+        store.retain(|_hash, entries| {
+            entries.retain(|(_, t)| now.duration_since(*t) <= ANNOUNCE_TTL);
+            !entries.is_empty()
+        });
+    }
 }
 
 fn token_for(addr: SocketAddr, salt: &[u8; 8]) -> Vec<u8> {
@@ -191,6 +218,9 @@ async fn run(
     let mut persist_timer = tokio::time::interval(Duration::from_secs(300));
     persist_timer.tick().await; // discard immediate first tick
 
+    let mut peer_store_gc_timer = tokio::time::interval(PEER_STORE_GC_INTERVAL);
+    peer_store_gc_timer.tick().await; // discard immediate first tick
+
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
@@ -230,6 +260,9 @@ async fn run(
                         tracing::debug!(target: "dht", contacts = count, "persisted dht state");
                     }
                 });
+            }
+            _ = peer_store_gc_timer.tick() => {
+                state.prune_peer_store().await;
             }
         }
     }
@@ -426,12 +459,19 @@ async fn answer_query(
             let advertised_port = if implied_port { from.port() } else { port };
             let peer_addr = SocketAddr::new(from.ip(), advertised_port);
             let mut store = state.peer_store.lock().await;
-            let entry = store.entry(info_hash).or_default();
-            entry.retain(|(a, _)| *a != peer_addr);
-            entry.push((peer_addr, Instant::now()));
-            // Trim per-hash list to avoid unbounded growth.
-            if entry.len() > 256 {
-                entry.drain(..entry.len() - 256);
+            // Bound the number of distinct info_hashes: once at the cap we
+            // still update hashes we already track, but refuse to create a
+            // new key. Prevents a flood of random-info_hash announces from
+            // growing the map without bound between GC sweeps. Either way
+            // we reply with our id (a normal announce_peer ack).
+            if store.len() < MAX_INFO_HASHES || store.contains_key(&info_hash) {
+                let entry = store.entry(info_hash).or_default();
+                entry.retain(|(a, _)| *a != peer_addr);
+                entry.push((peer_addr, Instant::now()));
+                // Trim per-hash list to avoid unbounded growth.
+                if entry.len() > 256 {
+                    entry.drain(..entry.len() - 256);
+                }
             }
             Response::Id { id: state.local_id }
         }
@@ -681,4 +721,33 @@ async fn announce_peer(
         let _ = send_query(sock, state, addr, q).await;
     }
     tracing::debug!(target: "dht", "announce_peer complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn prune_drops_stale_and_keeps_fresh() {
+        let state = SharedState::new(NodeId([0u8; 20]));
+        let fresh_hash = [1u8; 20];
+        let stale_hash = [2u8; 20];
+        let peer: SocketAddr = "1.2.3.4:6881".parse().unwrap();
+        {
+            let mut store = state.peer_store.lock().await;
+            store.insert(fresh_hash, vec![(peer, Instant::now())]);
+            // A stale entry, older than the TTL.
+            store.insert(
+                stale_hash,
+                vec![(peer, Instant::now() - ANNOUNCE_TTL - Duration::from_secs(1))],
+            );
+        }
+        state.prune_peer_store().await;
+        let store = state.peer_store.lock().await;
+        assert!(store.contains_key(&fresh_hash), "fresh entry must survive");
+        assert!(
+            !store.contains_key(&stale_hash),
+            "fully-stale info_hash must be removed entirely"
+        );
+    }
 }
