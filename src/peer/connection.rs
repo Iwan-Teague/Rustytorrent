@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{split, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Instant};
@@ -11,6 +11,8 @@ use crate::error::{Error, Result};
 use crate::peer::handshake::Handshake;
 use crate::peer::message::{read_frame, write_frame, Message, BLOCK_SIZE};
 use crate::peer::mse;
+use crate::peer::transport::Transport;
+use crate::peer::utp::UtpSocket;
 use crate::peer_id::PeerId;
 use crate::ratelimit::TokenBucket;
 use crate::socks5::{self, ProxyConfig};
@@ -159,58 +161,32 @@ pub async fn run_outgoing(
     proxies: Vec<ProxyConfig>,
     bind_iface: Option<String>,
     anonymous: bool,
+    utp: Option<Arc<UtpSocket>>,
 ) -> Result<()> {
-    tracing::debug!(target: "peer", %addr, hops = proxies.len(), bind = ?bind_iface, "dialing (plain)");
+    tracing::debug!(target: "peer", %addr, hops = proxies.len(), bind = ?bind_iface, utp = utp.is_some(), "dialing (plain)");
     let iface = bind_iface.as_deref();
-    let outcome = match plain_handshake(addr, info_hash, peer_id, &proxies, iface).await {
-        Ok((reader, writer, theirs)) => {
-            let supports_ext =
-                crate::peer::handshake::supports_extension_protocol(&theirs.reserved);
-            let _ = event_tx
-                .send(PeerEvent::Connected {
-                    addr,
-                    peer_id: theirs.peer_id,
-                })
-                .await;
-            post_handshake_loop(
-                reader,
-                writer,
-                addr,
-                event_tx.clone(),
-                cmd_rx,
-                supports_ext,
-                anonymous,
-            )
-            .await
-        }
-        Err(e) if is_likely_mse_signal(&e) => {
-            tracing::debug!(target: "peer", %addr, reason = %e, "plain failed, retrying with MSE");
-            match mse_handshake_outgoing(addr, info_hash, peer_id, &proxies, iface).await {
-                Ok((reader, writer, theirs)) => {
-                    let supports_ext =
-                        crate::peer::handshake::supports_extension_protocol(&theirs.reserved);
-                    let _ = event_tx
-                        .send(PeerEvent::Connected {
-                            addr,
-                            peer_id: theirs.peer_id,
-                        })
-                        .await;
-                    post_handshake_loop(
-                        reader,
-                        writer,
-                        addr,
-                        event_tx.clone(),
-                        cmd_rx,
-                        supports_ext,
-                        anonymous,
-                    )
+    let outcome = async {
+        // Establish a transport (TCP, or a TCP+µTP race when µTP is
+        // enabled on a clearnet direct path), then try plain BT.
+        let transport = connect_transport(addr, utp.as_ref(), &proxies, iface).await?;
+        match plain_handshake_outgoing(transport, info_hash, peer_id).await {
+            Ok((reader, writer, theirs)) => {
+                run_after_handshake(reader, writer, addr, &theirs, event_tx.clone(), cmd_rx, anonymous)
                     .await
-                }
-                Err(e) => Err(e),
             }
+            Err(e) if is_likely_mse_signal(&e) => {
+                tracing::debug!(target: "peer", %addr, reason = %e, "plain failed, retrying with MSE");
+                // Redial (racing again if µTP is on) and force MSE.
+                let transport = connect_transport(addr, utp.as_ref(), &proxies, iface).await?;
+                let (reader, writer, theirs) =
+                    mse_handshake_outgoing(transport, info_hash, peer_id).await?;
+                run_after_handshake(reader, writer, addr, &theirs, event_tx.clone(), cmd_rx, anonymous)
+                    .await
+            }
+            Err(e) => Err(e),
         }
-        Err(e) => Err(e),
-    };
+    }
+    .await;
 
     let (reason, violation) = classify_outcome(&outcome);
     let _ = event_tx
@@ -221,6 +197,41 @@ pub async fn run_outgoing(
         })
         .await;
     outcome
+}
+
+/// Emit the `Connected` event and run the post-handshake loop. Shared
+/// by the plain and MSE outgoing paths so the connected-event + loop
+/// boilerplate lives in one place.
+async fn run_after_handshake<R, W>(
+    reader: R,
+    writer: W,
+    addr: SocketAddr,
+    theirs: &Handshake,
+    event_tx: mpsc::Sender<PeerEvent>,
+    cmd_rx: mpsc::Receiver<PeerCommand>,
+    anonymous: bool,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+{
+    let supports_ext = crate::peer::handshake::supports_extension_protocol(&theirs.reserved);
+    let _ = event_tx
+        .send(PeerEvent::Connected {
+            addr,
+            peer_id: theirs.peer_id,
+        })
+        .await;
+    post_handshake_loop(
+        reader,
+        writer,
+        addr,
+        event_tx,
+        cmd_rx,
+        supports_ext,
+        anonymous,
+    )
+    .await
 }
 
 /// Build the `(reason, violation)` pair for a `PeerEvent::Disconnected`
@@ -247,34 +258,26 @@ pub async fn run_outgoing_mse_only(
     proxies: Vec<ProxyConfig>,
     bind_iface: Option<String>,
     anonymous: bool,
+    utp: Option<Arc<UtpSocket>>,
 ) -> Result<()> {
-    tracing::debug!(target: "peer", %addr, hops = proxies.len(), bind = ?bind_iface, "dialing (MSE-only)");
-    let outcome =
-        match mse_handshake_outgoing(addr, info_hash, peer_id, &proxies, bind_iface.as_deref())
-            .await
-        {
-            Ok((reader, writer, theirs)) => {
-                let supports_ext =
-                    crate::peer::handshake::supports_extension_protocol(&theirs.reserved);
-                let _ = event_tx
-                    .send(PeerEvent::Connected {
-                        addr,
-                        peer_id: theirs.peer_id,
-                    })
-                    .await;
-                post_handshake_loop(
-                    reader,
-                    writer,
-                    addr,
-                    event_tx.clone(),
-                    cmd_rx,
-                    supports_ext,
-                    anonymous,
-                )
-                .await
-            }
-            Err(e) => Err(e),
-        };
+    tracing::debug!(target: "peer", %addr, hops = proxies.len(), bind = ?bind_iface, utp = utp.is_some(), "dialing (MSE-only)");
+    let iface = bind_iface.as_deref();
+    let outcome = async {
+        let transport = connect_transport(addr, utp.as_ref(), &proxies, iface).await?;
+        let (reader, writer, theirs) =
+            mse_handshake_outgoing(transport, info_hash, peer_id).await?;
+        run_after_handshake(
+            reader,
+            writer,
+            addr,
+            &theirs,
+            event_tx.clone(),
+            cmd_rx,
+            anonymous,
+        )
+        .await
+    }
+    .await;
     let (reason, violation) = classify_outcome(&outcome);
     let _ = event_tx
         .send(PeerEvent::Disconnected {
@@ -339,27 +342,81 @@ fn is_protocol_violation(e: &Error) -> bool {
         || s.contains("extended payload empty")
 }
 
-/// Open a TCP connection (direct or via SOCKS5 chain), perform the plain
-/// BitTorrent handshake, return the split read/write halves.
-async fn plain_handshake(
+/// Establish a peer transport. On a clearnet direct path with µTP
+/// enabled, race a TCP dial and a µTP dial and take whichever connects
+/// first (the other is aborted); otherwise dial TCP only. µTP is gated
+/// off whenever a SOCKS5 chain or `--bind-iface` is set — UDP can't
+/// ride a SOCKS5 CONNECT and our µTP socket isn't interface-bound, so
+/// either would leak past the proxy / kill switch. nodelay is applied
+/// before returning.
+async fn connect_transport(
     addr: SocketAddr,
-    info_hash: [u8; 20],
-    peer_id: PeerId,
+    utp: Option<&Arc<UtpSocket>>,
     proxies: &[ProxyConfig],
     bind_iface: Option<&str>,
-) -> Result<(OwnedReadHalf, OwnedWriteHalf, Handshake)> {
-    let mut stream = dial(addr, proxies, bind_iface).await?;
-    let _ = stream.set_nodelay(true);
+) -> Result<Transport> {
+    let use_utp = proxies.is_empty() && bind_iface.is_none();
+    let transport = match (use_utp, utp) {
+        (true, Some(utp)) => race_tcp_utp(addr, utp, proxies, bind_iface).await?,
+        _ => Transport::Tcp(dial_tcp(addr, proxies, bind_iface).await?),
+    };
+    transport.set_nodelay();
+    Ok(transport)
+}
+
+/// Race a TCP dial against a µTP dial. Returns the first transport to
+/// connect; if one fails we wait for the other rather than failing the
+/// whole dial (a peer may have only one of the two reachable). Returns
+/// the last error only if BOTH fail.
+async fn race_tcp_utp(
+    addr: SocketAddr,
+    utp: &Arc<UtpSocket>,
+    proxies: &[ProxyConfig],
+    bind_iface: Option<&str>,
+) -> Result<Transport> {
+    let tcp_fut = dial_tcp(addr, proxies, bind_iface);
+    let utp_fut = utp.connect(addr);
+    tokio::pin!(tcp_fut);
+    tokio::pin!(utp_fut);
+    let mut tcp_done = false;
+    let mut utp_done = false;
+    let mut last_err: Option<Error> = None;
+    loop {
+        tokio::select! {
+            r = &mut tcp_fut, if !tcp_done => match r {
+                Ok(s) => return Ok(Transport::Tcp(s)),
+                Err(e) => { tcp_done = true; last_err = Some(e); }
+            },
+            r = &mut utp_fut, if !utp_done => match r {
+                Ok(s) => return Ok(Transport::Utp(s)),
+                Err(e) => { utp_done = true; last_err = Some(Error::Network(format!("utp connect {addr}: {e}"))); }
+            },
+            else => break,
+        }
+        if tcp_done && utp_done {
+            break;
+        }
+    }
+    Err(last_err.unwrap_or_else(|| Error::Network(format!("connect {addr}: no transport"))))
+}
+
+/// Perform the plain BT handshake over an already-connected transport,
+/// then return the split read/write halves.
+async fn plain_handshake_outgoing(
+    mut transport: Transport,
+    info_hash: [u8; 20],
+    peer_id: PeerId,
+) -> Result<(ReadHalf<Transport>, WriteHalf<Transport>, Handshake)> {
     let theirs = match timeout(
         HANDSHAKE_TIMEOUT,
-        Handshake::perform_outgoing(&mut stream, info_hash, peer_id),
+        Handshake::perform_outgoing(&mut transport, info_hash, peer_id),
     )
     .await
     {
         Ok(r) => r?,
         Err(_) => return Err(Error::Handshake("timeout".into())),
     };
-    let (read_half, write_half) = stream.into_split();
+    let (read_half, write_half) = split(transport);
     Ok((read_half, write_half, theirs))
 }
 
@@ -368,7 +425,7 @@ async fn plain_handshake(
 /// single-hop SOCKS5. Length-N chain → nested SOCKS5 CONNECTs on one
 /// TCP stream (C1: defeats single-proxy compromise). The returned
 /// `TcpStream` is, post-handshake, a transparent byte-pipe to `addr`.
-async fn dial(
+async fn dial_tcp(
     addr: SocketAddr,
     proxies: &[ProxyConfig],
     bind_iface: Option<&str>,
@@ -412,26 +469,26 @@ async fn dial(
     }
 }
 
-/// Open a fresh TCP connection (direct or via SOCKS5), drive the MSE
-/// handshake, then the BT handshake over the encrypted stream. Return the
-/// split RC4-wrapped halves.
+/// Drive the MSE handshake over an already-connected transport, then
+/// the BT handshake over the encrypted stream. Return the split
+/// RC4-wrapped halves.
 async fn mse_handshake_outgoing(
-    addr: SocketAddr,
+    transport: Transport,
     info_hash: [u8; 20],
     peer_id: PeerId,
-    proxies: &[ProxyConfig],
-    bind_iface: Option<&str>,
 ) -> Result<(
-    mse::Rc4Reader<OwnedReadHalf>,
-    mse::Rc4Writer<OwnedWriteHalf>,
+    mse::Rc4Reader<ReadHalf<Transport>>,
+    mse::Rc4Writer<WriteHalf<Transport>>,
     Handshake,
 )> {
-    let stream = dial(addr, proxies, bind_iface).await?;
-    let _ = stream.set_nodelay(true);
-
     // MSE handshake first. After this, all reads/writes through `enc` are
     // RC4'd transparently.
-    let mut enc = match timeout(HANDSHAKE_TIMEOUT, mse::perform_outgoing(stream, info_hash)).await {
+    let mut enc = match timeout(
+        HANDSHAKE_TIMEOUT,
+        mse::perform_outgoing(transport, info_hash),
+    )
+    .await
+    {
         Ok(Ok(e)) => e,
         Ok(Err(e)) => return Err(Error::Handshake(format!("mse: {e}"))),
         Err(_) => return Err(Error::Handshake("mse timeout".into())),
@@ -448,10 +505,10 @@ async fn mse_handshake_outgoing(
         Err(_) => return Err(Error::Handshake("bt-over-mse timeout".into())),
     };
 
-    // Pull out the raw socket + ciphers (now advanced past the BT
+    // Pull out the raw transport + ciphers (now advanced past the BT
     // handshake) and split into per-direction wrappers.
     let (raw_stream, in_cipher, out_cipher) = enc.into_parts();
-    let (read_half, write_half) = raw_stream.into_split();
+    let (read_half, write_half) = split(raw_stream);
     Ok((
         mse::Rc4Reader::new(read_half, in_cipher),
         mse::Rc4Writer::new(write_half, out_cipher),
@@ -464,7 +521,7 @@ async fn mse_handshake_outgoing(
 /// (anything else — the start of `Ya`), then dispatches.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct dial-time knob
 pub async fn run_with_stream(
-    stream: TcpStream,
+    stream: Transport,
     addr: SocketAddr,
     info_hash: [u8; 20],
     peer_id: PeerId,
@@ -515,7 +572,7 @@ pub async fn run_with_stream(
 /// post-handshake loop.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct dial-time knob
 async fn run_plain_on_stream(
-    mut stream: TcpStream,
+    mut stream: Transport,
     addr: SocketAddr,
     info_hash: [u8; 20],
     peer_id: PeerId,
@@ -543,7 +600,7 @@ async fn run_plain_on_stream(
             peer_id: theirs.peer_id,
         })
         .await;
-    let (reader, writer) = stream.into_split();
+    let (reader, writer) = split(stream);
     post_handshake_loop(
         reader,
         writer,
@@ -558,7 +615,7 @@ async fn run_plain_on_stream(
 
 /// Inbound connection dispatcher: peek the first byte and pick the right path.
 async fn run_incoming_dispatch(
-    stream: TcpStream,
+    mut stream: Transport,
     addr: SocketAddr,
     info_hash: [u8; 20],
     peer_id: PeerId,
@@ -566,18 +623,17 @@ async fn run_incoming_dispatch(
     cmd_rx: mpsc::Receiver<PeerCommand>,
     anonymous: bool,
 ) -> Result<()> {
-    // MSG_PEEK lets us inspect the byte without consuming it. tokio's
-    // `TcpStream::peek` returns the number of bytes copied; 0 means EOF.
-    let mut peek_buf = [0u8; 1];
-    let peeked = match timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut peek_buf)).await {
-        Ok(Ok(n)) => n,
+    // Peek the first byte without consuming it (MSG_PEEK on TCP; a
+    // buffered non-consuming read on µTP). `None` means EOF.
+    let peeked = match timeout(HANDSHAKE_TIMEOUT, stream.peek_first_byte()).await {
+        Ok(Ok(b)) => b,
         Ok(Err(e)) => return Err(Error::Network(format!("peek: {e}"))),
         Err(_) => return Err(Error::Handshake("peek timeout".into())),
     };
-    if peeked == 0 {
+    let Some(first) = peeked else {
         return Err(Error::Network("peer closed before handshake".into()));
-    }
-    if peek_buf[0] == crate::peer::handshake::PSTRLEN {
+    };
+    if first == crate::peer::handshake::PSTRLEN {
         // 0x13 → plain BT.
         run_plain_on_stream(
             stream, addr, info_hash, peer_id, event_tx, cmd_rx, false, anonymous,
@@ -592,10 +648,10 @@ async fn run_incoming_dispatch(
     }
 }
 
-/// MSE-over-stream incoming flow. The peek above did NOT consume the byte
-/// (MSG_PEEK), so the inner MSE handshake reads `Ya` from the start.
+/// MSE-over-stream incoming flow. The peek above did NOT consume the byte,
+/// so the inner MSE handshake reads `Ya` from the start.
 async fn run_mse_on_stream(
-    stream: TcpStream,
+    stream: Transport,
     addr: SocketAddr,
     info_hash: [u8; 20],
     peer_id: PeerId,
@@ -634,7 +690,7 @@ async fn run_mse_on_stream(
         .await;
 
     let (raw, in_cipher, out_cipher) = enc.into_parts();
-    let (read_half, write_half) = raw.into_split();
+    let (read_half, write_half) = split(raw);
     let reader = mse::Rc4Reader::new(read_half, in_cipher);
     let writer = mse::Rc4Writer::new(write_half, out_cipher);
     post_handshake_loop(

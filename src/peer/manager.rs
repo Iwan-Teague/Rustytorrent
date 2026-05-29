@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::peer::connection::{run_outgoing, run_outgoing_mse_only, PeerEvent, PeerHandle};
+use crate::peer::transport::Transport;
+use crate::peer::utp::UtpSocket;
 use crate::peer_id::PeerId;
 use crate::socks5::ProxyConfig;
 
@@ -42,8 +45,14 @@ pub struct PeerManager {
     /// `VIOLATION_WINDOW`. When the count reaches
     /// `VIOLATION_BAN_THRESHOLD` the IP joins the ban set. The map
     /// only grows for IPs that have actually violated; clean peers
-    /// never appear here. Entries are pruned lazily on insert.
+    /// never appear here. Entries are pruned lazily on insert and by
+    /// `gc_violations` on a periodic tick.
     violations: HashMap<IpAddr, Vec<Instant>>,
+    /// Shared µTP socket for outgoing dials. `Some` only when µTP is
+    /// enabled on a clearnet direct path (the engine withholds it under
+    /// `--anonymous`, an active SOCKS5 chain, or `--bind-iface`). When
+    /// set, each outgoing dial races TCP and µTP.
+    utp: Option<Arc<UtpSocket>>,
 }
 
 struct PeerSlot {
@@ -69,7 +78,12 @@ impl PeerManager {
             bind_iface: None,
             anonymous: false,
             violations: HashMap::new(),
+            utp: None,
         }
+    }
+
+    pub fn set_utp(&mut self, utp: Option<Arc<UtpSocket>>) {
+        self.utp = utp;
     }
 
     pub fn set_max_peers(&mut self, n: usize) {
@@ -231,15 +245,16 @@ impl PeerManager {
         let proxies = self.proxies.clone();
         let bind_iface = self.bind_iface.clone();
         let anonymous = self.anonymous;
+        let utp = self.utp.clone();
         let task = tokio::spawn(async move {
             let res = if force_mse {
                 run_outgoing_mse_only(
-                    addr, info_hash, peer_id, event_tx, cmd_rx, proxies, bind_iface, anonymous,
+                    addr, info_hash, peer_id, event_tx, cmd_rx, proxies, bind_iface, anonymous, utp,
                 )
                 .await
             } else {
                 run_outgoing(
-                    addr, info_hash, peer_id, event_tx, cmd_rx, proxies, bind_iface, anonymous,
+                    addr, info_hash, peer_id, event_tx, cmd_rx, proxies, bind_iface, anonymous, utp,
                 )
                 .await
             };
@@ -256,9 +271,10 @@ impl PeerManager {
         );
     }
 
-    /// Accept an inbound TCP connection from a peer and spawn its task.
-    /// Honors max-peer cap and ban list; returns false if rejected.
-    pub fn accept_incoming(&mut self, stream: tokio::net::TcpStream, addr: SocketAddr) -> bool {
+    /// Accept an inbound connection (TCP or µTP) from a peer and spawn
+    /// its task. Honors max-peer cap and ban list; returns false if
+    /// rejected.
+    pub fn accept_incoming(&mut self, stream: Transport, addr: SocketAddr) -> bool {
         if self.peers.len() >= self.max_peers || self.peers.contains_key(&addr) {
             return false;
         }

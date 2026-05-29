@@ -123,6 +123,12 @@ enum Commands {
         /// silently dropped (peer re-requests later).
         #[arg(long)]
         max_up: Option<u64>,
+        /// Enable µTP (BEP 29): bind a UDP socket on the listen port,
+        /// accept inbound µTP peers, and race TCP+µTP on every dial.
+        /// Auto-disabled under --anonymous / --socks5 / --bind-iface
+        /// (UDP can't ride SOCKS5 and isn't interface-bound here).
+        #[arg(long, default_value_t = false)]
+        utp: bool,
     },
     /// Download from a magnet URI (BEP 9 + BEP 10 + BEP 53). Bootstraps a
     /// peer pool via DHT and the magnet's own trackers, fetches the info
@@ -183,6 +189,9 @@ enum Commands {
         /// Cap upload rate, KiB/s.
         #[arg(long)]
         max_up: Option<u64>,
+        /// Enable µTP (BEP 29). Same semantics as `download --utp`.
+        #[arg(long, default_value_t = false)]
+        utp: bool,
     },
     /// Decrypt a `--paranoid` spool into the real file layout using the
     /// same passphrase that produced it. Pieces that don't hash-match
@@ -243,6 +252,7 @@ async fn main() -> Result<()> {
             spool,
             max_down,
             max_up,
+            utp,
         } => {
             cmd_download(
                 file,
@@ -265,6 +275,7 @@ async fn main() -> Result<()> {
                 spool,
                 max_down,
                 max_up,
+                utp,
             )
             .await
         }
@@ -294,6 +305,7 @@ async fn main() -> Result<()> {
             spool,
             max_down,
             max_up,
+            utp,
         } => {
             cmd_magnet(
                 uri,
@@ -315,6 +327,7 @@ async fn main() -> Result<()> {
                 spool,
                 max_down,
                 max_up,
+                utp,
             )
             .await
         }
@@ -438,6 +451,7 @@ async fn cmd_download(
     spool: Option<PathBuf>,
     max_down: Option<u64>,
     max_up: Option<u64>,
+    utp: bool,
 ) -> Result<()> {
     let raw = tokio::fs::read(&path)
         .await
@@ -523,6 +537,7 @@ async fn cmd_download(
         spool_path: spool,
         max_down_bytes_per_sec: max_down.map(|k| k * 1024),
         max_up_bytes_per_sec: max_up.map(|k| k * 1024),
+        utp_enabled: utp,
         ..Default::default()
     };
     let engine = rustytorrent::engine::TorrentEngine::new(t, peer_id, cfg);
@@ -712,6 +727,7 @@ async fn cmd_magnet(
     spool: Option<PathBuf>,
     max_down: Option<u64>,
     max_up: Option<u64>,
+    utp: bool,
 ) -> Result<()> {
     let magnet = rustytorrent::magnet::MagnetLink::parse(&uri)?;
     println!(
@@ -906,6 +922,7 @@ async fn cmd_magnet(
         spool_path: spool,
         max_down_bytes_per_sec: max_down.map(|k| k * 1024),
         max_up_bytes_per_sec: max_up.map(|k| k * 1024),
+        utp_enabled: utp,
         ..Default::default()
     };
     let engine = rustytorrent::engine::TorrentEngine::new(t, peer_id, cfg);

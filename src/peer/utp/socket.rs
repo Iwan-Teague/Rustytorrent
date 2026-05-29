@@ -134,6 +134,25 @@ impl UtpStream {
     pub fn peer_addr(&self) -> SocketAddr {
         self.key.0
     }
+
+    /// Peek the first not-yet-consumed byte without removing it from the
+    /// stream — the inbound dispatcher uses this to choose plain BT vs
+    /// MSE. `Ok(None)` means clean EOF before any byte arrived. The byte
+    /// stays buffered, so the subsequent handshake read still sees it
+    /// (mirrors `TcpStream::peek` / MSG_PEEK semantics for the caller).
+    pub async fn peek_first_byte(&mut self) -> io::Result<Option<u8>> {
+        if self.read_pos < self.read_rem.len() {
+            return Ok(Some(self.read_rem[self.read_pos]));
+        }
+        match self.incoming.recv().await {
+            Some(bytes) => {
+                self.read_rem = bytes;
+                self.read_pos = 0;
+                Ok(self.read_rem.first().copied())
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 impl AsyncRead for UtpStream {

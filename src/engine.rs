@@ -12,6 +12,8 @@ use crate::metainfo::TorrentFile;
 use crate::peer::connection::{PeerCommand, PeerEvent};
 use crate::peer::manager::PeerManager;
 use crate::peer::message::{bitfield_to_bytes, BLOCK_SIZE};
+use crate::peer::transport::Transport;
+use crate::peer::utp::UtpSocket;
 use crate::peer_id::PeerId;
 use crate::piece::{verify_piece, BlockOutcome, Picker, PieceManager};
 use crate::ratelimit::TokenBucket;
@@ -105,6 +107,13 @@ pub struct EngineConfig {
     /// than queued, which keeps the engine memory-bounded under bursty
     /// load.
     pub max_up_bytes_per_sec: Option<u64>,
+    /// **µTP** (BEP 29) transport. When on, the engine binds a µTP
+    /// socket on `listen_port` (UDP), accepts inbound µTP peers, and
+    /// races TCP+µTP on every outgoing dial. Gated off automatically
+    /// under `anonymous`, an active SOCKS5 chain, or `bind_iface` —
+    /// UDP can't ride SOCKS5 and our µTP socket isn't interface-bound,
+    /// so allowing it there would leak past the proxy / kill switch.
+    pub utp_enabled: bool,
 }
 
 impl Default for EngineConfig {
@@ -130,6 +139,7 @@ impl Default for EngineConfig {
             spool_path: None,
             max_down_bytes_per_sec: None,
             max_up_bytes_per_sec: None,
+            utp_enabled: false,
         }
     }
 }
@@ -326,10 +336,49 @@ impl TorrentEngine {
         peers.set_bind_iface(self.cfg.bind_iface.clone());
         peers.set_anonymous(self.cfg.anonymous);
 
-        // Bind incoming-connection listener — unless anonymous mode (the
-        // listener would expose our real IP on the configured port).
-        let (incoming_tx, mut incoming_rx) =
-            mpsc::channel::<(tokio::net::TcpStream, SocketAddr)>(32);
+        // µTP transport (BEP 29): bind a UDP socket on the listen port
+        // when enabled on a clearnet direct path. Gated off under
+        // anonymous / SOCKS5 / bind-iface — UDP can't ride a SOCKS5
+        // CONNECT and our µTP socket isn't interface-bound, so allowing
+        // it there would leak past the proxy / kill switch.
+        let utp_socket: Option<Arc<UtpSocket>> = if self.cfg.utp_enabled
+            && !self.cfg.anonymous
+            && self.cfg.proxies.is_empty()
+            && self.cfg.bind_iface.is_none()
+        {
+            let bind: SocketAddr = (std::net::Ipv4Addr::UNSPECIFIED, self.cfg.listen_port).into();
+            match UtpSocket::bind(bind).await {
+                Ok(s) => {
+                    tracing::info!(target: "engine", port = self.cfg.listen_port, "µTP transport enabled (TCP+µTP dial race)");
+                    Some(Arc::new(s))
+                }
+                Err(e) => {
+                    tracing::warn!(target: "engine", error = %e, "µTP bind failed; continuing TCP-only");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        peers.set_utp(utp_socket.clone());
+
+        // Incoming connections (TCP and/or µTP) funnel through one
+        // channel as `Transport` values so the accept path is uniform.
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<(Transport, SocketAddr)>(32);
+
+        // µTP inbound accept loop. The per-peer cap + ban list are still
+        // enforced in `accept_incoming`. Skipped under anonymous mode
+        // (no inbound at all then) since `utp_socket` is already None.
+        if let Some(utp) = utp_socket.clone() {
+            let tx = incoming_tx.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, addr)) = utp.accept().await {
+                    if tx.send((Transport::Utp(stream), addr)).await.is_err() {
+                        break; // engine gone
+                    }
+                }
+            });
+        }
         let listener_handle = if self.cfg.anonymous {
             drop(incoming_tx);
             None
@@ -383,7 +432,7 @@ impl TorrentEngine {
                                         buckets.retain(|_, b| b.available() < 9.0);
                                         last_gc = Instant::now();
                                     }
-                                    if incoming_tx.send((s, addr)).await.is_err() {
+                                    if incoming_tx.send((Transport::Tcp(s), addr)).await.is_err() {
                                         break;
                                     }
                                 }
