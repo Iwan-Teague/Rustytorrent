@@ -53,6 +53,16 @@ pub const MAX_DATA_PAYLOAD: usize = 1200;
 /// real BitTorrent block-exchange flow; sized to make wnd_size
 /// effectively non-throttling.
 pub const RECV_WINDOW_BYTES: u32 = 1024 * 1024;
+/// Hard cap on out-of-order DATA packets we'll buffer while waiting
+/// for the gap-filling packet to arrive. Without this, a malicious
+/// peer can withhold one seq_nr and then stream packets at
+/// ever-higher seq_nrs, forcing us to buffer every payload in memory
+/// indefinitely (a cheap remote OOM). Sized to comfortably cover the
+/// advertised receive window (`RECV_WINDOW_BYTES / MAX_DATA_PAYLOAD`,
+/// rounded up) — a well-behaved peer never exceeds it; a flooding
+/// peer just gets its excess out-of-order packets dropped and must
+/// retransmit them in order.
+pub const MAX_PENDING_IN: usize = RECV_WINDOW_BYTES as usize / MAX_DATA_PAYLOAD + 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -325,10 +335,19 @@ impl Connection {
                         self.in_buf.extend(buf.iter().copied());
                         self.peer_seq_nr_acked = self.peer_seq_nr_acked.wrapping_add(1);
                     }
-                } else {
-                    // Out-of-order; stash for later.
+                } else if self.pending_in.contains_key(&payload_seq)
+                    || self.pending_in.len() < MAX_PENDING_IN
+                {
+                    // Out-of-order; stash for later. Re-stashing a seq we
+                    // already hold is free (overwrite). Only grow the
+                    // buffer up to MAX_PENDING_IN — beyond that we drop
+                    // the excess (see the const's rationale): the peer
+                    // will retransmit once our cumulative ack_nr advances.
                     self.pending_in.insert(payload_seq, packet.payload.clone());
                 }
+                // Always cumulative-ack our real in-order position, even
+                // when we dropped this packet — that tells a flooding
+                // peer exactly which seq we're still stuck on.
                 Some(self.build_state_ack())
             }
             PacketType::Fin => {
@@ -644,6 +663,41 @@ mod tests {
         assert_eq!(got, b"hello,WORLD");
         // Suppress unused-variable warning on `init` — kept to make
         // the handshake context obvious.
+        let _ = init;
+    }
+
+    /// A peer that withholds the gap-filler and floods ever-higher
+    /// out-of-order seq_nrs must not grow our reorder buffer without
+    /// bound. Excess packets are dropped; the buffer stays capped.
+    #[test]
+    fn out_of_order_flood_is_bounded() {
+        let t = now();
+        let (init, syn) = Connection::new_initiator(900, t);
+        let (mut recv, _state) = Connection::new_receiver(&syn, t).unwrap();
+        let recv_id = recv.recv_id;
+        let mk = |seq: u16| Packet {
+            packet_type: PacketType::Data,
+            connection_id: recv_id,
+            timestamp_micros: 0,
+            timestamp_diff_micros: 0,
+            wnd_size: RECV_WINDOW_BYTES,
+            seq_nr: seq,
+            ack_nr: 0,
+            extensions: Vec::new(),
+            payload: vec![0u8; MAX_DATA_PAYLOAD],
+        };
+        // next-expected is 2 (SYN seq was 1). Never send 2 — flood
+        // 3..=N with N far past the cap, all out of order.
+        for seq in 3..(3 + MAX_PENDING_IN as u32 + 5_000) {
+            let _ = recv.handle_incoming(&mk(seq as u16), t);
+        }
+        assert!(
+            recv.pending_in.len() <= MAX_PENDING_IN,
+            "reorder buffer must stay capped at {MAX_PENDING_IN}, got {}",
+            recv.pending_in.len()
+        );
+        // Nothing was delivered in order (the gap at seq 2 is still open).
+        assert!(recv.take_received(usize::MAX).is_empty());
         let _ = init;
     }
 
