@@ -223,10 +223,19 @@ async fn do_handshake_on_stream(
     target: SocketAddr,
 ) -> Result<()> {
     // Step 1 — method negotiation.
-    // We always offer NO_AUTH (cheap fallback for proxies that ignore creds).
-    // If we have creds, we additionally offer USER/PASS; the proxy picks one.
+    //
+    // When we have credentials we offer ONLY USER/PASS — never NO_AUTH
+    // alongside it. Offering both lets the proxy downgrade to NO_AUTH and
+    // silently ignore our credentials, which is a privacy hole: with
+    // --tor-isolation each dial carries a fresh random SOCKS5 username
+    // that Tor uses to assign a distinct circuit (see
+    // `ProxyConfig::for_dial`). If the proxy picks NO_AUTH that username
+    // never reaches Tor, every dial rides the same circuit, and the
+    // correlation defense the user asked for is gone — with no error. So
+    // when creds are set we force USER/PASS and fail closed if the proxy
+    // won't take it. When we have no creds we offer NO_AUTH only.
     let methods: &[u8] = if proxy.credentials.is_some() {
-        &[METHOD_NO_AUTH, METHOD_USERPASS]
+        &[METHOD_USERPASS]
     } else {
         &[METHOD_NO_AUTH]
     };
@@ -591,6 +600,103 @@ mod tests {
         assert_eq!(&buf, b"world");
         let res = server.await.unwrap();
         assert_eq!(res.creds, Some(("alice".into(), "s3cret".into())));
+    }
+
+    /// Privacy regression: when credentials are present we must offer
+    /// ONLY USER/PASS, so the proxy can't downgrade to NO_AUTH and
+    /// silently drop the per-dial isolation username. The mock asserts
+    /// the offered method set and that it actually receives the creds.
+    #[tokio::test]
+    async fn creds_present_offers_only_userpass() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let target: SocketAddr = "9.9.9.9:6881".parse().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 2];
+            sock.read_exact(&mut greeting).await.unwrap();
+            let nmethods = greeting[1] as usize;
+            let mut methods = vec![0u8; nmethods];
+            sock.read_exact(&mut methods).await.unwrap();
+            // The whole point: NO_AUTH must NOT be on offer.
+            assert!(
+                !methods.contains(&METHOD_NO_AUTH),
+                "NO_AUTH must not be offered when creds are set (downgrade hole)"
+            );
+            assert!(methods.contains(&METHOD_USERPASS));
+            sock.write_all(&[VER_SOCKS5, METHOD_USERPASS])
+                .await
+                .unwrap();
+            // Consume the USER/PASS auth and confirm the username arrives.
+            let mut head = [0u8; 2];
+            sock.read_exact(&mut head).await.unwrap();
+            let mut u = vec![0u8; head[1] as usize];
+            sock.read_exact(&mut u).await.unwrap();
+            let mut plen = [0u8; 1];
+            sock.read_exact(&mut plen).await.unwrap();
+            let mut p = vec![0u8; plen[0] as usize];
+            sock.read_exact(&mut p).await.unwrap();
+            sock.write_all(&[VER_USERPASS, 0x00]).await.unwrap();
+            // CONNECT + success reply.
+            let mut req = [0u8; 10];
+            sock.read_exact(&mut req).await.unwrap();
+            sock.write_all(&[VER_SOCKS5, REP_SUCCEEDED, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            String::from_utf8(u).unwrap()
+        });
+        let _stream = connect(
+            &ProxyConfig {
+                addr: proxy_addr,
+                credentials: Some(Credentials {
+                    username: "isolation-nonce".into(),
+                    password: "x".into(),
+                }),
+                isolation: false,
+            },
+            target,
+        )
+        .await
+        .unwrap();
+        let got_user = server.await.unwrap();
+        assert_eq!(got_user, "isolation-nonce");
+    }
+
+    /// A NO_AUTH-only proxy must make a creds-bearing dial fail closed,
+    /// not silently succeed with the credentials ignored.
+    #[tokio::test]
+    async fn creds_present_fails_closed_on_no_auth_only_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 2];
+            sock.read_exact(&mut greeting).await.unwrap();
+            let mut methods = vec![0u8; greeting[1] as usize];
+            sock.read_exact(&mut methods).await.unwrap();
+            // Proxy supports only NO_AUTH; client offered only USERPASS →
+            // nothing in common.
+            sock.write_all(&[VER_SOCKS5, METHOD_NONE_ACCEPTABLE])
+                .await
+                .unwrap();
+        });
+        let res = connect(
+            &ProxyConfig {
+                addr: proxy_addr,
+                credentials: Some(Credentials {
+                    username: "u".into(),
+                    password: "p".into(),
+                }),
+                isolation: false,
+            },
+            "1.1.1.1:80".parse().unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(Socks5Error::AuthFailed)),
+            "creds + NO_AUTH-only proxy must fail closed, got {res:?}"
+        );
+        server.await.unwrap();
     }
 
     /// Verify the "no acceptable methods" path: proxy demands auth, client
