@@ -30,6 +30,7 @@ Cross-platform: Linux, macOS (Intel + Apple Silicon), and Windows.
 | BEP 10 extension protocol + BEP 9 ut_metadata + magnet links | ✅ |
 | BEP 11 PEX — bidirectional: receive incoming peer lists + send delta updates every 60 s | ✅ |
 | Engine-wide bandwidth limiter (`--max-down`, `--max-up`) | ✅ |
+| µTP transport (BEP 29) — `--utp`: parallel TCP+µTP dial + inbound µTP | ✅ |
 | Web UI | ❌ — Phase 8 work |
 
 ## Quick start
@@ -111,6 +112,9 @@ rustytorrent download <file> [OPTIONS]
   --spool PATH              override the spool file path
   --max-down N              cap inbound bandwidth, KiB/s (engine-wide)
   --max-up N                cap outbound bandwidth, KiB/s (engine-wide)
+  --utp                     enable µTP (BEP 29): race TCP+µTP on each dial,
+                            accept inbound µTP. Auto-off under --anonymous /
+                            --socks5 / --bind-iface (UDP can't ride SOCKS5)
 
 rustytorrent decrypt <file> [OPTIONS]      # extract a --paranoid spool afterwards
 
