@@ -589,6 +589,12 @@ impl TorrentEngine {
         dht_announce_timer.tick().await;
         let mut dht_announce_long_period = false;
 
+        // Periodic GC of the per-IP protocol-violation map so a churn of
+        // many one-off offenders can't grow it without bound (defense in
+        // depth — see PeerManager::gc_violations).
+        let mut violation_gc_timer = interval(Duration::from_secs(60));
+        violation_gc_timer.tick().await;
+
         // C2 — engage the seccomp sandbox last in startup. By now the
         // listener is bound, the storage task is alive, the initial
         // tracker announce (which needs DNS) has gone out, and the
@@ -675,6 +681,9 @@ impl TorrentEngine {
                 }
                 _ = progress_timer.tick() => {
                     self.log_progress();
+                }
+                _ = violation_gc_timer.tick() => {
+                    peers.gc_violations();
                 }
                 Some((stream, addr)) = incoming_rx.recv() => {
                     if !peers.accept_incoming(stream, addr) {

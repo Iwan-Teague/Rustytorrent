@@ -171,6 +171,28 @@ impl PeerManager {
         self.banned.contains(ip)
     }
 
+    /// Drop violation entries whose timestamps have all aged out of
+    /// `VIOLATION_WINDOW`. `record_violation` prunes stale timestamps
+    /// only for the IP it's touching, so an IP that violates once and
+    /// never reconnects would otherwise keep its entry forever — an
+    /// attacker with many real source IPs (each committing a single
+    /// sub-threshold violation) could grow the map without bound. The
+    /// engine calls this on a periodic tick to bound that growth.
+    ///
+    /// The `banned` set is deliberately NOT swept here: an entry only
+    /// lands there after a peer crossed `VIOLATION_BAN_THRESHOLD`
+    /// genuine protocol violations, i.e. proved itself malicious, so
+    /// retaining the ban for the process lifetime is the safer policy.
+    /// Its growth is bounded by the number of distinct IPs that managed
+    /// to earn a ban, which is self-limiting in practice.
+    pub fn gc_violations(&mut self) {
+        let now = Instant::now();
+        self.violations.retain(|_ip, times| {
+            times.retain(|t| now.duration_since(*t) <= VIOLATION_WINDOW);
+            !times.is_empty()
+        });
+    }
+
     pub fn drop_peer(&mut self, addr: &SocketAddr) {
         if let Some(slot) = self.peers.remove(addr) {
             // Dropping `slot.handle` closes the cmd channel; combined with abort
@@ -327,6 +349,39 @@ mod tests {
         // After ban, the existing connection should be torn down.
         assert!(m.is_banned(&addr.ip()));
         assert_eq!(m.connected_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn gc_drops_fully_aged_violation_entries() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut m = PeerManager::new([0u8; 20], [0u8; 20], tx);
+        let ip: IpAddr = "10.0.0.7".parse().unwrap();
+        // Insert a single stale timestamp directly (older than the window).
+        m.violations.insert(
+            ip,
+            vec![Instant::now() - VIOLATION_WINDOW - Duration::from_secs(5)],
+        );
+        assert!(m.violations.contains_key(&ip));
+        m.gc_violations();
+        assert!(
+            !m.violations.contains_key(&ip),
+            "fully-aged-out IP entry must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_retains_recent_violation_entries() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut m = PeerManager::new([0u8; 20], [0u8; 20], tx);
+        let ip: IpAddr = "10.0.0.8".parse().unwrap();
+        m.record_violation(ip); // one fresh strike, below threshold
+        assert!(m.violations.contains_key(&ip));
+        m.gc_violations();
+        assert!(
+            m.violations.contains_key(&ip),
+            "a recent sub-threshold violation must be retained"
+        );
+        assert!(!m.is_banned(&ip));
     }
 
     #[tokio::test]
