@@ -23,10 +23,9 @@
 //!   simpler fixed-window approach. Means we won't be as friendly to
 //!   coexisting TCP flows under load, but data still moves.
 //! - Selective Ack (BEP 29) IS acted on: the receiver emits a SACK
-//!   bitmask and the sender prunes selectively-acked packets from its
-//!   retransmit queue. What's still missing is SACK-driven *fast*
-//!   retransmit — we prune the queue but wait for the gap packet's RTO
-//!   rather than resending it the moment a SACK reveals the gap.
+//!   bitmask, the sender prunes selectively-acked packets from its
+//!   retransmit queue, and a SACK reporting >= 3 packets past the gap
+//!   triggers an immediate fast retransmit of the gap (no RTO wait).
 //!
 //! Both gaps are noted on each call site so a future contributor can
 //! tighten without first re-deriving the design.

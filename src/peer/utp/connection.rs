@@ -19,12 +19,11 @@
 //! - **Selective ack (BEP 29)**: a receiver holding out-of-order
 //!   packets attaches a SACK bitmask to its acks (`build_sack`); a
 //!   sender prunes selectively-acked packets from its retransmit queue
-//!   (`process_sack`) so a later RTO resends only the true gap, not the
-//!   whole window.
+//!   (`process_sack`). When a SACK reports >= 3 packets past the gap
+//!   (TCP-style duplicate-ack loss signal) the sender fast-retransmits
+//!   the gap immediately instead of waiting out its RTO.
 //! - **Not implemented**: LEDBAT congestion control (we use a fixed
-//!   send window of `INITIAL_WINDOW_PACKETS`); SACK-driven *fast*
-//!   retransmit (we prune the queue but still wait for the gap packet's
-//!   RTO rather than resending it immediately); sequence-number
+//!   send window of `INITIAL_WINDOW_PACKETS`); sequence-number
 //!   wraparound (16-bit seq_nr wraps after 65 536 packets — a real
 //!   long-lived connection would need to handle it, the typical
 //!   BitTorrent block-exchange session won't).
@@ -127,6 +126,16 @@ pub struct Connection {
     /// When the connection should be hard-killed if we still haven't
     /// reached `Closed` or `Reset`.
     deadline: Instant,
+    /// SACK-driven fast retransmit: when a selective ack reveals enough
+    /// packets received past the gap, the gap's seq_nr is parked here
+    /// and re-sent on the next `pending_send_packets` — beating the
+    /// gap packet's RTO by ~one round trip.
+    fast_rtx_seq: Option<u16>,
+    /// The last gap seq_nr we fast-retransmitted, so a run of SACKs for
+    /// the same gap triggers exactly one fast retransmit (further
+    /// recovery falls to the normal RTO). Cleared implicitly when the
+    /// gap advances to a new seq_nr.
+    last_fast_rtx_seq: Option<u16>,
 }
 
 impl Connection {
@@ -153,6 +162,8 @@ impl Connection {
             pending_in: BTreeMap::new(),
             in_flight: VecDeque::new(),
             deadline: now + HARD_TIMEOUT,
+            fast_rtx_seq: None,
+            last_fast_rtx_seq: None,
         };
         // The SYN packet uses our recv_id as its connection_id; the
         // peer will read this as its OWN send_id and use it on its
@@ -195,6 +206,8 @@ impl Connection {
             pending_in: BTreeMap::new(),
             in_flight: VecDeque::new(),
             deadline: now + HARD_TIMEOUT,
+            fast_rtx_seq: None,
+            last_fast_rtx_seq: None,
         };
         // STATE acks the SYN. seq_nr is our chosen initial; ack_nr
         // is the SYN's seq_nr.
@@ -393,6 +406,17 @@ impl Connection {
         if self.state == State::SynSent || self.state == State::SynReceived {
             return out;
         }
+        // SACK-driven fast retransmit: a selective ack revealed the gap
+        // packet was lost (enough later packets arrived), so resend it
+        // now rather than waiting out its RTO. Refresh ack_nr and reset
+        // its send timer so `tick` doesn't double-send it.
+        if let Some(seq) = self.fast_rtx_seq.take() {
+            if let Some(entry) = self.in_flight.iter_mut().find(|e| e.seq_nr == seq) {
+                entry.packet.ack_nr = self.peer_seq_nr_acked;
+                entry.send_time = now;
+                out.push(entry.packet.clone());
+            }
+        }
         // Packetize as much of the send buffer as the window allows.
         while !self.out_buf.is_empty() && self.in_flight.len() < INITIAL_WINDOW_PACKETS {
             let chunk_len = self.out_buf.len().min(MAX_DATA_PAYLOAD);
@@ -548,6 +572,22 @@ impl Connection {
             let sacked = byte < mask.len() && (mask[byte] >> (offset % 8)) & 1 == 1;
             !sacked
         });
+        // Fast retransmit: a SACK reporting >= 3 packets received past
+        // the gap is the µTP analogue of TCP's three-duplicate-ack loss
+        // signal (the threshold tolerates mild reordering). Schedule one
+        // immediate retransmit of the lowest still-unacked packet — the
+        // gap — and remember it so a burst of SACKs for the same gap
+        // doesn't trigger repeated resends (the RTO covers the rest).
+        let sacked_count: u32 = mask.iter().map(|b| b.count_ones()).sum();
+        if sacked_count >= 3 {
+            if let Some(front) = self.in_flight.front() {
+                let gap = front.seq_nr;
+                if self.last_fast_rtx_seq != Some(gap) {
+                    self.fast_rtx_seq = Some(gap);
+                    self.last_fast_rtx_seq = Some(gap);
+                }
+            }
+        }
     }
 }
 
@@ -845,6 +885,53 @@ mod tests {
         // seqs 3,4,5 pruned; only seq 2 (the gap) remains for retransmit.
         assert_eq!(init.in_flight.len(), 1);
         assert_eq!(init.in_flight.front().unwrap().seq_nr, 2);
+    }
+
+    /// A SACK reporting >= 3 packets past the gap triggers an immediate
+    /// fast retransmit of the gap (no RTO wait), exactly once per gap.
+    #[test]
+    fn sack_triggers_fast_retransmit() {
+        let t = now();
+        let (mut init, syn) = Connection::new_initiator(820, t);
+        let (_recv, state) = Connection::new_receiver(&syn, t).unwrap();
+        let _ = init.handle_incoming(&state, t);
+        // Send 4 DATA packets (seqs 2,3,4,5).
+        init.enqueue_send(&vec![0u8; MAX_DATA_PAYLOAD * 4]);
+        let sent = init.pending_send_packets(t);
+        assert_eq!(sent.len(), 4);
+        // Nothing more to send and no fast-rtx yet.
+        assert!(init.pending_send_packets(t).is_empty());
+
+        // SACK marks seqs 3,4,5 received (3 packets past the gap at 2).
+        let recv_id = init.recv_id;
+        let mk_ack = || Packet {
+            packet_type: PacketType::State,
+            connection_id: recv_id,
+            timestamp_micros: 0,
+            timestamp_diff_micros: 0,
+            wnd_size: RECV_WINDOW_BYTES,
+            seq_nr: 1,
+            ack_nr: 1,
+            extensions: vec![Extension {
+                kind: EXT_SELECTIVE_ACK,
+                data: vec![0b0000_0111, 0, 0, 0],
+            }],
+            payload: Vec::new(),
+        };
+        let _ = init.handle_incoming(&mk_ack(), t);
+        // The gap (seq 2) is fast-retransmitted right now.
+        let rtx = init.pending_send_packets(t);
+        assert_eq!(rtx.len(), 1);
+        assert_eq!(rtx[0].seq_nr, 2);
+        assert_eq!(rtx[0].packet_type, PacketType::Data);
+
+        // A second identical SACK for the same gap must NOT retransmit
+        // again (dedup) — recovery for repeated loss falls to the RTO.
+        let _ = init.handle_incoming(&mk_ack(), t);
+        assert!(
+            init.pending_send_packets(t).is_empty(),
+            "same-gap SACK must fast-retransmit only once"
+        );
     }
 
     #[test]
