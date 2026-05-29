@@ -48,7 +48,7 @@ protection that A-tier doesn't touch.
 |---|------|------------------|------|
 | ~~C1~~ | ~~**Multi-hop proxy chaining**~~ — landed. `--socks5` is now repeatable; the chain runs nested SOCKS5 CONNECTs on a single TCP stream. Credentials and Tor stream isolation attach to the last hop. Tracker HTTP still rides the first hop only (reqwest limit). | done |
 | ~~C2 (Linux + macOS)~~ | ~~**OS-level sandboxing**~~ — Linux seccomp + macOS `sandbox_init` SBPL profile landed. Windows AppContainer remains open. | mostly done |
-| C3 (mostly) | **µTP (BEP 29) over UDP** | Packet codec, state machine, UDP socket runtime, AsyncRead/AsyncWrite bridge, AND engine integration (`--utp`: parallel TCP+µTP dial race + inbound µTP listener) all landed. Gated off under anonymous/SOCKS5/bind-iface. Remaining: LEDBAT congestion control, selective-ack on receive, per-IP rate limit on µTP accept. | mostly done |
+| C3 (mostly) | **µTP (BEP 29) over UDP** | Packet codec, state machine, UDP socket runtime, AsyncRead/AsyncWrite bridge, engine integration (`--utp`: parallel TCP+µTP dial race + inbound µTP listener), selective-ack (emit + prune + fast retransmit), and inbound-flood / spoof defenses all landed. Gated off under anonymous/SOCKS5/bind-iface. **Only remaining: LEDBAT congestion control** (today: fixed 8-packet window). | mostly done |
 | C4 | **I2P transport** | Native anonymity overlay; tiny swarms but no Tor-style exit-node trust issues. Substantial work — different transport entirely. | ~1000+ lines |
 | ~~C5~~ | ~~**Anonymous-mode peer_id rotation**~~ — landed. At every reannounce in anonymous mode the engine regenerates the peer_id (libtorrent-style prefix); existing TCP connections keep their handshaken id but every new outgoing dial uses the fresh one. Defeats the "same client signature across unrelated swarms" correlation. | done |
 | ~~C6~~ | ~~**Tracker-frequency jitter**~~ — landed. Reannounce interval is jittered upward (+0-5% normal, +5-50% anonymous) so two clients on the same tracker don't share an identical cadence fingerprint. | done |
@@ -228,9 +228,13 @@ _None — B2 landed alongside the multi-hop chain work._
   packet could still surface one, since our receiver's initial seq_nr
   is fixed; randomizing it as an unguessable accept token would close
   that too — noted for later.)
-- ⏳ Open: LEDBAT congestion control (fixed 8-packet window today);
-  selective-ack on receive (we parse but ignore); randomized receiver
-  seq_nr as an accept token (full blind-spoof resistance).
+- ✅ Selective-ack (BEP 29): receiver emits a SACK bitmask; sender
+  prunes selectively-acked packets and fast-retransmits the gap on a
+  >=3-past-gap SACK (TCP-style dup-ack loss signal).
+- ⏳ Open: LEDBAT congestion control (fixed 8-packet window today —
+  needs cross-clock delay measurement + cwnd controller, validated
+  against a real µTP peer); randomized receiver seq_nr as an accept
+  token (full blind-spoof resistance).
 
 ### B2 — `--memory-only` storage
 - ✅ In-RAM piece store; nothing persisted to disk for the lifetime of
