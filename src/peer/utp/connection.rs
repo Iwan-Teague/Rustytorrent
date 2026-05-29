@@ -204,6 +204,15 @@ impl Connection {
         matches!(self.state, State::Closed | State::Reset)
     }
 
+    /// True once a locally-initiated FIN has been fully acknowledged by
+    /// the peer (in `FinSent` with nothing left in-flight). Lets the
+    /// driver reap the connection immediately instead of waiting out
+    /// `HARD_TIMEOUT` — the `State` ack of our FIN never advances us out
+    /// of `FinSent` on its own.
+    pub fn fin_complete(&self) -> bool {
+        self.state == State::FinSent && self.in_flight.is_empty()
+    }
+
     pub fn state(&self) -> State {
         self.state
     }
@@ -286,7 +295,14 @@ impl Connection {
                 // SynSent → Connected once we see the peer's STATE.
                 if self.state == State::SynSent {
                     self.state = State::Connected;
-                    self.peer_seq_nr_acked = packet.seq_nr;
+                    // The STATE's seq_nr is the peer's *next* seq — its
+                    // first DATA will reuse this exact value (a STATE
+                    // doesn't advance the sender's seq). So we expect
+                    // `packet.seq_nr` next, i.e. we've "acked through"
+                    // one before it. Setting `peer_seq_nr_acked` to
+                    // `packet.seq_nr` itself would make that first DATA
+                    // look like a duplicate and silently drop it.
+                    self.peer_seq_nr_acked = packet.seq_nr.wrapping_sub(1);
                 }
                 None
             }
@@ -524,6 +540,31 @@ mod tests {
         // Initiator processes the ack and clears in-flight.
         let _ = init.handle_incoming(&reply, t);
         assert!(init.in_flight.is_empty());
+    }
+
+    /// Receiver-initiated DATA must be delivered to the initiator. The
+    /// receiver's first DATA reuses the seq_nr it announced in its STATE
+    /// (a STATE doesn't advance the sender's seq), so a naive initiator
+    /// would treat it as a duplicate and drop it. Regression test for
+    /// that off-by-one.
+    #[test]
+    fn receiver_initiated_data_reaches_initiator() {
+        let t = now();
+        let (mut init, syn) = Connection::new_initiator(700, t);
+        let (mut recv, state) = Connection::new_receiver(&syn, t).unwrap();
+        // Complete the handshake on the initiator side.
+        let _ = init.handle_incoming(&state, t);
+        assert_eq!(init.state, State::Connected);
+
+        // Receiver sends the first application bytes.
+        recv.enqueue_send(b"from-the-receiver");
+        let out = recv.pending_send_packets(t);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].packet_type, PacketType::Data);
+
+        let _ = init.handle_incoming(&out[0], t);
+        let got = init.take_received(64);
+        assert_eq!(got, b"from-the-receiver");
     }
 
     /// FIN from one side closes the other once everything's drained.

@@ -48,7 +48,7 @@ protection that A-tier doesn't touch.
 |---|------|------------------|------|
 | ~~C1~~ | ~~**Multi-hop proxy chaining**~~ — landed. `--socks5` is now repeatable; the chain runs nested SOCKS5 CONNECTs on a single TCP stream. Credentials and Tor stream isolation attach to the last hop. Tracker HTTP still rides the first hop only (reqwest limit). | done |
 | ~~C2 (Linux + macOS)~~ | ~~**OS-level sandboxing**~~ — Linux seccomp + macOS `sandbox_init` SBPL profile landed. Windows AppContainer remains open. | mostly done |
-| C3 (partial) | **µTP (BEP 29) over UDP** | Packet codec and per-connection state machine landed (pure logic, unit-testable). Socket runtime + AsyncRead/AsyncWrite glue + engine integration still open — without them no real peer traffic flows over µTP yet. | partly done |
+| C3 (partial) | **µTP (BEP 29) over UDP** | Packet codec, per-connection state machine, and the UDP socket runtime + AsyncRead/AsyncWrite bridge all landed. Real µTP byte streams now flow (verified by localhost loopback tests). Engine integration (parallel TCP+µTP dial) is the remaining step. | partly done |
 | C4 | **I2P transport** | Native anonymity overlay; tiny swarms but no Tor-style exit-node trust issues. Substantial work — different transport entirely. | ~1000+ lines |
 | ~~C5~~ | ~~**Anonymous-mode peer_id rotation**~~ — landed. At every reannounce in anonymous mode the engine regenerates the peer_id (libtorrent-style prefix); existing TCP connections keep their handshaken id but every new outgoing dial uses the fresh one. Defeats the "same client signature across unrelated swarms" correlation. | done |
 | ~~C6~~ | ~~**Tracker-frequency jitter**~~ — landed. Reannounce interval is jittered upward (+0-5% normal, +5-50% anonymous) so two clients on the same tracker don't share an identical cadence fingerprint. | done |
@@ -131,11 +131,20 @@ _None — B2 landed alongside the multi-hop chain work._
   reordering, and clean FIN-driven close. Pure logic — no I/O —
   so tests drive two connections back-to-back over a perfect
   in-memory channel.
-- ⏳ Open: UDP socket driver (demux by `(peer, connection_id)`,
-  bridge to AsyncRead/AsyncWrite); engine integration (parallel
-  TCP+µTP dial; off under `--anonymous` since UDP can't ride
-  SOCKS5); LEDBAT congestion control (we use a fixed 8-packet
-  window today); selective-ack on receive (we parse but ignore).
+- ✅ UDP socket runtime ([`src/peer/utp/socket.rs`](../src/peer/utp/socket.rs)):
+  one `UtpSocket` owns a single UDP socket and a driver task that
+  demuxes datagrams by `(peer, connection_id)` and multiplexes every
+  connection over it. `UtpStream` implements `AsyncRead`/`AsyncWrite`,
+  so the existing BT-handshake / MSE / wire-message code runs over µTP
+  unchanged. `connect` (outbound) and `accept` (inbound) both work;
+  loopback tests cover small + 20 KB multi-packet transfers and the
+  dead-peer dial timeout. Fixing this exposed a state-machine bug: the
+  initiator was treating the receiver's first DATA as a duplicate
+  (STATE seq_nr off-by-one) — now fixed and regression-tested.
+- ⏳ Open: engine integration (parallel TCP+µTP dial; off under
+  `--anonymous` since UDP can't ride SOCKS5); LEDBAT congestion
+  control (fixed 8-packet window today); selective-ack on receive (we
+  parse but ignore).
 
 ### B2 — `--memory-only` storage
 - ✅ In-RAM piece store; nothing persisted to disk for the lifetime of

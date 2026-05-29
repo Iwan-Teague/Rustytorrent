@@ -9,10 +9,12 @@
 //!
 //! ## Scope of this implementation
 //!
-//! This module starts with the packet codec (`packet`). Subsequent
-//! commits will add the connection state machine (`socket` /
-//! `stream`) and the engine integration. Each is a focused commit so
-//! a reviewer can audit the layers independently.
+//! Three layers, each a focused commit so a reviewer can audit them
+//! independently: the packet codec (`packet`), the pure-logic
+//! per-connection state machine (`connection`), and the UDP socket
+//! runtime + `AsyncRead`/`AsyncWrite` bridge (`socket`). Engine
+//! integration (parallel TCP+µTP dial; off under `--anonymous` since
+//! UDP can't ride SOCKS5) is the remaining step.
 //!
 //! ## What we deliberately don't implement
 //!
@@ -29,6 +31,8 @@
 
 pub mod connection;
 pub mod packet;
+pub mod socket;
 
 pub use connection::{Connection, State};
 pub use packet::{Packet, PacketType};
+pub use socket::{UtpSocket, UtpStream};
