@@ -110,9 +110,16 @@ struct Entry {
     deliver: mpsc::UnboundedSender<Vec<u8>>,
     /// For an outgoing dial: the responder that delivers the finished
     /// `UtpStream` once we reach `Connected`, paired with the receive
-    /// half the stream will read from. `None` for inbound connections
-    /// (their stream is built and handed to `accept` immediately).
+    /// half the stream will read from. `None` for inbound connections.
     pending: Option<PendingDial>,
+    /// For an *inbound* connection: the stream + peer addr we'll hand to
+    /// `accept()` — but only once the peer sends a non-SYN packet,
+    /// proving it actually received our STATE (return-path validation).
+    /// Holding off until then means a spoofed-source SYN flood never
+    /// surfaces to `accept()` / occupies a peer slot; the half-open
+    /// entries just reap at `HARD_TIMEOUT`. `None` once surfaced (or for
+    /// outbound connections).
+    pending_accept: Option<(UtpStream, SocketAddr)>,
 }
 
 /// A connected µTP stream. Implements `AsyncRead` + `AsyncWrite` so it
@@ -375,6 +382,20 @@ impl Driver {
                 }
             }
             self.collect_after(&key, now, &mut outgoing);
+            // Return-path validation: a non-SYN packet means the peer
+            // received our STATE, so this is a responsive (not blindly
+            // spoofed) source — surface the held inbound stream to
+            // accept() now. A duplicate SYN proves nothing, so it
+            // doesn't trigger this.
+            if pkt.packet_type != PacketType::Syn {
+                let surfaced = self
+                    .conns
+                    .get_mut(&key)
+                    .and_then(|e| e.pending_accept.take());
+                if let Some((stream, paddr)) = surfaced {
+                    let _ = self.accept_tx.send((stream, paddr));
+                }
+            }
         } else if pkt.packet_type == PacketType::Syn {
             // A SYN's connection_id is the initiator's recv_id; our
             // recv_id for the receiver side is that + 1.
@@ -403,12 +424,13 @@ impl Driver {
                         conn,
                         deliver: dtx,
                         pending: None,
+                        // Hold the stream until the peer's first non-SYN
+                        // packet confirms the return path (anti-spoofing);
+                        // only then is it handed to accept().
+                        pending_accept: Some((stream, peer)),
                     },
                 );
                 outgoing.push(state);
-                // If nobody is accepting, the stream is dropped, which
-                // sends a Close → the half-open conn is reaped.
-                let _ = self.accept_tx.send((stream, peer));
             }
         }
         // Non-SYN packets with no matching connection are ignored.
@@ -430,6 +452,7 @@ impl Driver {
                         conn,
                         deliver: dtx,
                         pending: Some((resp, drx)),
+                        pending_accept: None,
                     },
                 );
                 self.flush(peer, vec![syn]).await;
@@ -601,21 +624,24 @@ mod tests {
             }
         }
 
-        // Drain accepts until the queue goes idle. The driver must not
-        // have created more than MAX_CONNS connections, so we can't
-        // accept more than that.
+        // Pure SYNs with no follow-up packet must NEVER surface to
+        // accept(): return-path validation holds the connection until a
+        // non-SYN packet confirms the source is responsive. A spoofed
+        // SYN flood therefore can't occupy a single peer slot. (The
+        // driver still bounds its internal half-open state at MAX_CONNS;
+        // those entries reap at HARD_TIMEOUT.)
         let mut accepted = 0usize;
         while let Ok(Ok(_)) =
             tokio::time::timeout(Duration::from_millis(200), server.accept()).await
         {
             accepted += 1;
-            if accepted > MAX_CONNS + 200 {
-                break; // safety valve — a bug shouldn't spin this forever
+            if accepted > 8 {
+                break; // any surfaced connection here is already a bug
             }
         }
-        assert!(
-            accepted <= MAX_CONNS,
-            "accepted {accepted} connections, cap is {MAX_CONNS}"
+        assert_eq!(
+            accepted, 0,
+            "pure-SYN flood must not surface any accepted connection"
         );
     }
 

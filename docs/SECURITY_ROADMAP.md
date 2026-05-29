@@ -219,11 +219,18 @@ _None — B2 landed alongside the multi-hop chain work._
   a connection entry per forged SYN — an unbounded remote OOM. The cap
   bounds steady-state memory regardless of flood rate; half-open forged
   entries reap at `HARD_TIMEOUT`.
+- ✅ Anti-spoofing accept: an inbound µTP connection is no longer
+  surfaced to `accept()` on the SYN alone — the driver holds it until
+  the peer sends a non-SYN packet (proving it received our STATE, i.e.
+  a responsive return path). A spoofed-source SYN flood therefore never
+  occupies a peer slot; the half-open entries just reap at
+  `HARD_TIMEOUT`. (Residual: a blind spoofer who also forges a DATA
+  packet could still surface one, since our receiver's initial seq_nr
+  is fixed; randomizing it as an unguessable accept token would close
+  that too — noted for later.)
 - ⏳ Open: LEDBAT congestion control (fixed 8-packet window today);
-  selective-ack on receive (we parse but ignore); anti-spoofing accept
-  (we mark a receiver `Connected` on the SYN before confirming the
-  return path, so a forged SYN can occupy a peer slot for one handshake
-  timeout — bounded by the peer cap, same class as a TCP SYN).
+  selective-ack on receive (we parse but ignore); randomized receiver
+  seq_nr as an accept token (full blind-spoof resistance).
 
 ### B2 — `--memory-only` storage
 - ✅ In-RAM piece store; nothing persisted to disk for the lifetime of
