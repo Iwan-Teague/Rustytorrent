@@ -257,9 +257,15 @@ enum Commands {
         /// Web UI port (bound to 127.0.0.1).
         #[arg(long, default_value_t = 8080)]
         web: u16,
-        /// Base listen port; torrent `i` uses `base + i`.
+        /// Single shared listen port for all hosted torrents (one
+        /// acceptor demuxes inbound connections by info_hash).
         #[arg(long, default_value_t = 6881)]
         port: u16,
+        /// Disable the shared DHT. By default the daemon runs one DHT
+        /// instance shared by every torrent; pass this for tracker-only
+        /// operation (e.g. all torrents are private/BEP 27 anyway).
+        #[arg(long, default_value_t = false)]
+        no_dht: bool,
         /// Directory the runtime web `add` endpoint may load `.torrent`
         /// files from. Requests for paths outside it are refused, so a
         /// loopback foothold can't read arbitrary host files. Defaults to
@@ -388,8 +394,9 @@ async fn main() -> Result<()> {
             output,
             web,
             port,
+            no_dht,
             torrent_dir,
-        } => cmd_daemon(torrents, output, web, port, torrent_dir).await,
+        } => cmd_daemon(torrents, output, web, port, no_dht, torrent_dir).await,
         Commands::Create {
             path,
             output,
@@ -727,15 +734,50 @@ async fn cmd_daemon(
     torrents: Vec<PathBuf>,
     output: PathBuf,
     web: u16,
-    base_port: u16,
+    port: u16,
+    no_dht: bool,
     torrent_dir: PathBuf,
 ) -> Result<()> {
     use rustytorrent::session::SessionManager;
 
-    let mgr = SessionManager::new();
     let peer_id = rustytorrent::peer_id::load_or_generate(&rustytorrent::peer_id::default_path());
 
-    for (i, path) in torrents.iter().enumerate() {
+    // BEP 10 reserved bits, set once before any peer task: extension
+    // protocol always on; DHT bit reflects whether the shared DHT runs.
+    rustytorrent::peer::handshake::set_extension_bytes(
+        rustytorrent::peer::handshake::extension_bytes_from(!no_dht, true),
+    );
+
+    // One shared inbound listener for every hosted torrent, demuxing by
+    // info_hash. Bind it up front — a daemon that can't accept inbound
+    // peers is barely a daemon, so a bind failure is fatal here.
+    let listener = rustytorrent::engine::bind_dual_stack_listener(port)
+        .with_context(|| format!("binding shared listener on port {port}"))?;
+    let registry = rustytorrent::acceptor::new_registry();
+
+    // One shared DHT (unless --no-dht). Per-session DHTs would race on the
+    // single persisted-state file, which is exactly why this is shared.
+    let dht = if no_dht {
+        None
+    } else {
+        let bootstrap = rustytorrent::dht::DEFAULT_BOOTSTRAP_NODES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let persist = Some(rustytorrent::dht::persist::default_path());
+        match rustytorrent::dht::Dht::spawn(port, bootstrap, persist, None).await {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("warning: shared DHT failed to start ({e}); continuing tracker-only");
+                None
+            }
+        }
+    };
+
+    let acceptor_task = rustytorrent::acceptor::spawn(listener, None, registry.clone(), peer_id);
+    let mgr = SessionManager::with_shared(registry, dht, port, acceptor_task);
+
+    for path in torrents.iter() {
         let raw = match tokio::fs::read(path).await {
             Ok(r) => r,
             Err(e) => {
@@ -752,11 +794,13 @@ async fn cmd_daemon(
         };
         let cfg = rustytorrent::engine::EngineConfig {
             output_dir: output.clone(),
-            // One listen port per torrent (v1 — see docs/DAEMON.md).
-            listen_port: base_port.wrapping_add(i as u16),
-            // Tracker-only for now: a shared DHT is the documented
-            // follow-up; per-session DHTs would race on the state file.
-            enable_dht: false,
+            // The SessionManager overrides this with the shared port and
+            // routes inbound through the shared acceptor; setting it here
+            // is just for the announce port the engine advertises.
+            listen_port: port,
+            // Opt in to the DHT; the manager downgrades this to off if the
+            // daemon was started --no-dht (or for private torrents).
+            enable_dht: !no_dht,
             ..Default::default()
         };
         match mgr.add(t, peer_id, cfg).await {
@@ -766,15 +810,17 @@ async fn cmd_daemon(
     }
 
     println!(
-        "Daemon:     {} torrent(s); UI at http://127.0.0.1:{web}/ (loopback)",
-        mgr.len().await
+        "Daemon:     {} torrent(s) on shared port {port}{}; UI at http://127.0.0.1:{web}/ (loopback)",
+        mgr.len().await,
+        if no_dht { " (DHT off)" } else { " (shared DHT)" },
     );
 
     let state = rustytorrent::web::DaemonState {
         mgr: mgr.clone(),
         output,
         peer_id,
-        base_port,
+        base_port: port,
+        no_dht,
         torrent_dir,
     };
     // Serve until ctrl-c, then stop every session gracefully.

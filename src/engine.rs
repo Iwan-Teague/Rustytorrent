@@ -221,6 +221,12 @@ pub struct TorrentEngine {
     /// `listen_port`). Independent of `managed_web_tx`/`managed_ctl_rx` so
     /// a session can mix-and-match.
     managed_incoming_rx: Option<mpsc::Receiver<crate::peer::inbound::Inbound>>,
+    /// **Daemon seam.** When set (via [`Self::set_managed_dht`]), the
+    /// engine uses this shared `Dht` for `get_peers`/`announce` instead of
+    /// spawning its own, and does NOT shut it down on exit (the
+    /// `SessionManager` owns it plus the one process-wide persisted-state
+    /// file). `None` → standalone behaviour (spawn an own DHT iff enabled).
+    managed_dht: Option<crate::dht::Dht>,
     /// Memoized per-file progress for the web UI, keyed on the count of
     /// locally-complete pieces. Completed pieces only ever increase, so if
     /// the count is unchanged since the last computation the per-file
@@ -289,6 +295,7 @@ impl TorrentEngine {
             managed_web_tx: None,
             managed_ctl_rx: None,
             managed_incoming_rx: None,
+            managed_dht: None,
             file_progress_cache: None,
             upload_cache: PieceCache::default(),
             download_bucket,
@@ -320,6 +327,15 @@ impl TorrentEngine {
     /// info_hash and handshaken them). Call before [`Self::run`].
     pub fn set_managed_inbound(&mut self, rx: mpsc::Receiver<crate::peer::inbound::Inbound>) {
         self.managed_incoming_rx = Some(rx);
+    }
+
+    /// **Daemon seam.** Hand the engine a shared `Dht` to use for peer
+    /// discovery + announce instead of spawning its own. The engine will
+    /// NOT shut it down on exit. Per-torrent gating (`--anonymous`,
+    /// private/BEP 27) still applies: a session that mustn't use the DHT
+    /// simply isn't given one. Call before [`Self::run`].
+    pub fn set_managed_dht(&mut self, dht: crate::dht::Dht) {
+        self.managed_dht = Some(dht);
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -455,9 +471,14 @@ impl TorrentEngine {
         //    own TCP listener (+ µTP socket) on `listen_port` and emit
         //    `Inbound::Raw` for the per-peer task to handshake — exactly
         //    the pre-daemon behavior.
-        let (mut incoming_rx, listener_handle): (
+        // `inbound_available` is true when peers can actually reach us
+        // (our own bound listener, or the daemon's shared acceptor routing
+        // to us). It gates the DHT `announce_peer` — we only publish
+        // ourselves on the DHT when we're genuinely connectable.
+        let (mut incoming_rx, listener_handle, inbound_available): (
             mpsc::Receiver<crate::peer::inbound::Inbound>,
             Option<tokio::task::JoinHandle<()>>,
+            bool,
         ) = if let Some(rx) = self.managed_incoming_rx.take() {
             tracing::info!(
                 target: "engine",
@@ -466,7 +487,7 @@ impl TorrentEngine {
             // Outbound µTP dialing is not offered in managed mode (the
             // daemon's shared transport story is TCP-only for now).
             peers.set_utp(None);
-            (rx, None)
+            (rx, None, true)
         } else {
             // µTP transport (BEP 29): bind a UDP socket on the listen port
             // when enabled on a clearnet direct path. Still gated off under
@@ -612,7 +633,8 @@ impl TorrentEngine {
                     }
                 }
             };
-            (incoming_rx, listener_handle)
+            let inbound_available = listener_handle.is_some();
+            (incoming_rx, listener_handle, inbound_available)
         };
 
         let layout = Layout::from_torrent(self.cfg.output_dir.clone(), &self.torrent);
@@ -800,7 +822,20 @@ impl TorrentEngine {
         if self.cfg.enable_dht && self.cfg.anonymous {
             tracing::info!(target: "engine", "anonymous mode: ignoring --dht request");
         }
-        let dht = if dht_wanted {
+        // Prefer an injected shared DHT (daemon). We do NOT own it, so we
+        // must not shut it down on exit — `owns_dht` tracks that. Per-torrent
+        // gating still applies: a session that mustn't use the DHT (anonymous
+        // / private) is never given a shared handle by the manager AND
+        // `dht_wanted` is false, so we leave `dht` None.
+        let (dht, owns_dht) = if let Some(shared) = self.managed_dht.take() {
+            if dht_wanted {
+                (Some(shared), false)
+            } else {
+                // Session is DHT-ineligible (anonymous/private); drop the
+                // shared handle without using it.
+                (None, false)
+            }
+        } else if dht_wanted {
             let bootstrap = if self.cfg.dht_bootstrap.is_empty() {
                 crate::dht::DEFAULT_BOOTSTRAP_NODES
                     .iter()
@@ -818,14 +853,14 @@ impl TorrentEngine {
             )
             .await
             {
-                Ok(d) => Some(d),
+                Ok(d) => (Some(d), true),
                 Err(e) => {
                     tracing::warn!(target: "engine", error = %e, "dht spawn failed");
-                    None
+                    (None, false)
                 }
             }
         } else {
-            None
+            (None, false)
         };
         // First DHT lookup fires after a short delay (let bootstrap settle),
         // then every 5 minutes thereafter. Also triggered ad-hoc when we
@@ -1083,7 +1118,7 @@ impl TorrentEngine {
                 _ = pex_timer.tick(), if !self.peer_pex_ids.is_empty() => {
                     self.send_pex_to_all(&peers).await;
                 }
-                _ = dht_announce_timer.tick(), if dht.is_some() && listener_handle.is_some() => {
+                _ = dht_announce_timer.tick(), if dht.is_some() && inbound_available => {
                     let dht_ref = dht.as_ref().expect("guarded by `if`");
                     let info_hash = self.torrent.info_hash;
                     let port = self.cfg.listen_port;
@@ -1119,8 +1154,13 @@ impl TorrentEngine {
         if let Some(h) = listener_handle {
             h.abort();
         }
+        // Only shut down a DHT we own. A shared (daemon-injected) DHT
+        // outlives the session — the SessionManager shuts it down once,
+        // on daemon exit, so it can persist its routing table cleanly.
         if let Some(d) = dht {
-            d.shutdown().await;
+            if owns_dht {
+                d.shutdown().await;
+            }
         }
         result
     }
@@ -1850,7 +1890,7 @@ fn fmt_duration(secs: u64) -> String {
 /// fails — the most common failure is a host without IPv6 configured
 /// at all, in which case losing IPv6 reach is preferable to losing
 /// the listener entirely.
-fn bind_dual_stack_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+pub fn bind_dual_stack_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
     let try_v6 = || -> std::io::Result<tokio::net::TcpListener> {
         let sock = socket2::Socket::new(
             socket2::Domain::IPV6,

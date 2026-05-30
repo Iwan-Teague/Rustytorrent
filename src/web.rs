@@ -300,7 +300,12 @@ pub struct DaemonState {
     pub mgr: SessionManager,
     pub output: std::path::PathBuf,
     pub peer_id: crate::peer_id::PeerId,
+    /// The shared listen port (all sessions share one acceptor on it).
     pub base_port: u16,
+    /// Whether the daemon's shared DHT is disabled. Runtime-added
+    /// torrents opt into the DHT unless this is set; the `SessionManager`
+    /// downgrades the request to off when there's no shared DHT.
+    pub no_dht: bool,
     /// Directory the runtime `POST /api/add` path must live under. The
     /// request body path is canonicalized and rejected unless it resolves
     /// inside this dir — so a loopback foothold (co-hosted XSS, a
@@ -393,12 +398,14 @@ async fn daemon_add(State(st): State<DaemonState>, body: String) -> impl IntoRes
         Ok(t) => t,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("parse {path}: {e}")),
     };
-    // One listen port per session; offset by the current count.
-    let n = st.mgr.len().await as u16;
     let cfg = crate::engine::EngineConfig {
         output_dir: st.output.clone(),
-        listen_port: st.base_port.wrapping_add(n),
-        enable_dht: false, // daemon v1 is tracker-only
+        // The SessionManager routes inbound through the shared acceptor and
+        // overrides this with the shared port; it's only the announce port.
+        listen_port: st.base_port,
+        // Opt into the shared DHT; the manager downgrades to off when the
+        // daemon ran --no-dht (or the torrent is private).
+        enable_dht: !st.no_dht,
         ..Default::default()
     };
     match st.mgr.add(torrent, st.peer_id, cfg).await {
@@ -493,11 +500,10 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
                 return;
             }
         };
-        let n = st.mgr.len().await as u16;
         let cfg = crate::engine::EngineConfig {
             output_dir: st.output.clone(),
-            listen_port: st.base_port.wrapping_add(n),
-            enable_dht: false, // daemon v1 is tracker-only
+            listen_port: st.base_port,
+            enable_dht: !st.no_dht,
             ..Default::default()
         };
         match st.mgr.add(torrent, st.peer_id, cfg).await {

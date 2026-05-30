@@ -116,22 +116,27 @@ or a path/uploaded `.torrent`.
 
 ## Incremental plan (each step ships + tests independently)
 
-1. **Engine seam extraction** — split `run` → `run_inner(deps)`; single
-   torrent unchanged. (No new user feature; pure refactor, full suite +
-   self-test must stay green.)
-2. **Shared acceptor** — move the inbound listener + info_hash routing
-   into a standalone acceptor that feeds sessions; single-torrent
-   `download` uses a one-session manager under the hood. Behavior
-   identical; adds the routing-by-info_hash test.
-3. **SessionManager + `daemon` subcommand** — host a static list of
-   torrents given on the CLI; shared listener + DHT + one web server;
-   `GET /api/status` returns an array; status page lists them.
-4. **`POST /api/add` / `/api/remove`** — runtime add/remove; web buttons.
+1. **[DONE] Engine inbound seam** — rather than the originally-planned
+   `run_inner(deps)` split, the engine gained a narrower
+   `set_managed_inbound` seam: all inbound connections flow through one
+   `mpsc<Inbound>` channel, and in managed mode the engine reads it
+   instead of binding its own listener. Single-torrent `download`/`magnet`
+   is byte-identical (it emits `Inbound::Raw` and handshakes itself).
+2. **[DONE] Shared acceptor** — `src/acceptor.rs` owns one listener and a
+   `Registry` (info_hash → session inbound channel), handshakes each
+   connection (plain + MSE), and routes by info_hash. Unit tests cover
+   plain routing, the MSE candidate match, and the unknown-hash drop.
+3. **[DONE] SessionManager + `daemon` subcommand** — `with_shared` owns the
+   registry, the shared DHT, and the acceptor task; `cmd_daemon` binds one
+   listener on `--port`, spawns one DHT (unless `--no-dht`), and hosts all
+   torrents on it. `GET /api/status` already returns an array.
+   `tests/daemon_shared.rs` exercises the routing end to end.
+4. **[DONE] `POST /api/add` / per-torrent control** — runtime add (path +
+   magnet) and pause/resume/remove via the web layer.
 5. **Persistence (follow-up)** — save/restore the torrent set.
 
-Steps 1–2 are behavior-preserving and de-risk everything after. Only
-step 3 changes the `/api/status` shape (object → array) — the existing
-`web_smoke` test updates there.
+Steps 1–3 landed behavior-preserving for the single-torrent path and are
+covered by the full test suite.
 
 ---
 

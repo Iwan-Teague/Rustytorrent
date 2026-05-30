@@ -57,6 +57,7 @@ async fn daemon_hosts_lists_and_controls_torrents() {
         output: std::env::temp_dir(),
         peer_id: [7u8; 20],
         base_port: 0,
+        no_dht: true,
         torrent_dir: std::env::temp_dir(),
     };
     tokio::spawn(async move {

@@ -252,13 +252,26 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 
 ## 6. Features (roadmap follow-ups)
 
-- [ ] **P1 — daemon: one shared inbound listener** demuxing by info_hash
-  instead of one port per session (see `docs/DAEMON.md`). The BT
-  handshake carries info_hash; MSE's `perform_incoming` already matches a
-  *set* of info_hashes, so routing is feasible.
-- [ ] **P1 — daemon: one shared DHT** instead of DHT-off-per-session.
-  `Dht` is already `Clone`; thread one instance through all sessions
-  (avoids the persisted-state race that forced DHT-off in v1).
+- [x] **P1 — daemon: one shared inbound listener** demuxing by info_hash
+  instead of one port per session (see `docs/DAEMON.md`). DONE: new
+  `src/acceptor.rs` owns one TCP (+ optional µTP) listener; for each
+  connection it drives the handshake far enough to learn the info_hash
+  (plain: read the 68-byte handshake; MSE: `mse::perform_incoming` with
+  the current candidate set), looks the session up in a shared
+  `Registry`, and forwards the already-handshaken connection via
+  `Inbound::Handshaken`. Engine gained a `set_managed_inbound` seam
+  (skips binding its own listener); the single-torrent `download`/`magnet`
+  path is byte-identical (it emits `Inbound::Raw` and handshakes itself).
+  Integration-tested end to end (`tests/daemon_shared.rs`): inbound routes
+  to the right session, unknown info_hash is dropped, and removal stops
+  routing.
+- [x] **P1 — daemon: one shared DHT** instead of DHT-off-per-session.
+  DONE: `cmd_daemon` spawns one `Dht` (unless `--no-dht`) and
+  `SessionManager` hands each eligible session a clone via the engine's
+  `set_managed_dht` seam. The engine never shuts down a shared DHT
+  (`owns_dht`); the manager shuts it down once on daemon exit so the
+  routing-table state persists cleanly. Per-torrent gating still applies
+  (anonymous/private sessions get no handle).
 - [ ] **P2 — daemon persistence:** save/restore the hosted torrent set
   across restarts.
 - [ ] **P2 — selective download: skip allocating unwanted files** (today
