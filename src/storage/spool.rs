@@ -85,6 +85,10 @@ pub struct EncryptedSpool {
     piece_length: u64,
     num_pieces: u32,
     total_length: u64,
+    /// Reused padding buffer for `write_piece`, so the common
+    /// download-path write doesn't allocate a fresh full-piece `Vec` every
+    /// call. Sized to `piece_length` lazily on first write.
+    write_scratch: Vec<u8>,
 }
 
 impl EncryptedSpool {
@@ -165,6 +169,7 @@ impl EncryptedSpool {
             piece_length,
             num_pieces,
             total_length,
+            write_scratch: Vec::new(),
         })
     }
 
@@ -185,11 +190,12 @@ impl EncryptedSpool {
             )));
         }
         // Pad up to piece_length so every slot has the same on-disk size.
-        let mut padded = data.to_vec();
-        if (padded.len() as u64) < self.piece_length {
-            padded.resize(self.piece_length as usize, 0);
-        }
-        let (nonce, ct) = crypt::encrypt(&self.key, &padded)?;
+        // Reuse the scratch buffer to avoid a per-write allocation.
+        let buf = &mut self.write_scratch;
+        buf.clear();
+        buf.extend_from_slice(data);
+        buf.resize(self.piece_length as usize, 0);
+        let (nonce, ct) = crypt::encrypt(&self.key, buf)?;
         debug_assert_eq!(ct.len() as u64, self.piece_length + TAG_LEN as u64);
 
         let offset = slot_offset(self.piece_length, index);
@@ -230,6 +236,12 @@ impl EncryptedSpool {
         plaintext.truncate(actual as usize);
         let begin = begin as usize;
         let end = end as usize;
+        // Fast path: a full-piece read (the upload cache's pattern) can
+        // hand back the decrypted buffer directly instead of cloning a
+        // sub-slice out of it.
+        if begin == 0 && end == plaintext.len() {
+            return Ok(plaintext);
+        }
         Ok(plaintext[begin..end].to_vec())
     }
 

@@ -148,10 +148,12 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   `serve_request`; eliminating it needs `PeerCommand::Piece.data` /
   `Message::Piece.data` to become a shareable `bytes::Bytes` slice of the
   cached piece (a wider type change), still open.
-- [ ] **P2 — spool write pads/allocates per write.** `storage/spool.rs`
-  `padded.resize()` allocates a full piece buffer each write; reuse a
-  scratch buffer. `plaintext[..].to_vec()` on read clones — return a slice
-  where possible.
+- [x] **P2 — spool write pads/allocates per write.** `storage/spool.rs`
+  DONE: `write_piece` now reuses a `write_scratch` buffer instead of
+  `data.to_vec()` + `resize` per call, and `read_range` returns the
+  decrypted buffer directly on a full-piece read (the upload-cache
+  pattern) instead of cloning a sub-slice. Short-last-piece + full-piece
+  roundtrips still green.
 - [x] **P2 — disk `flush()` per piece recomputes `slices_for_piece`.**
   `storage/disk.rs` — DONE: `write_piece` called `slices_for_piece` twice
   (write loop + flush loop). Now it records the touched file indices
