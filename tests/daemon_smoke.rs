@@ -156,4 +156,39 @@ async fn daemon_hosts_lists_and_controls_torrents() {
         "added torrent should appear"
     );
     let _ = tokio::fs::remove_file(&tpath).await;
+
+    // POST /api/add_magnet:
+    // - a garbage body is a 400 (parse failure)
+    let resp = client
+        .post(format!("{base}/api/add_magnet"))
+        .body("not a magnet")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // - a valid magnet WITHOUT trackers is a 400 (daemon v1 can't
+    //   bootstrap peers without DHT)
+    let no_tr = format!("magnet:?xt=urn:btih:{}", "ab".repeat(20));
+    let resp = client
+        .post(format!("{base}/api/add_magnet"))
+        .body(no_tr)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // - a valid magnet WITH a tracker is accepted (202) and echoes the
+    //   info-hash hex. The background fetch will fail against the dead
+    //   tracker, but the synchronous accept is what we assert here.
+    let ih_hex = "cd".repeat(20);
+    let magnet = format!("magnet:?xt=urn:btih:{ih_hex}&tr=http://127.0.0.1:1/announce&dn=test");
+    let resp = client
+        .post(format!("{base}/api/add_magnet"))
+        .body(magnet)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(resp.text().await.unwrap(), ih_hex);
 }

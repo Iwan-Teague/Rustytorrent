@@ -343,6 +343,7 @@ pub fn daemon_router(state: DaemonState) -> Router {
         .route("/", get(daemon_index))
         .route("/api/status", get(daemon_status))
         .route("/api/add", post(daemon_add))
+        .route("/api/add_magnet", post(daemon_add_magnet))
         .route("/api/torrent/:ih/pause", post(daemon_pause))
         .route("/api/torrent/:ih/resume", post(daemon_resume))
         .route("/api/torrent/:ih/remove", post(daemon_remove))
@@ -406,6 +407,112 @@ async fn daemon_add(State(st): State<DaemonState>, body: String) -> impl IntoRes
     }
 }
 
+/// Add a torrent from a `magnet:?xt=urn:btih:…` URI at runtime.
+///
+/// Metadata fetch can take many seconds (tracker bootstrap + BEP 9
+/// `ut_metadata` from peers), so we do NOT block the request: parse and
+/// dup-check synchronously, then spawn a background task that bootstraps
+/// peers, fetches the info dict, and registers the session once it
+/// lands. Returns `202 Accepted` with the info-hash hex immediately —
+/// the caller polls `/api/status` for the session to appear.
+///
+/// Daemon v1 is tracker-only (DHT off), so the peer pool comes solely
+/// from the magnet's `tr=` trackers; a magnet without trackers can't be
+/// bootstrapped here and is rejected up front.
+async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl IntoResponse {
+    let magnet = match crate::magnet::MagnetLink::parse(body.trim()) {
+        Ok(m) => m,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("parse magnet: {e}")),
+    };
+    let info_hash = magnet.info_hash;
+    // Cheap early dup check so we don't kick off an expensive fetch for a
+    // torrent we already host. `add` re-checks atomically at insert.
+    if st.mgr.contains(&info_hash).await {
+        return (StatusCode::CONFLICT, "already running".to_string());
+    }
+    if magnet.trackers.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "magnet has no trackers; daemon v1 is tracker-only (DHT off) and can't \
+             bootstrap peers without them"
+                .to_string(),
+        );
+    }
+
+    let ih_hex = crate::util::hex(&info_hash);
+    tokio::spawn(async move {
+        // Tracker bootstrap. No proxy / non-anonymous in daemon v1.
+        let req = crate::tracker::AnnounceRequest {
+            info_hash,
+            peer_id: st.peer_id,
+            port: st.base_port,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0, // metadata unknown at the magnet stage
+            event: crate::tracker::Event::Started,
+            num_want: 50,
+        };
+        let mut pool: Vec<SocketAddr> = Vec::new();
+        for url in &magnet.trackers {
+            match crate::tracker::announce_with_proxy_anon(url, &req, None, false).await {
+                Ok(resp) => pool.extend(resp.peers),
+                Err(e) => {
+                    tracing::debug!(target: "web", tracker = %url, error = %e, "magnet tracker bootstrap failed")
+                }
+            }
+        }
+        pool.sort();
+        pool.dedup();
+        if pool.is_empty() {
+            tracing::warn!(target: "web", info_hash = %crate::util::hex(&info_hash), "magnet add: no peers from trackers; giving up");
+            return;
+        }
+
+        let info_bytes = match crate::peer::metadata_fetch::fetch_metadata(
+            info_hash,
+            pool,
+            Vec::new(),
+            false,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(target: "web", info_hash = %crate::util::hex(&info_hash), error = %e, "magnet add: metadata fetch failed");
+                return;
+            }
+        };
+        let torrent = match crate::metainfo::TorrentFile::from_info_dict_bytes(
+            &info_bytes,
+            info_hash,
+            magnet.trackers,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(target: "web", error = %e, "magnet add: info dict parse/verify failed");
+                return;
+            }
+        };
+        let n = st.mgr.len().await as u16;
+        let cfg = crate::engine::EngineConfig {
+            output_dir: st.output.clone(),
+            listen_port: st.base_port.wrapping_add(n),
+            enable_dht: false, // daemon v1 is tracker-only
+            ..Default::default()
+        };
+        match st.mgr.add(torrent, st.peer_id, cfg).await {
+            Some(ih) => {
+                tracing::info!(target: "web", info_hash = %crate::util::hex(&ih), "magnet add: session started")
+            }
+            None => {
+                tracing::info!(target: "web", info_hash = %crate::util::hex(&info_hash), "magnet add: already running (raced)")
+            }
+        }
+    });
+
+    (StatusCode::ACCEPTED, ih_hex)
+}
+
 async fn daemon_pause(State(st): State<DaemonState>, Path(ih): Path<String>) -> impl IntoResponse {
     daemon_ctl(&st.mgr, &ih, EngineControl::Pause).await
 }
@@ -463,7 +570,7 @@ const DAEMON_HTML: &str = r##"<!doctype html>
 </style></head><body>
 <h1>RustyTorrent <span class="meta" id="count"></span></h1>
 <form id="addform" style="margin:.5rem 0">
-  <input id="addpath" type="text" placeholder="path to a .torrent on the daemon host" style="width:70%;font:inherit;padding:.2rem .4rem">
+  <input id="addpath" type="text" placeholder="path to a .torrent on the daemon host, or a magnet: link" style="width:70%;font:inherit;padding:.2rem .4rem">
   <button type="submit">Add</button>
   <span class="meta" id="addmsg"></span>
 </form>
@@ -475,10 +582,18 @@ document.getElementById("addform").addEventListener("submit", async (e) => {
   const path = document.getElementById("addpath").value.trim();
   if (!path) return;
   const msg = document.getElementById("addmsg");
+  // Route magnet links to the async add_magnet endpoint; everything else
+  // is treated as a server-side .torrent path.
+  const isMagnet = path.toLowerCase().startsWith("magnet:");
+  const url = isMagnet ? "/api/add_magnet" : "/api/add";
   try {
-    const r = await fetch("/api/add", { method:"POST", body: path });
-    msg.textContent = r.ok ? "added" : "error: " + (await r.text());
-    if (r.ok) document.getElementById("addpath").value = "";
+    const r = await fetch(url, { method:"POST", body: path });
+    if (r.ok) {
+      msg.textContent = isMagnet ? "fetching metadata…" : "added";
+      document.getElementById("addpath").value = "";
+    } else {
+      msg.textContent = "error: " + (await r.text());
+    }
     await tick();
   } catch (err) { msg.textContent = "error"; }
 });

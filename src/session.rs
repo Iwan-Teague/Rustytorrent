@@ -111,6 +111,14 @@ impl SessionManager {
         self.inner.lock().await.len()
     }
 
+    /// Whether a session with this info-hash is already hosted. A cheap
+    /// pre-check before an expensive add path (e.g. a magnet metadata
+    /// fetch); [`add`](Self::add) still re-checks atomically at insert
+    /// time, so this is only an optimization, not a correctness guard.
+    pub async fn contains(&self, info_hash: &InfoHash) -> bool {
+        self.inner.lock().await.contains_key(info_hash)
+    }
+
     /// Gracefully stop every session (tracker `stopped`, storage flush)
     /// and clear the map. Used on daemon shutdown. Each engine is given
     /// until a shared deadline to finish its teardown; only a straggler

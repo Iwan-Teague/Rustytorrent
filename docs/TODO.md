@@ -198,10 +198,18 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 - [x] **P1 — `--verbose` / `--quiet` flags.** [DONE] Global `-v` (debug),
   `-vv` (trace), `-q` (warn) set the default tracing filter; `RUST_LOG`
   still overrides. No more env-var-only verbosity control.
-- [ ] **P1 — magnet `add` to the daemon.** [verified gap] Daemon
-  `POST /api/add` only takes a `.torrent` path; magnet URIs need the
-  metadata-fetch flow wired into the add path (`fetch_metadata` →
-  `from_info_dict_bytes` → `mgr.add`).
+- [x] **P1 — magnet `add` to the daemon.** [verified gap] Daemon
+  `POST /api/add` only took a `.torrent` path. DONE: added
+  `POST /api/add_magnet` accepting a `magnet:?xt=urn:btih:…` URI. Because
+  the metadata fetch can take many seconds, the handler parses +
+  dup-checks synchronously then spawns a background task (tracker
+  bootstrap → `fetch_metadata` → `from_info_dict_bytes` → `mgr.add`),
+  returning `202 Accepted` with the info-hash hex immediately; the
+  session appears in `/api/status` once metadata lands. Daemon v1 is
+  tracker-only, so a magnet without `tr=` trackers is rejected up front.
+  Added `SessionManager::contains` for the cheap pre-check, wired the
+  daemon UI's add box to route `magnet:` links to the new endpoint, and
+  covered parse-error / no-tracker / accepted cases in the smoke test.
 - [ ] **P1 — torrent-creation command (`create`).** [verified gap] No way
   to make a `.torrent` from a file/dir; users need `mktorrent`. Add
   `rustytorrent create <path> [--tracker URL]` (piece hashing → info dict
