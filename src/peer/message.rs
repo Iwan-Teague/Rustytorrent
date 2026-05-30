@@ -317,11 +317,12 @@ pub fn bitfield_from_bytes(bytes: &[u8], num_pieces: usize) -> Result<BitVec<u8,
             expected_bytes
         )));
     }
-    let mut out: BitVec<u8, Msb0> = BitVec::repeat(false, num_pieces);
-    for i in 0..num_pieces {
-        let bit = (bytes[i / 8] >> (7 - (i % 8))) & 1;
-        out.set(i, bit == 1);
-    }
+    // `BitVec<u8, Msb0>` lays bits out MSB-first within each byte — the
+    // exact wire order (piece i lives at byte i/8, bit 7-(i%8)). So a bulk
+    // copy of the bytes followed by a truncate to the piece count is
+    // identical to the old per-bit loop, without the per-bit shift/branch.
+    let mut out: BitVec<u8, Msb0> = BitVec::from_slice(bytes);
+    out.truncate(num_pieces);
     // Verify spare bits are zero. BEP 3: spare bits past piece count MUST be zero.
     let extra_bits = expected_bytes * 8 - num_pieces;
     if extra_bits > 0 {

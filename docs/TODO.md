@@ -141,9 +141,12 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 - [ ] **P2 — µTP `Send` command allocates `Vec<u8>` per chunk.**
   `utp/socket.rs` — a block split into N packets allocates N times;
   consider `Arc<[u8]>` or a ring buffer.
-- [ ] **P2 — bitfield byte→bits expansion is a manual per-bit loop.**
-  `peer/connection.rs` / `message.rs bitfield_from_bytes` — use a
-  bytewise/`bitvec` fast path or a 256-entry lookup table.
+- [x] **P2 — bitfield byte→bits expansion is a manual per-bit loop.**
+  `message.rs bitfield_from_bytes` — DONE: replaced the per-bit
+  shift/branch loop with a bulk `BitVec::<u8, Msb0>::from_slice(bytes)` +
+  `truncate(num_pieces)`. `Msb0` ordering is exactly the wire layout, so
+  it's byte-for-byte equivalent (all bitfield tests green) without
+  per-bit work.
 
 ## 4. Correctness & robustness
 
