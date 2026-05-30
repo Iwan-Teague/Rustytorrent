@@ -114,7 +114,7 @@ impl Picker {
         endgame: bool,
     ) -> Option<usize> {
         if let Some(i) = self.assigned.get(addr) {
-            if pm.state(*i) != &PieceState::Complete {
+            if pm.state(*i) != &PieceState::Complete && pm.is_wanted(*i) {
                 return Some(*i);
             }
         }
@@ -125,6 +125,7 @@ impl Picker {
                 i < &bf.len()
                     && bf[*i]
                     && pm.state(*i) != &PieceState::Complete
+                    && pm.is_wanted(*i)
                     && (endgame || !in_use.contains(i))
             })
             .collect();

@@ -119,6 +119,11 @@ pub struct EngineConfig {
     /// serves a read-only status page + JSON + Prometheus metrics on
     /// `127.0.0.1:port` (loopback only — never exposed to the network).
     pub web_port: Option<u16>,
+    /// **Selective download.** Substrings matched against multi-file
+    /// torrent paths; only files whose path contains one of these (and
+    /// the pieces overlapping them) are downloaded. Empty = download
+    /// everything (the default).
+    pub selected_files: Vec<String>,
 }
 
 impl Default for EngineConfig {
@@ -146,6 +151,7 @@ impl Default for EngineConfig {
             max_up_bytes_per_sec: None,
             utp_enabled: false,
             web_port: None,
+            selected_files: Vec::new(),
         }
     }
 }
@@ -478,6 +484,29 @@ impl TorrentEngine {
         };
 
         let layout = Layout::from_torrent(self.cfg.output_dir.clone(), &self.torrent);
+
+        // Selective download: narrow the piece manager's "wanted" set to
+        // pieces overlapping the selected files. Empty selection → want
+        // everything (the mask is all-true and nothing below changes).
+        if !self.cfg.selected_files.is_empty() {
+            let wanted = layout.wanted_pieces(&self.cfg.selected_files);
+            let want_count = wanted.iter().filter(|&&w| w).count();
+            self.pm.set_wanted(&wanted);
+            tracing::info!(
+                target: "engine",
+                selectors = ?self.cfg.selected_files,
+                wanted_pieces = want_count,
+                total_pieces = self.pm.num_pieces(),
+                "selective download"
+            );
+            println!(
+                "Select:     {} of {} pieces (files matching {:?})",
+                want_count,
+                self.pm.num_pieces(),
+                self.cfg.selected_files
+            );
+        }
+
         let (storage_cmd_tx, storage_cmd_rx) = mpsc::channel::<StorageCommand>(64);
         let (storage_event_tx, mut storage_event_rx) = mpsc::channel::<StorageEvent>(64);
 
@@ -1432,7 +1461,9 @@ impl TorrentEngine {
             name: self.torrent.info.name.clone(),
             info_hash: hex_lower(&self.torrent.info_hash),
             complete_pieces: self.pm.complete_count(),
-            total_pieces: self.pm.num_pieces(),
+            // Denominator is the *wanted* count so the progress bar fills
+            // to 100% on a selective download (== num_pieces by default).
+            total_pieces: self.pm.wanted_count(),
             downloaded_bytes: self.downloaded,
             uploaded_bytes: self.uploaded,
             total_bytes: self.torrent.total_length(),
@@ -1448,7 +1479,7 @@ impl TorrentEngine {
     fn log_progress(&mut self) {
         self.last_progress = Instant::now();
         let done = self.pm.complete_count();
-        let total = self.pm.num_pieces();
+        let total = self.pm.wanted_count();
         let pct = (done as f64) / (total as f64) * 100.0;
         let secs = self.start_time.elapsed().as_secs_f64().max(0.001);
         let rate = (self.downloaded as f64) / secs;

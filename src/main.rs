@@ -133,6 +133,11 @@ enum Commands {
         /// Prometheus /metrics) on 127.0.0.1:PORT. Loopback only.
         #[arg(long, value_name = "PORT")]
         web: Option<u16>,
+        /// Selective download: only fetch files whose path contains this
+        /// substring (repeatable). Multi-file torrents only; omit to get
+        /// everything.
+        #[arg(long = "select", value_name = "SUBSTR")]
+        select: Vec<String>,
     },
     /// Download from a magnet URI (BEP 9 + BEP 10 + BEP 53). Bootstraps a
     /// peer pool via DHT and the magnet's own trackers, fetches the info
@@ -199,6 +204,10 @@ enum Commands {
         /// Serve a read-only web monitoring UI on 127.0.0.1:PORT.
         #[arg(long, value_name = "PORT")]
         web: Option<u16>,
+        /// Selective download: only fetch files whose path contains this
+        /// substring (repeatable). Applies once magnet metadata arrives.
+        #[arg(long = "select", value_name = "SUBSTR")]
+        select: Vec<String>,
     },
     /// Decrypt a `--paranoid` spool into the real file layout using the
     /// same passphrase that produced it. Pieces that don't hash-match
@@ -261,6 +270,7 @@ async fn main() -> Result<()> {
             max_up,
             utp,
             web,
+            select,
         } => {
             cmd_download(
                 file,
@@ -285,6 +295,7 @@ async fn main() -> Result<()> {
                 max_up,
                 utp,
                 web,
+                select,
             )
             .await
         }
@@ -316,6 +327,7 @@ async fn main() -> Result<()> {
             max_up,
             utp,
             web,
+            select,
         } => {
             cmd_magnet(
                 uri,
@@ -339,6 +351,7 @@ async fn main() -> Result<()> {
                 max_up,
                 utp,
                 web,
+                select,
             )
             .await
         }
@@ -464,6 +477,7 @@ async fn cmd_download(
     max_up: Option<u64>,
     utp: bool,
     web: Option<u16>,
+    select: Vec<String>,
 ) -> Result<()> {
     let raw = tokio::fs::read(&path)
         .await
@@ -554,6 +568,7 @@ async fn cmd_download(
         max_up_bytes_per_sec: max_up.map(|k| k * 1024),
         utp_enabled: utp,
         web_port: web,
+        selected_files: select,
         ..Default::default()
     };
     if let Some(p) = web {
@@ -748,6 +763,7 @@ async fn cmd_magnet(
     max_up: Option<u64>,
     utp: bool,
     web: Option<u16>,
+    select: Vec<String>,
 ) -> Result<()> {
     let magnet = rustytorrent::magnet::MagnetLink::parse(&uri)?;
     println!(
@@ -947,6 +963,7 @@ async fn cmd_magnet(
         max_up_bytes_per_sec: max_up.map(|k| k * 1024),
         utp_enabled: utp,
         web_port: web,
+        selected_files: select,
         ..Default::default()
     };
     if let Some(p) = web {

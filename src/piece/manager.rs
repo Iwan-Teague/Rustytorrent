@@ -36,6 +36,11 @@ pub struct PieceManager {
     received: Vec<BitVec<u8, Msb0>>,
     buffers: Vec<Option<Vec<u8>>>,
     local: BitVec<u8, Msb0>,
+    /// Selective download: which pieces we actually want. Defaults to
+    /// all-`true` (every piece wanted), so unless `set_wanted` narrows
+    /// it the manager behaves exactly as before. Pieces that aren't
+    /// wanted are never picked and don't count toward completion.
+    wanted: BitVec<u8, Msb0>,
 }
 
 impl PieceManager {
@@ -53,6 +58,7 @@ impl PieceManager {
             buffers.push(None);
         }
         let local = BitVec::repeat(false, num_pieces);
+        let wanted = BitVec::repeat(true, num_pieces);
         Self {
             piece_length,
             total_length,
@@ -62,7 +68,31 @@ impl PieceManager {
             received,
             buffers,
             local,
+            wanted,
         }
+    }
+
+    /// Narrow the set of pieces we want (selective download). `mask[i]`
+    /// true ⇒ piece `i` is wanted. A mask of the wrong length is ignored
+    /// (defensive — the caller computes it from the same `num_pieces`).
+    pub fn set_wanted(&mut self, mask: &[bool]) {
+        if mask.len() != self.num_pieces {
+            return;
+        }
+        for (i, &w) in mask.iter().enumerate() {
+            self.wanted.set(i, w);
+        }
+    }
+
+    /// Whether piece `index` is wanted. Out-of-range reads as not wanted.
+    pub fn is_wanted(&self, index: usize) -> bool {
+        self.wanted.get(index).map(|b| *b).unwrap_or(false)
+    }
+
+    /// Count of wanted pieces (the denominator for selective-download
+    /// progress). Equals `num_pieces` when nothing is deselected.
+    pub fn wanted_count(&self) -> usize {
+        self.wanted.count_ones()
     }
 
     pub fn piece_length(&self) -> u64 {
@@ -100,16 +130,21 @@ impl PieceManager {
         &self.local
     }
 
+    /// Complete once every *wanted* piece is downloaded. With no
+    /// selection (all pieces wanted) this is exactly "all local".
     pub fn is_complete(&self) -> bool {
-        self.local.all()
+        (0..self.num_pieces).all(|i| !self.wanted[i] || self.local[i])
     }
 
     pub fn complete_count(&self) -> usize {
         self.local.count_ones()
     }
 
+    /// Wanted pieces we don't yet have — the real remaining work.
     pub fn missing_count(&self) -> usize {
-        self.num_pieces - self.complete_count()
+        (0..self.num_pieces)
+            .filter(|&i| self.wanted[i] && !self.local[i])
+            .count()
     }
 
     /// Mark a piece as already verified — used by the resume scanner.
@@ -298,6 +333,41 @@ fn num_blocks_for_piece(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selective_completion_ignores_unwanted_pieces() {
+        let mut pm = PieceManager::new(100, 300, 3);
+        // Want pieces 0 and 2 only (piece 1 deselected).
+        pm.set_wanted(&[true, false, true]);
+        assert_eq!(pm.wanted_count(), 2);
+        assert!(pm.is_wanted(0) && !pm.is_wanted(1) && pm.is_wanted(2));
+        assert_eq!(pm.missing_count(), 2);
+        assert!(!pm.is_complete());
+
+        pm.mark_complete_verified(0);
+        assert_eq!(pm.missing_count(), 1);
+        assert!(!pm.is_complete());
+
+        // Completing only the wanted pieces (never piece 1) is enough.
+        pm.mark_complete_verified(2);
+        assert_eq!(pm.missing_count(), 0);
+        assert!(
+            pm.is_complete(),
+            "complete once all WANTED pieces are local"
+        );
+    }
+
+    #[test]
+    fn default_wants_all_pieces() {
+        let mut pm = PieceManager::new(100, 300, 3);
+        assert_eq!(pm.wanted_count(), 3);
+        assert!(!pm.is_complete());
+        pm.mark_complete_verified(0);
+        pm.mark_complete_verified(1);
+        assert!(!pm.is_complete(), "still missing piece 2");
+        pm.mark_complete_verified(2);
+        assert!(pm.is_complete());
+    }
 
     #[test]
     fn block_layout_full_pieces() {

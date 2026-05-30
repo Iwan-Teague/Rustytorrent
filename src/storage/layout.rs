@@ -89,6 +89,43 @@ impl Layout {
         let global_start = (piece_index as u64) * self.piece_length;
         self.slices(global_start, piece_size)
     }
+
+    /// Compute which pieces are *wanted* given a set of file-path
+    /// selectors (used for selective download). A file is selected when
+    /// its path contains any of the `selectors` substrings; a piece is
+    /// wanted when its byte range overlaps any selected file. An empty
+    /// `selectors` slice means "want everything" — the default, and the
+    /// only case the rest of the engine ever saw before this feature, so
+    /// it returns an all-`true` mask byte-for-byte identical to no
+    /// selection at all.
+    ///
+    /// Boundary pieces that straddle a wanted and an unwanted file are
+    /// wanted (we need the whole piece to reconstruct the wanted file);
+    /// the unwanted file just receives the spillover bytes, which is
+    /// standard BitTorrent behaviour.
+    pub fn wanted_pieces(&self, selectors: &[String]) -> Vec<bool> {
+        if selectors.is_empty() {
+            return vec![true; self.num_pieces];
+        }
+        let selected: Vec<&FileSpan> = self
+            .files
+            .iter()
+            .filter(|f| {
+                let path = f.path.to_string_lossy();
+                selectors.iter().any(|s| path.contains(s.as_str()))
+            })
+            .collect();
+
+        let mut wanted = vec![false; self.num_pieces];
+        for (idx, w) in wanted.iter_mut().enumerate() {
+            let piece_start = (idx as u64) * self.piece_length;
+            let piece_end = (piece_start + self.piece_length).min(self.total_length);
+            *w = selected
+                .iter()
+                .any(|f| f.start < piece_end && piece_start < f.end());
+        }
+        wanted
+    }
 }
 
 #[cfg(test)]
@@ -181,5 +218,33 @@ mod tests {
         // Piece 2: bytes 200..300 (last piece, 100 bytes total) — file 1 [50..100] + file 2 [0..50]
         let s = l.slices_for_piece(2, 100);
         assert_eq!(s, vec![(1, 50, 50), (2, 0, 50)]);
+    }
+
+    #[test]
+    fn wanted_empty_selectors_wants_everything() {
+        let l = Layout::from_torrent("/tmp/dl".into(), &torrent_multi());
+        assert_eq!(l.wanted_pieces(&[]), vec![true; l.num_pieces]);
+    }
+
+    #[test]
+    fn wanted_selects_overlapping_pieces_only() {
+        // Files: a.txt [0..150], b.txt [150..250], c.txt [250..300];
+        // piece_length 100 → pieces cover [0..100],[100..200],[200..300].
+        let l = Layout::from_torrent("/tmp/dl".into(), &torrent_multi());
+        // Select only c.txt ([250..300]) → only piece 2 ([200..300]) overlaps.
+        assert_eq!(l.wanted_pieces(&["c.txt".into()]), vec![false, false, true]);
+        // Select b.txt ([150..250]) → pieces 1 ([100..200]) and 2 ([200..300]).
+        assert_eq!(l.wanted_pieces(&["b.txt".into()]), vec![false, true, true]);
+        // Select a.txt ([0..150]) → pieces 0 ([0..100]) and 1 ([100..200]).
+        assert_eq!(l.wanted_pieces(&["a.txt".into()]), vec![true, true, false]);
+    }
+
+    #[test]
+    fn wanted_unmatched_selector_wants_nothing() {
+        let l = Layout::from_torrent("/tmp/dl".into(), &torrent_multi());
+        assert_eq!(
+            l.wanted_pieces(&["nonexistent".into()]),
+            vec![false, false, false]
+        );
     }
 }
