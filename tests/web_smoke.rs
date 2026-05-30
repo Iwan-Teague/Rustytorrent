@@ -21,6 +21,7 @@ fn sample() -> EngineStats {
         up_rate_bps: 10,
         complete: false,
         paused: false,
+        remaining_bytes: 700,
         peers: vec!["10.0.0.1:6881".into(), "10.0.0.2:6881".into()],
         files: vec![rustytorrent::web::FileProgress {
             path: "movie.mkv".into(),

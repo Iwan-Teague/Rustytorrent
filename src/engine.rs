@@ -1540,6 +1540,12 @@ impl TorrentEngine {
             up_rate_bps,
             complete: self.pm.is_complete(),
             paused: self.paused,
+            // Approx remaining = missing wanted pieces × piece length,
+            // capped at the torrent's outstanding bytes (the last piece
+            // is usually short, so this slightly over-estimates).
+            remaining_bytes: (self.pm.missing_count() as u64)
+                .saturating_mul(self.pm.piece_length())
+                .min(self.torrent.total_length().saturating_sub(self.downloaded)),
             peers,
             files,
         }

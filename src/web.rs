@@ -73,6 +73,9 @@ pub struct EngineStats {
     pub complete: bool,
     /// True when the download is paused via the control API.
     pub paused: bool,
+    /// Approximate bytes still to download (wanted pieces not yet
+    /// complete). Drives the ETA estimate; 0 when complete.
+    pub remaining_bytes: u64,
     /// Addresses of the currently-connected peers (`ip:port`). Loopback-
     /// only endpoint, so listing the swarm we're talking to is fine.
     pub peers: Vec<String>,
@@ -285,6 +288,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
     <span class="k">Down rate</span><span id="rate">—</span>
     <span class="k">Up rate</span><span id="urate">—</span>
     <span class="k">Peers</span><span id="peers">—</span>
+    <span class="k">ETA</span><span id="eta">—</span>
     <span class="k">Elapsed</span><span id="elapsed">—</span>
     <span class="k">Info hash</span><span class="mono" id="ih">—</span>
   </div>
@@ -345,6 +349,12 @@ async function tick() {
     if (rates.length > HIST) rates.shift();
     drawSpark();
     document.getElementById("peers").textContent = s.peers_connected;
+    let eta = "—";
+    if (s.complete) eta = "done";
+    else if (s.paused) eta = "paused";
+    else if (s.down_rate_bps > 0 && s.remaining_bytes > 0)
+      eta = fmtDur(Math.round(s.remaining_bytes / s.down_rate_bps));
+    document.getElementById("eta").textContent = eta;
     document.getElementById("elapsed").textContent = fmtDur(s.elapsed_secs);
     document.getElementById("ih").textContent = s.info_hash;
     const btn = document.getElementById("pause");
@@ -412,6 +422,7 @@ mod tests {
             up_rate_bps: 2_000,
             complete: false,
             paused: false,
+            remaining_bytes: 3 * 1024 * 1024,
             peers: vec!["1.2.3.4:6881".into(), "[::1]:51413".into()],
             files: vec![FileProgress {
                 path: "a/b.txt".into(),
