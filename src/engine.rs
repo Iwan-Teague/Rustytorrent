@@ -23,6 +23,7 @@ use crate::storage::{
     StorageEvent,
 };
 use crate::tracker::{self, AnnounceRequest, Event};
+use crate::web::EngineStats;
 
 /// Outstanding block requests per unchoked peer.
 pub const PIPELINE_DEPTH: usize = 5;
@@ -114,6 +115,10 @@ pub struct EngineConfig {
     /// UDP can't ride SOCKS5 and our µTP socket isn't interface-bound,
     /// so allowing it there would leak past the proxy / kill switch.
     pub utp_enabled: bool,
+    /// **Phase 8 web monitoring UI.** When `Some(port)`, the engine
+    /// serves a read-only status page + JSON + Prometheus metrics on
+    /// `127.0.0.1:port` (loopback only — never exposed to the network).
+    pub web_port: Option<u16>,
 }
 
 impl Default for EngineConfig {
@@ -140,6 +145,7 @@ impl Default for EngineConfig {
             max_down_bytes_per_sec: None,
             max_up_bytes_per_sec: None,
             utp_enabled: false,
+            web_port: None,
         }
     }
 }
@@ -664,6 +670,20 @@ impl TorrentEngine {
         let mut violation_gc_timer = interval(Duration::from_secs(60));
         violation_gc_timer.tick().await;
 
+        // Phase 8 — read-only web monitoring UI. The engine publishes a
+        // fresh stats snapshot into this watch channel each progress
+        // tick; the axum server (loopback only) serves whatever the
+        // latest value is. A bind failure inside `web::serve` is
+        // non-fatal — monitoring must never take down a download.
+        let web_tx: Option<tokio::sync::watch::Sender<EngineStats>> = match self.cfg.web_port {
+            Some(port) => {
+                let (tx, rx) = tokio::sync::watch::channel(self.build_stats(0));
+                tokio::spawn(crate::web::serve(port, rx));
+                Some(tx)
+            }
+            None => None,
+        };
+
         // C2 — engage the seccomp sandbox last in startup. By now the
         // listener is bound, the storage task is alive, the initial
         // tracker announce (which needs DNS) has gone out, and the
@@ -750,6 +770,9 @@ impl TorrentEngine {
                 }
                 _ = progress_timer.tick() => {
                     self.log_progress();
+                    if let Some(tx) = &web_tx {
+                        let _ = tx.send(self.build_stats(peers.connected_count()));
+                    }
                 }
                 _ = violation_gc_timer.tick() => {
                     peers.gc_violations();
@@ -1378,6 +1401,27 @@ impl TorrentEngine {
         }
     }
 
+    /// Build a stats snapshot for the web monitoring layer. `peers_connected`
+    /// comes from the `PeerManager` (which lives in `run`'s scope, not on
+    /// `self`), so the caller passes it in.
+    fn build_stats(&self, peers_connected: usize) -> EngineStats {
+        let secs = self.start_time.elapsed().as_secs_f64().max(0.001);
+        let down_rate_bps = (self.downloaded as f64 / secs) as u64;
+        EngineStats {
+            name: self.torrent.info.name.clone(),
+            info_hash: hex_lower(&self.torrent.info_hash),
+            complete_pieces: self.pm.complete_count(),
+            total_pieces: self.pm.num_pieces(),
+            downloaded_bytes: self.downloaded,
+            uploaded_bytes: self.uploaded,
+            total_bytes: self.torrent.total_length(),
+            peers_connected,
+            elapsed_secs: self.start_time.elapsed().as_secs(),
+            down_rate_bps,
+            complete: self.pm.is_complete(),
+        }
+    }
+
     fn log_progress(&mut self) {
         self.last_progress = Instant::now();
         let done = self.pm.complete_count();
@@ -1399,6 +1443,16 @@ impl TorrentEngine {
             rate / 1024.0,
         );
     }
+}
+
+/// Lowercase hex of a byte slice (for the info-hash in web stats).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Bind the inbound peer listener as a dual-stack socket so both IPv4

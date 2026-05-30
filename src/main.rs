@@ -129,6 +129,10 @@ enum Commands {
         /// (UDP can't ride SOCKS5 and isn't interface-bound here).
         #[arg(long, default_value_t = false)]
         utp: bool,
+        /// Serve a read-only web monitoring UI (status page + JSON +
+        /// Prometheus /metrics) on 127.0.0.1:PORT. Loopback only.
+        #[arg(long, value_name = "PORT")]
+        web: Option<u16>,
     },
     /// Download from a magnet URI (BEP 9 + BEP 10 + BEP 53). Bootstraps a
     /// peer pool via DHT and the magnet's own trackers, fetches the info
@@ -192,6 +196,9 @@ enum Commands {
         /// Enable µTP (BEP 29). Same semantics as `download --utp`.
         #[arg(long, default_value_t = false)]
         utp: bool,
+        /// Serve a read-only web monitoring UI on 127.0.0.1:PORT.
+        #[arg(long, value_name = "PORT")]
+        web: Option<u16>,
     },
     /// Decrypt a `--paranoid` spool into the real file layout using the
     /// same passphrase that produced it. Pieces that don't hash-match
@@ -253,6 +260,7 @@ async fn main() -> Result<()> {
             max_down,
             max_up,
             utp,
+            web,
         } => {
             cmd_download(
                 file,
@@ -276,6 +284,7 @@ async fn main() -> Result<()> {
                 max_down,
                 max_up,
                 utp,
+                web,
             )
             .await
         }
@@ -306,6 +315,7 @@ async fn main() -> Result<()> {
             max_down,
             max_up,
             utp,
+            web,
         } => {
             cmd_magnet(
                 uri,
@@ -328,6 +338,7 @@ async fn main() -> Result<()> {
                 max_down,
                 max_up,
                 utp,
+                web,
             )
             .await
         }
@@ -452,6 +463,7 @@ async fn cmd_download(
     max_down: Option<u64>,
     max_up: Option<u64>,
     utp: bool,
+    web: Option<u16>,
 ) -> Result<()> {
     let raw = tokio::fs::read(&path)
         .await
@@ -541,8 +553,12 @@ async fn cmd_download(
         max_down_bytes_per_sec: max_down.map(|k| k * 1024),
         max_up_bytes_per_sec: max_up.map(|k| k * 1024),
         utp_enabled: utp,
+        web_port: web,
         ..Default::default()
     };
+    if let Some(p) = web {
+        println!("Web UI:     http://127.0.0.1:{p}/ (loopback only)");
+    }
     let engine = rustytorrent::engine::TorrentEngine::new(t, peer_id, cfg);
 
     // The engine handles ctrl-c internally and performs an orderly shutdown
@@ -731,6 +747,7 @@ async fn cmd_magnet(
     max_down: Option<u64>,
     max_up: Option<u64>,
     utp: bool,
+    web: Option<u16>,
 ) -> Result<()> {
     let magnet = rustytorrent::magnet::MagnetLink::parse(&uri)?;
     println!(
@@ -929,8 +946,12 @@ async fn cmd_magnet(
         max_down_bytes_per_sec: max_down.map(|k| k * 1024),
         max_up_bytes_per_sec: max_up.map(|k| k * 1024),
         utp_enabled: utp,
+        web_port: web,
         ..Default::default()
     };
+    if let Some(p) = web {
+        println!("Web UI:     http://127.0.0.1:{p}/ (loopback only)");
+    }
     let engine = rustytorrent::engine::TorrentEngine::new(t, peer_id, cfg);
     engine.run().await?;
     println!("Done.");

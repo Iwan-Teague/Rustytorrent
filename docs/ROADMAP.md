@@ -20,8 +20,8 @@ RustyTorrent aims to be a fully-featured, production-quality peer-to-peer file t
 | 4 | Core Downloading | ✅ Done |
 | 5 | Multi-file & Correctness | ✅ Done |
 | 6 | Hardening & Resume | ✅ Done |
-| 7 | Extensions | 🟡 MSE/PE + DHT done; BEPs 9/10/11 pending |
-| 8 | Web UI | 🔲 Not started |
+| 7 | Extensions | ✅ MSE/PE + DHT + BEP 9/10/11 + magnet + µTP (BEP 29, SACK + LEDBAT) |
+| 8 | Web UI | 🟡 Read-only monitoring landed (`--web`: status page + JSON + Prometheus); control plane (add/pause/remove) pending |
 
 **Anonymity / security**:
 - Built-in SOCKS5 client (RFC 1928 + RFC 1929 auth) for outgoing peer
@@ -203,11 +203,17 @@ Stretch goals that make RustyTorrent a first-class citizen in the wider peer-to-
 A browser-based interface for monitoring and controlling downloads.
 
 ### Goals
-- `axum`-based JSON REST API
-- Endpoints: list torrents, add torrent (file or magnet), remove, pause/resume, peer list, stats
-- Small SPA frontend (vanilla JS or minimal framework)
-- Speed graphs, piece progress visualization
-- Prometheus metrics endpoint (`/metrics`)
+- ✅ `axum`-based HTTP server (`--web PORT`, loopback-bound)
+- ✅ `GET /api/status` (JSON), `GET /metrics` (Prometheus), `GET /` (self-contained status page with live progress bar)
+- 🔲 Control endpoints: add torrent (file or magnet), remove, pause/resume — need a multi-torrent daemon (today's engine is one-torrent-per-process)
+- 🔲 Multi-torrent list view + speed graphs
+
+### Status
+The **read-only monitoring** slice has landed: a single running download
+serves its live stats over loopback HTTP. The control plane (add / pause /
+remove) is gated on refactoring the one-torrent-per-process engine into a
+multi-torrent daemon with a shared session manager — a larger change
+tracked separately.
 
 ---
 

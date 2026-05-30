@@ -24,6 +24,9 @@ subtle       = "2"                                          # constant-time byte
 socket2      = "0.6"                                        # interface-binding for VPN kill switch
 aes-gcm      = "0.10"                                       # AEAD for the --paranoid encrypted spool
 argon2       = "0.5"                                        # passphrase-to-key derivation for --paranoid
+axum         = { version = "0.7", default-features = false, features = ["http1", "tokio", "json"] }  # Phase 8 web monitoring server
+serde        = { version = "1", features = ["derive"] }     # JSON status serialization
+serde_json   = "1"                                          # JSON status serialization
 
 [target.'cfg(unix)'.dependencies]
 libc         = "0.2"                                        # if_nametoindex for --bind-iface (Unix)

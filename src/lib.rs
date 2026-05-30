@@ -13,3 +13,4 @@ pub mod scheduler;
 pub mod socks5;
 pub mod storage;
 pub mod tracker;
+pub mod web;

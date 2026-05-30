@@ -32,7 +32,8 @@ Cross-platform: Linux, macOS (Intel + Apple Silicon), and Windows.
 | Engine-wide bandwidth limiter (`--max-down`, `--max-up`) | ✅ |
 | µTP transport (BEP 29) — `--utp`: TCP+µTP dial race, inbound µTP, SACK + LEDBAT | ✅ |
 | Private torrents (BEP 27) — DHT + PEX disabled when `private` is set | ✅ |
-| Web UI | ❌ — Phase 8 work |
+| Web monitoring UI — `--web PORT`: status page + JSON + Prometheus `/metrics` (loopback) | ✅ |
+| Web UI control plane (add/pause/remove, multi-torrent) | ❌ — needs a daemon refactor |
 
 ## Quick start
 
@@ -116,6 +117,8 @@ rustytorrent download <file> [OPTIONS]
   --utp                     enable µTP (BEP 29): race TCP+µTP on each dial,
                             accept inbound µTP. Auto-off under --anonymous /
                             --socks5 / --bind-iface (UDP can't ride SOCKS5)
+  --web PORT                serve a read-only monitoring UI on 127.0.0.1:PORT
+                            (status page + /api/status JSON + /metrics)
 
 rustytorrent decrypt <file> [OPTIONS]      # extract a --paranoid spool afterwards
 
