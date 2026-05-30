@@ -33,7 +33,8 @@ Cross-platform: Linux, macOS (Intel + Apple Silicon), and Windows.
 | µTP transport (BEP 29) — `--utp`: TCP+µTP dial race, inbound µTP, SACK + LEDBAT | ✅ |
 | Private torrents (BEP 27) — DHT + PEX disabled when `private` is set | ✅ |
 | Web monitoring UI — `--web PORT`: status page + JSON + Prometheus `/metrics` (loopback) | ✅ |
-| Web UI control plane (add/pause/remove, multi-torrent) | ❌ — needs a daemon refactor |
+| Single-torrent control — `/api/pause` · `/api/resume` · `/api/shutdown` | ✅ |
+| Multi-torrent **daemon** — `rustytorrent daemon`: host N torrents, add/list/pause/resume/remove | ✅ |
 
 ## Quick start
 

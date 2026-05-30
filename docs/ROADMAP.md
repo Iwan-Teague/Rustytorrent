@@ -21,7 +21,7 @@ RustyTorrent aims to be a fully-featured, production-quality peer-to-peer file t
 | 5 | Multi-file & Correctness | ✅ Done |
 | 6 | Hardening & Resume | ✅ Done |
 | 7 | Extensions | ✅ MSE/PE + DHT + BEP 9/10/11 + magnet + µTP (BEP 29, SACK + LEDBAT) |
-| 8 | Web UI | 🟡 `--web`: status page (progress, sparkline, per-file, peers) + JSON + Prometheus + **pause/resume**; multi-torrent add/remove still needs a daemon |
+| 8 | Web UI | ✅ `--web`: single-torrent status page (progress, sparkline, per-file, peers, ETA) + JSON + Prometheus + pause/resume/stop. `daemon`: multi-torrent host with add/list/pause/resume/remove. Follow-ups: shared listener+DHT, magnet add |
 
 **Anonymity / security**:
 - Built-in SOCKS5 client (RFC 1928 + RFC 1929 auth) for outgoing peer
@@ -205,16 +205,15 @@ A browser-based interface for monitoring and controlling downloads.
 ### Goals
 - ✅ `axum`-based HTTP server (`--web PORT`, loopback-bound)
 - ✅ `GET /api/status` + `/api/peers` + `/api/files` (JSON), `GET /metrics` (Prometheus), `GET /` (self-contained status page: progress bar, download-rate sparkline, instantaneous rates, per-file progress, peer list)
-- ✅ `POST /api/pause` / `/api/resume` — pause/resume the running download (button on the status page)
-- 🔲 add torrent (file or magnet) / remove — need a multi-torrent daemon (today's engine is one-torrent-per-process)
-- 🔲 multi-torrent list view
+- ✅ `POST /api/pause` / `/api/resume` / `/api/shutdown` — control the running download (buttons on the status page)
+- ✅ multi-torrent **daemon** (`rustytorrent daemon`): a `SessionManager` hosts N torrents behind one loopback UI; `GET /api/status` array, `POST /api/add` (server-side `.torrent` path), `POST /api/torrent/{ih}/pause|resume|remove`
+- 🔲 magnet `add` (needs the metadata-fetch flow), shared listener (demux by info_hash) + shared DHT — see docs/DAEMON.md
 
 ### Status
-Monitoring + single-torrent control have landed: a running download
-serves rich live stats over loopback HTTP and can be paused/resumed. The
-remaining control plane — adding and removing torrents at runtime — is
-gated on refactoring the one-torrent-per-process engine into a
-multi-torrent daemon with a shared session manager, tracked separately.
+**Done.** Single-torrent monitoring + control and the multi-torrent
+daemon (add / list / pause / resume / remove) all landed; see
+docs/DAEMON.md for the daemon design and the remaining optimisations
+(one shared listener/DHT instead of one per session, magnet add).
 
 ---
 
