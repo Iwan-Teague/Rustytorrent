@@ -103,6 +103,25 @@ impl Layout {
     /// wanted (we need the whole piece to reconstruct the wanted file);
     /// the unwanted file just receives the spillover bytes, which is
     /// standard BitTorrent behaviour.
+    /// The file paths that match `selectors` (same substring rule as
+    /// [`wanted_pieces`]). Used to show the user exactly which files a
+    /// `--select` resolved to — an empty result means every selector was
+    /// a typo / matched nothing, which is worth surfacing loudly before a
+    /// download silently fetches zero bytes. An empty `selectors` returns
+    /// every file (the "want everything" default).
+    pub fn selected_paths(&self, selectors: &[String]) -> Vec<&std::path::Path> {
+        self.files
+            .iter()
+            .filter(|f| {
+                selectors.is_empty() || {
+                    let path = f.path.to_string_lossy();
+                    selectors.iter().any(|s| path.contains(s.as_str()))
+                }
+            })
+            .map(|f| f.path.as_path())
+            .collect()
+    }
+
     pub fn wanted_pieces(&self, selectors: &[String]) -> Vec<bool> {
         if selectors.is_empty() {
             return vec![true; self.num_pieces];
@@ -246,5 +265,18 @@ mod tests {
             l.wanted_pieces(&["nonexistent".into()]),
             vec![false, false, false]
         );
+    }
+
+    #[test]
+    fn selected_paths_matches_and_reports_empty() {
+        let l = Layout::from_torrent("/tmp/dl".into(), &torrent_multi());
+        // Empty selectors → every file.
+        assert_eq!(l.selected_paths(&[]).len(), l.files.len());
+        // One match.
+        let one = l.selected_paths(&["b.txt".into()]);
+        assert_eq!(one.len(), 1);
+        assert!(one[0].to_string_lossy().ends_with("b.txt"));
+        // No match → empty (the loud-warning trigger in the engine).
+        assert!(l.selected_paths(&["nonexistent".into()]).is_empty());
     }
 }

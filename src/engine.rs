@@ -557,12 +557,27 @@ impl TorrentEngine {
                 total_pieces = self.pm.num_pieces(),
                 "selective download"
             );
+            let matched = layout.selected_paths(&self.cfg.selected_files);
             println!(
-                "Select:     {} of {} pieces (files matching {:?})",
+                "Select:     {} of {} pieces, {} file(s) matching {:?}",
                 want_count,
                 self.pm.num_pieces(),
+                matched.len(),
                 self.cfg.selected_files
             );
+            if matched.is_empty() {
+                // No file matched — the user will otherwise see a download
+                // that fetches nothing with no explanation. Surface it.
+                println!(
+                    "  warning: no files matched the --select pattern(s); nothing to download"
+                );
+            } else {
+                for p in &matched {
+                    // Show the path relative to the torrent root for brevity.
+                    let shown = p.strip_prefix(&layout.root).unwrap_or(p);
+                    println!("  + {}", shown.display());
+                }
+            }
         }
 
         let (storage_cmd_tx, storage_cmd_rx) = mpsc::channel::<StorageCommand>(64);

@@ -193,9 +193,14 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 - [ ] **P2 — single-download queue / resume-list.** Without the daemon,
   one torrent per process and no persisted queue. Either document "use
   `daemon`" or add a simple resume-list the daemon restores on startup.
-- [ ] **P2 — print the selected files after `--select` resolves.**
-  [verified] Especially for magnet (metadata arrives async); surface what
-  matched so the user knows `--select` took effect.
+- [x] **P2 — print the selected files after `--select` resolves.**
+  DONE: added `Layout::selected_paths(selectors)` and the engine now
+  prints each matched file (relative to the torrent root) after the piece
+  summary, plus a loud warning when a `--select` pattern matched nothing
+  (previously a typo silently downloaded zero bytes with no explanation).
+  Unit-tested match/empty cases. (Originally flagged [verified] —
+  especially useful for magnet, where metadata arrives async, so the user
+  sees `--select` took effect.)
 - [ ] **P2 — actionable error messages.** Audit `Error::Network`/`Tracker`
   strings for "what do I do" guidance (e.g. tracker timeouts, MSE-only
   swarms, bind failures).
