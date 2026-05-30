@@ -132,8 +132,9 @@ enum Commands {
         max_up: Option<u64>,
         /// Enable µTP (BEP 29): bind a UDP socket on the listen port,
         /// accept inbound µTP peers, and race TCP+µTP on every dial.
-        /// Auto-disabled under --anonymous / --socks5 / --bind-iface
-        /// (UDP can't ride SOCKS5 and isn't interface-bound here).
+        /// Auto-disabled under --anonymous / --socks5 (UDP can't ride a
+        /// SOCKS5 CONNECT). Works with --bind-iface — the µTP socket is
+        /// pinned to the same interface as TCP (VPN kill switch).
         #[arg(long, default_value_t = false)]
         utp: bool,
         /// Serve a read-only web monitoring UI (status page + JSON +

@@ -427,19 +427,35 @@ impl TorrentEngine {
         peers.set_anonymous(self.cfg.anonymous);
 
         // µTP transport (BEP 29): bind a UDP socket on the listen port
-        // when enabled on a clearnet direct path. Gated off under
-        // anonymous / SOCKS5 / bind-iface — UDP can't ride a SOCKS5
-        // CONNECT and our µTP socket isn't interface-bound, so allowing
-        // it there would leak past the proxy / kill switch.
+        // when enabled on a clearnet direct path. Still gated off under
+        // anonymous and SOCKS5 — UDP can't ride a SOCKS5 CONNECT, and
+        // anonymous mode wants no UDP egress at all. Under `--bind-iface`
+        // we now DO enable µTP, binding the datagram socket to the same
+        // interface as the TCP path (the VPN kill switch) so it can't
+        // leak onto the default route.
         let utp_socket: Option<Arc<UtpSocket>> = if self.cfg.utp_enabled
             && !self.cfg.anonymous
             && self.cfg.proxies.is_empty()
-            && self.cfg.bind_iface.is_none()
         {
             let bind: SocketAddr = (std::net::Ipv4Addr::UNSPECIFIED, self.cfg.listen_port).into();
-            match UtpSocket::bind(bind).await {
+            // With an interface pin, build the UDP socket through the
+            // device-bind helper first; otherwise a plain bind.
+            let built = match &self.cfg.bind_iface {
+                Some(iface) => {
+                    crate::netbind::bind_udp_to_interface(bind, iface).and_then(UtpSocket::from_udp)
+                }
+                None => UtpSocket::bind(bind).await,
+            };
+            match built {
                 Ok(s) => {
-                    tracing::info!(target: "engine", port = self.cfg.listen_port, "µTP transport enabled (TCP+µTP dial race)");
+                    match &self.cfg.bind_iface {
+                        Some(iface) => {
+                            tracing::info!(target: "engine", port = self.cfg.listen_port, iface = %iface, "µTP transport enabled (interface-bound)")
+                        }
+                        None => {
+                            tracing::info!(target: "engine", port = self.cfg.listen_port, "µTP transport enabled (TCP+µTP dial race)")
+                        }
+                    }
                     Some(Arc::new(s))
                 }
                 Err(e) => {

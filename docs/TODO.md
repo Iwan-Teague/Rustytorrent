@@ -77,10 +77,14 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   itself can't fall back to the default route; confirm no DNS leak for
   the proxy host (it's resolved once at startup → ok). Write it up in
   `docs/ANONYMITY.md` as a coverage matrix.
-- [ ] **P1 — interface-bind the µTP socket** so `--utp` can coexist with
-  `--bind-iface` (today µTP is force-disabled there). Same `socket2`
-  device-bind already used for TCP (`netbind::bind_udp_to_interface`
-  exists for DHT — reuse it).
+- [x] **P1 — interface-bind the µTP socket** so `--utp` can coexist with
+  `--bind-iface` (was force-disabled there). DONE: added
+  `UtpSocket::from_udp(UdpSocket)` so a caller can hand it a pre-bound
+  socket; the engine now builds the µTP datagram socket via
+  `netbind::bind_udp_to_interface` when `--bind-iface` is set, pinning it
+  to the same interface as the TCP path. Still gated off under
+  `--anonymous`/`--socks5` (UDP can't ride SOCKS5). CLI help + gating
+  comments updated.
 - [ ] **P2 — tracker HTTP is not interface-bindable** (reqwest
   limitation) — documented residual of `--bind-iface`. Investigate a
   reqwest connector that binds to the interface, or route the tracker

@@ -268,7 +268,17 @@ pub struct UtpSocket {
 impl UtpSocket {
     /// Bind a UDP socket and start the driver task.
     pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
-        let socket = Arc::new(UdpSocket::bind(addr).await?);
+        let socket = UdpSocket::bind(addr).await?;
+        Self::from_udp(socket)
+    }
+
+    /// Build a µTP socket from an already-bound `UdpSocket`. Used when the
+    /// caller needs to pin the underlying datagram socket to a specific
+    /// interface first (the `--bind-iface` VPN kill switch) via
+    /// `netbind::bind_udp_to_interface`, which `UtpSocket::bind` can't do
+    /// because the device-bind setsockopt must run before `bind`.
+    pub fn from_udp(socket: UdpSocket) -> io::Result<Self> {
+        let socket = Arc::new(socket);
         let local_addr = socket.local_addr()?;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
