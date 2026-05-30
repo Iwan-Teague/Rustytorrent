@@ -96,8 +96,10 @@ the default route and leaking your real IP.
 - ✅ **The DHT's UDP socket is bound to the interface** (`IP_BOUND_IF` /
   `SO_BINDTODEVICE`), so DHT traffic fails closed with the rest of the kill
   switch if the tunnel drops — DHT stays usable under `--bind-iface`.
-- ✅ **µTP is force-disabled** under `--bind-iface` (its socket isn't
-  interface-bound in this build).
+- ✅ **µTP's UDP socket is bound to the interface** (`UtpSocket::from_udp`
+  over `netbind::bind_udp_to_interface`), so `--utp` works under
+  `--bind-iface` and fails closed with the rest of the kill switch if the
+  tunnel drops.
 - ⚠️ **Tracker HTTP is NOT interface-bound.** The HTTP client (`reqwest`)
   doesn't expose per-interface binding, so tracker announces ride the OS's
   normal routing. For a complete kill switch, **pair `--bind-iface` with
@@ -144,11 +146,20 @@ Tor caveats specific to high-volume P2P traffic:
   scope. Use a system-wide VPN or transparent-proxy setup if those matter.
 - **Application-level leaks in this codebase** — e.g. accidentally including
   a hostname in a log line. We try to keep these minimal. Report them.
-- **µTP (BEP 29).** We use TCP for the peer wire protocol. Many real-world
-  clients support µTP, which is UDP-based and bypasses the SOCKS5 path
-  entirely. Since we don't implement µTP at all, this isn't an active leak —
-  but if/when we do, it'll need its own proxy story (or a hard-off in
-  anonymous mode, like DHT).
+- **The `daemon` subcommand does not support `--anonymous`.** The
+  multi-torrent daemon's sessions dial clearnet (tracker-only, DHT off)
+  and the privacy flags are not yet wired through `SessionManager`. Do not
+  use `daemon` for anonymous workloads. Its web UI is loopback-only, like
+  `--web`, and the only outbound it makes is the runtime magnet/tracker
+  bootstrap for `POST /api/add_magnet` — also clearnet.
+- **µTP (BEP 29) is implemented** (UDP-based, raced against TCP on every
+  dial). Because UDP can't ride a SOCKS5 CONNECT, µTP is **force-disabled**
+  under `--anonymous` and `--socks5` — exactly the hard-off treatment DHT
+  gets — so it is *not* a leak vector there. Under `--bind-iface` (no
+  proxy) µTP stays on but its socket is interface-bound, so it fails closed
+  with the kill switch. The only configuration where µTP egresses on the
+  default route is plain clearnet (no privacy flags), which is by
+  definition not trying to be anonymous.
 
 ---
 

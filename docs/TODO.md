@@ -69,14 +69,22 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 
 ## 2. Privacy & anonymity
 
-- [ ] **P1 — verify `--anonymous` covers ALL egress, end to end.** Spot
+- [x] **P1 — verify `--anonymous` covers ALL egress, end to end.** Spot
   checks pass (listener off, DHT off, MSE forced, UDP trackers rejected,
   cleartext `http://` trackers rejected, port=0, ephemeral peer_id
-  [verified]). Remaining audit: confirm the daemon path and `--web`
-  never dial out; confirm `reqwest`'s connection to the SOCKS5 proxy
-  itself can't fall back to the default route; confirm no DNS leak for
-  the proxy host (it's resolved once at startup → ok). Write it up in
-  `docs/ANONYMITY.md` as a coverage matrix.
+  [verified]). DONE: audited every egress path and updated
+  `docs/ANONYMITY.md`. Findings: (1) tracker HTTP always uses the proxied
+  reqwest client with `socks5h://` when a proxy is set — remote DNS, no
+  fallback to the default route; (2) anonymous refuses to start without a
+  proxy (`engine.rs`), so there's no clearnet dial path; (3) `--web` and
+  the daemon UI are loopback-only and never dial out *except* the daemon's
+  runtime magnet bootstrap (clearnet — daemon doesn't support anonymous,
+  now documented); (4) proxy-host DNS is resolved once at startup on the
+  host (unavoidable; use an IP literal to avoid). Also FIXED two stale
+  claims the audit caught in ANONYMITY.md: it said µTP "isn't implemented"
+  and "is force-disabled under --bind-iface" — both untrue after the µTP
+  work; corrected to: µTP is implemented, hard-off under anonymous/socks5,
+  interface-bound under --bind-iface.
 - [x] **P1 — interface-bind the µTP socket** so `--utp` can coexist with
   `--bind-iface` (was force-disabled there). DONE: added
   `UtpSocket::from_udp(UdpSocket)` so a caller can hand it a pre-bound
