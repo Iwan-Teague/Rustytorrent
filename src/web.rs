@@ -293,21 +293,33 @@ async fn index() -> Html<&'static str> {
 
 // ---- Multi-torrent daemon router ----
 
-/// Build the daemon router over a [`SessionManager`]. `GET /api/status`
-/// returns an *array* of per-session stats; control is per info-hash.
-pub fn daemon_router(mgr: SessionManager) -> Router {
+/// Everything the daemon web handlers need: the session map plus the
+/// template for building a config when a torrent is added at runtime.
+#[derive(Clone)]
+pub struct DaemonState {
+    pub mgr: SessionManager,
+    pub output: std::path::PathBuf,
+    pub peer_id: crate::peer_id::PeerId,
+    pub base_port: u16,
+}
+
+/// Build the daemon router. `GET /api/status` returns an *array* of
+/// per-session stats; control is per info-hash; `POST /api/add` takes a
+/// server-side `.torrent` path and starts hosting it.
+pub fn daemon_router(state: DaemonState) -> Router {
     Router::new()
         .route("/", get(daemon_index))
         .route("/api/status", get(daemon_status))
+        .route("/api/add", post(daemon_add))
         .route("/api/torrent/:ih/pause", post(daemon_pause))
         .route("/api/torrent/:ih/resume", post(daemon_resume))
         .route("/api/torrent/:ih/remove", post(daemon_remove))
-        .with_state(mgr)
+        .with_state(state)
 }
 
 /// Serve the daemon UI/API on `127.0.0.1:port` (loopback only, same as
 /// the single-torrent server).
-pub async fn serve_daemon(port: u16, mgr: SessionManager) {
+pub async fn serve_daemon(port: u16, state: DaemonState) {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -317,35 +329,56 @@ pub async fn serve_daemon(port: u16, mgr: SessionManager) {
         }
     };
     tracing::info!(target: "web", %addr, "daemon UI at http://{addr}/");
-    if let Err(e) = axum::serve(listener, daemon_router(mgr)).await {
+    if let Err(e) = axum::serve(listener, daemon_router(state)).await {
         tracing::warn!(target: "web", error = %e, "daemon web server stopped");
     }
 }
 
-async fn daemon_status(State(mgr): State<SessionManager>) -> impl IntoResponse {
-    axum::Json(mgr.snapshot().await)
+async fn daemon_status(State(st): State<DaemonState>) -> impl IntoResponse {
+    axum::Json(st.mgr.snapshot().await)
 }
 
-async fn daemon_pause(
-    State(mgr): State<SessionManager>,
-    Path(ih): Path<String>,
-) -> impl IntoResponse {
-    daemon_ctl(&mgr, &ih, EngineControl::Pause).await
+/// Add a torrent at runtime. The (loopback) request body is a path to a
+/// `.torrent` file on the daemon host. Returns the info-hash hex on
+/// success. Magnet add is a follow-up (needs the metadata-fetch flow).
+async fn daemon_add(State(st): State<DaemonState>, body: String) -> impl IntoResponse {
+    let path = body.trim();
+    if path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty path".to_string());
+    }
+    let raw = match tokio::fs::read(path).await {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("read {path}: {e}")),
+    };
+    let torrent = match crate::metainfo::TorrentFile::from_bytes(&raw) {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("parse {path}: {e}")),
+    };
+    // One listen port per session; offset by the current count.
+    let n = st.mgr.len().await as u16;
+    let cfg = crate::engine::EngineConfig {
+        output_dir: st.output.clone(),
+        listen_port: st.base_port.wrapping_add(n),
+        enable_dht: false, // daemon v1 is tracker-only
+        ..Default::default()
+    };
+    match st.mgr.add(torrent, st.peer_id, cfg).await {
+        Some(ih) => (StatusCode::OK, hex_lower(&ih)),
+        None => (StatusCode::CONFLICT, "already running".to_string()),
+    }
 }
-async fn daemon_resume(
-    State(mgr): State<SessionManager>,
-    Path(ih): Path<String>,
-) -> impl IntoResponse {
-    daemon_ctl(&mgr, &ih, EngineControl::Resume).await
+
+async fn daemon_pause(State(st): State<DaemonState>, Path(ih): Path<String>) -> impl IntoResponse {
+    daemon_ctl(&st.mgr, &ih, EngineControl::Pause).await
 }
-async fn daemon_remove(
-    State(mgr): State<SessionManager>,
-    Path(ih): Path<String>,
-) -> impl IntoResponse {
+async fn daemon_resume(State(st): State<DaemonState>, Path(ih): Path<String>) -> impl IntoResponse {
+    daemon_ctl(&st.mgr, &ih, EngineControl::Resume).await
+}
+async fn daemon_remove(State(st): State<DaemonState>, Path(ih): Path<String>) -> impl IntoResponse {
     let Some(h) = parse_info_hash(&ih) else {
         return (StatusCode::BAD_REQUEST, "bad info_hash");
     };
-    if mgr.remove(&h).await {
+    if st.mgr.remove(&h).await {
         (StatusCode::OK, "removed")
     } else {
         (StatusCode::NOT_FOUND, "no such torrent")
@@ -365,6 +398,16 @@ async fn daemon_ctl(
     } else {
         (StatusCode::NOT_FOUND, "no such torrent")
     }
+}
+
+/// Lowercase hex of a byte slice.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Parse a 40-char lowercase-hex info-hash into 20 bytes.
@@ -403,9 +446,26 @@ const DAEMON_HTML: &str = r##"<!doctype html>
   .empty { color: #999; }
 </style></head><body>
 <h1>RustyTorrent <span class="meta" id="count"></span></h1>
+<form id="addform" style="margin:.5rem 0">
+  <input id="addpath" type="text" placeholder="path to a .torrent on the daemon host" style="width:70%;font:inherit;padding:.2rem .4rem">
+  <button type="submit">Add</button>
+  <span class="meta" id="addmsg"></span>
+</form>
 <div id="list"><p class="empty">Loading…</p></div>
 <script>
 const fmtBytes = b => { const u=["B","KiB","MiB","GiB","TiB"]; let i=0; b=Number(b); while(b>=1024&&i<u.length-1){b/=1024;i++;} return b.toFixed(i?1:0)+" "+u[i]; };
+document.getElementById("addform").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const path = document.getElementById("addpath").value.trim();
+  if (!path) return;
+  const msg = document.getElementById("addmsg");
+  try {
+    const r = await fetch("/api/add", { method:"POST", body: path });
+    msg.textContent = r.ok ? "added" : "error: " + (await r.text());
+    if (r.ok) document.getElementById("addpath").value = "";
+    await tick();
+  } catch (err) { msg.textContent = "error"; }
+});
 async function act(ih, action) { try { await fetch(`/api/torrent/${ih}/${action}`, {method:"POST"}); await tick(); } catch(e){} }
 async function tick() {
   let list;

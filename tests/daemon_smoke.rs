@@ -5,7 +5,7 @@
 use rustytorrent::engine::EngineConfig;
 use rustytorrent::metainfo::TorrentFile;
 use rustytorrent::session::SessionManager;
-use rustytorrent::web::daemon_router;
+use rustytorrent::web::{daemon_router, DaemonState};
 
 /// Build a minimal valid single-file torrent whose `name` is `name` and
 /// whose first pieces-hash byte is `tag` (so the two torrents get
@@ -52,8 +52,14 @@ async fn daemon_hosts_lists_and_controls_torrents() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let state = DaemonState {
+        mgr: mgr.clone(),
+        output: std::env::temp_dir(),
+        peer_id: [7u8; 20],
+        base_port: 0,
+    };
     tokio::spawn(async move {
-        let _ = axum::serve(listener, daemon_router(mgr.clone())).await;
+        let _ = axum::serve(listener, daemon_router(state)).await;
     });
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -111,4 +117,42 @@ async fn daemon_hosts_lists_and_controls_torrents() {
     )
     .unwrap();
     assert_eq!(list.as_array().unwrap().len(), 1);
+
+    // POST /api/add with a path to a .torrent on disk → array grows.
+    let mut tpath = std::env::temp_dir();
+    tpath.push(format!("rt_daemon_add_{}.torrent", std::process::id()));
+    // Reconstruct gamma's bytes and write them out.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"d4:infod6:lengthi16384e4:name5:gamma12:piece lengthi16384e6:pieces20:");
+    let mut h = [0u8; 20];
+    h[0] = 0xCC;
+    buf.extend_from_slice(&h);
+    buf.extend_from_slice(b"ee");
+    tokio::fs::write(&tpath, &buf).await.unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/add"))
+        .body(tpath.to_string_lossy().into_owned())
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "add failed: {}", resp.status());
+
+    let list: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/api/status"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        list.as_array().unwrap().len(),
+        2,
+        "added torrent should appear"
+    );
+    let _ = tokio::fs::remove_file(&tpath).await;
 }

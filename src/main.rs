@@ -695,9 +695,15 @@ async fn cmd_daemon(
         mgr.len().await
     );
 
+    let state = rustytorrent::web::DaemonState {
+        mgr: mgr.clone(),
+        output,
+        peer_id,
+        base_port,
+    };
     // Serve until ctrl-c, then stop every session gracefully.
     tokio::select! {
-        _ = rustytorrent::web::serve_daemon(web, mgr.clone()) => {}
+        _ = rustytorrent::web::serve_daemon(web, state) => {}
         _ = tokio::signal::ctrl_c() => {
             println!("\nshutting down daemon...");
         }
