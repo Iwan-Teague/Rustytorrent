@@ -96,13 +96,16 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   runtime.** [DONE] `storage/disk.rs` now offloads each piece's SHA-1 to
   `spawn_blocking` so the resume scan no longer freezes the reactor.
   Further win available: pipeline reads + hashing across cores (still P2).
-- [ ] **P1 — `picker.pick_for` rebuilds + sorts a candidates `Vec` every
-  call.** [verified] `piece/picker.rs` does O(n log n) per block request
-  over all pieces. For large torrents this is a hot path. Maintain an
-  incrementally-updated rarest-piece structure (bucket by availability),
-  or cache candidates and invalidate on bitfield/Have changes. Also skip
-  the `sort_by_key` entirely in sequential mode (it computes `min`
-  separately already). [verified]
+- [x] **P1 — `picker.pick_for` rebuilds + sorts a candidates `Vec` every
+  call.** [verified] `piece/picker.rs` did O(n log n) per block request.
+  DONE (partial — the low-risk half): replaced the `collect + sort_by_key`
+  with a single O(n) min-availability pass that keeps only the
+  current-best tie group, and made sequential mode early-exit at the first
+  usable (lowest-index) piece instead of collecting + `min`-ing. Removes
+  the sort and the full-candidate allocation; behavior (rarest-first with
+  tie-shuffle) is identical, all picker tests green. The fully incremental
+  availability-bucket structure remains a possible future step but wasn't
+  needed to kill the sort — left as a note, not a blocker.
 - [ ] **P1 — `file_progress` + peer-list scan every progress tick.**
   [verified] `engine.rs` `file_progress` iterates all pieces × all files
   each ~2 s, and `build_stats` re-collects connected-peer addresses every

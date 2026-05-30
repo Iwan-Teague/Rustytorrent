@@ -131,31 +131,43 @@ impl Picker {
         }
         let bf = self.peer_bitfields.get(addr)?;
         let in_use: std::collections::HashSet<usize> = self.assigned.values().copied().collect();
-        let mut candidates: Vec<usize> = (0..self.num_pieces)
-            .filter(|i| {
-                i < &bf.len()
-                    && bf[*i]
-                    && pm.state(*i) != &PieceState::Complete
-                    && pm.is_wanted(*i)
-                    && (endgame || !in_use.contains(i))
-            })
-            .collect();
-        if candidates.is_empty() {
-            return None;
-        }
+        let usable = |i: usize| -> bool {
+            i < bf.len()
+                && bf[i]
+                && pm.state(i) != &PieceState::Complete
+                && pm.is_wanted(i)
+                && (endgame || !in_use.contains(&i))
+        };
+
         let chosen = if self.sequential {
             // Lowest-index needed piece → in-order delivery for streaming.
-            *candidates.iter().min().expect("non-empty checked above")
+            // The first match in ascending order IS the lowest index, so
+            // break immediately rather than scanning + min-ing the rest.
+            (0..self.num_pieces).find(|&i| usable(i))?
         } else {
-            candidates.sort_by_key(|i| self.availability[*i]);
-            // Shuffle within the lowest-availability group for fairness.
-            let min_av = self.availability[candidates[0]];
-            let tie_end = candidates
-                .iter()
-                .position(|i| self.availability[*i] != min_av)
-                .unwrap_or(candidates.len());
-            candidates[..tie_end].shuffle(&mut rand::thread_rng());
-            candidates[0]
+            // Rarest-first in a single O(n) pass: track the minimum
+            // availability seen and the set of pieces tied at it, instead
+            // of building + sorting a full candidate Vec (was O(n log n)).
+            // `ties` only ever holds the current-best group.
+            let mut min_av = u32::MAX;
+            let mut ties: Vec<usize> = Vec::new();
+            for i in 0..self.num_pieces {
+                if !usable(i) {
+                    continue;
+                }
+                let av = self.availability[i];
+                if av < min_av {
+                    min_av = av;
+                    ties.clear();
+                    ties.push(i);
+                } else if av == min_av {
+                    ties.push(i);
+                }
+            }
+            // Shuffle within the lowest-availability group for fairness,
+            // then take one. Empty ⇒ no usable piece for this peer.
+            ties.shuffle(&mut rand::thread_rng());
+            *ties.first()?
         };
         self.assigned.insert(*addr, chosen);
         Some(chosen)
