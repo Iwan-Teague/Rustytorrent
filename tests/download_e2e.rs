@@ -213,6 +213,72 @@ async fn multi_file_download_writes_correct_offsets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_from_partial_download() {
+    // The leecher's output dir is pre-populated with the first two pieces
+    // correct and the rest zeroed. scan_resume must verify pieces 0+1 and
+    // mark them present, so the leecher only needs to fetch the last piece
+    // — and the final file is still byte-identical.
+    let data: Vec<u8> = (0..40_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    let name = "resume.bin";
+    let torrent = make_torrent(name, &data);
+
+    let tmp = std::env::temp_dir().join(format!("rt_e2e_resume_{}", std::process::id()));
+    let seed_dir = tmp.join("seed");
+    let leech_dir = tmp.join("leech");
+    tokio::fs::create_dir_all(&seed_dir).await.unwrap();
+    tokio::fs::create_dir_all(&leech_dir).await.unwrap();
+    tokio::fs::write(seed_dir.join(name), &data).await.unwrap();
+
+    // Partial: first 2 pieces (0..32768) correct, remainder zeroed to the
+    // full length so the file layout matches.
+    let mut partial = vec![0u8; data.len()];
+    let prefix = (2 * PIECE_LEN as usize).min(data.len());
+    partial[..prefix].copy_from_slice(&data[..prefix]);
+    tokio::fs::write(leech_dir.join(name), &partial)
+        .await
+        .unwrap();
+
+    let port = free_port().await;
+    let seeder = TorrentEngine::new(
+        torrent.clone(),
+        [7u8; 20],
+        EngineConfig {
+            output_dir: seed_dir.clone(),
+            listen_port: port,
+            no_tracker: true,
+            ..Default::default()
+        },
+    );
+    let seeder_task = tokio::spawn(async move {
+        let _ = seeder.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let leecher = TorrentEngine::new(
+        torrent,
+        [8u8; 20],
+        EngineConfig {
+            output_dir: leech_dir.clone(),
+            listen_port: free_port().await,
+            no_tracker: true,
+            seed_peers: vec![format!("127.0.0.1:{port}").parse().unwrap()],
+            ..Default::default()
+        },
+    );
+    let result = tokio::time::timeout(Duration::from_secs(30), leecher.run()).await;
+    assert!(result.is_ok(), "resuming leecher timed out");
+    assert!(result.unwrap().is_ok());
+
+    let got = tokio::fs::read(leech_dir.join(name)).await.unwrap();
+    assert_eq!(got, data, "resumed download must end byte-identical");
+
+    seeder_task.abort();
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selective_download_fetches_only_wanted_file() {
     // Same 2-file torrent. Select only "a.bin": the leecher fetches the
     // pieces overlapping a.bin (0 and the boundary piece 1), completes

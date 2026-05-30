@@ -203,9 +203,11 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   test in `download_e2e.rs`: a 2-file torrent whose boundary falls inside
   a piece; asserts each file is written byte-identical (the virtual
   offset map splits the straddling piece correctly).
-- [ ] **P1 — resume/restart test:** partial download persists and resumes
-  correctly (scan_resume rebuilds the bitfield). (The e2e harness now
-  makes this easy to add.)
+- [x] **P1 — resume/restart test.** [DONE] `resume_from_partial_download`
+  in `download_e2e.rs`: pre-populates the leecher's output with the first
+  two pieces correct + the rest zeroed; asserts `scan_resume` verifies
+  them so only the last piece is fetched and the final file is
+  byte-identical.
 - [x] **P1 — `--select` end-to-end engine test.** [DONE]
   `selective_download_fetches_only_wanted_file` in `download_e2e.rs`:
   selects one file of a 2-file torrent, asserts the leecher completes
