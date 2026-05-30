@@ -637,8 +637,9 @@ async fn cmd_download(
     Ok(())
 }
 
-/// Resolve the paranoid-mode passphrase from CLI flag → env var → error.
-/// We never log it; just pass it to the engine to derive the spool key.
+/// Resolve the paranoid-mode passphrase: CLI flag → env var → interactive
+/// no-echo prompt → error. We never log it; just pass it to the engine to
+/// derive the spool key.
 ///
 /// Order is deliberate: the `--passphrase` flag wins for scripting, but
 /// it is the *least* private source — a CLI argument is visible to every
@@ -664,7 +665,25 @@ fn resolve_passphrase(flag: Option<String>) -> Result<String> {
             return Ok(p);
         }
     }
-    anyhow::bail!("--paranoid requires --passphrase or RUSTYTORRENT_PASSPHRASE (non-empty)")
+    // Most private source: an interactive no-echo prompt. The passphrase
+    // never touches the argument list, the environment, or shell history —
+    // it's typed straight into the terminal and the input is hidden.
+    // Only attempt it when stdin AND stderr are real TTYs; in a pipe,
+    // service, or CI context there's no human to type, so we fall through
+    // to the hard error rather than blocking forever on a read.
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        let p = rpassword::prompt_password("Passphrase: ")
+            .map_err(|e| anyhow::anyhow!("reading passphrase from terminal: {e}"))?;
+        if !p.is_empty() {
+            return Ok(p);
+        }
+        anyhow::bail!("empty passphrase");
+    }
+    anyhow::bail!(
+        "--paranoid requires a passphrase: set RUSTYTORRENT_PASSPHRASE, pass --passphrase, \
+         or run interactively to be prompted"
+    )
 }
 
 async fn cmd_daemon(

@@ -43,11 +43,16 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 - [ ] **P2 — Windows AppContainer sandbox.** `sandbox.rs` supports Linux
   seccomp + macOS SBPL; Windows `--sandbox` is refused. Implement
   AppContainer (roadmap C2 remainder).
-- [ ] **P2 — no-echo TTY passphrase prompt** for `--paranoid`. Today the
+- [x] **P2 — no-echo TTY passphrase prompt** for `--paranoid`. Today the
   passphrase comes from `--passphrase` (warned: leaks in `ps`/history) or
-  `RUSTYTORRENT_PASSPHRASE`. Add an interactive no-echo prompt when stdin
-  is a TTY and neither is set (needs `rpassword` or termios FFI; test per
-  OS).
+  `RUSTYTORRENT_PASSPHRASE`. DONE: added `rpassword` and a third fallback
+  in `resolve_passphrase` — when both stdin and stderr are TTYs and no
+  flag/env is set, prompt with hidden input (`rpassword::prompt_password`).
+  Gated on `IsTerminal` for both streams so pipes/CI fall through to the
+  hard error instead of blocking. Most-private source (never in argv,
+  env, or shell history). Benefits both `download --paranoid` and
+  `decrypt`. rpassword wraps the termios/Win32 `unsafe`, keeping our code
+  unsafe-free.
 - [ ] **P2 — randomized µTP receiver seq as an accept token** to close
   the residual blind-spoof (a forged SYN+DATA can still surface one
   inbound connection). `utp/connection.rs new_receiver` uses a fixed
