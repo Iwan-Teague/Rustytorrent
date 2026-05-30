@@ -408,10 +408,44 @@ async fn daemon_add(State(st): State<DaemonState>, body: String) -> impl IntoRes
         enable_dht: !st.no_dht,
         ..Default::default()
     };
-    match st.mgr.add(torrent, st.peer_id, cfg).await {
+    match st.mgr.add_persistent(torrent, st.peer_id, cfg, &raw).await {
         Some(ih) => (StatusCode::OK, crate::util::hex(&ih)),
         None => (StatusCode::CONFLICT, "already running".to_string()),
     }
+}
+
+/// Build `.torrent` bytes from a (verified) raw info-dict and a tracker
+/// list. The info dict is spliced in **verbatim**, so the info-hash is
+/// preserved exactly — we must never re-encode it (key reordering would
+/// change the hash). Top-level keys are emitted in bencode-canonical
+/// order: `announce` < `announce-list` < `info`. Used to persist a
+/// magnet-added torrent so the daemon can resume it after a restart.
+fn assemble_torrent_bytes(info_bytes: &[u8], trackers: &[String]) -> Vec<u8> {
+    fn push_bstr(out: &mut Vec<u8>, s: &[u8]) {
+        out.extend_from_slice(s.len().to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(s);
+    }
+    let mut out = Vec::with_capacity(info_bytes.len() + 64);
+    out.push(b'd');
+    if let Some(first) = trackers.first() {
+        push_bstr(&mut out, b"announce");
+        push_bstr(&mut out, first.as_bytes());
+    }
+    if !trackers.is_empty() {
+        push_bstr(&mut out, b"announce-list");
+        out.push(b'l');
+        for t in trackers {
+            out.push(b'l');
+            push_bstr(&mut out, t.as_bytes());
+            out.push(b'e');
+        }
+        out.push(b'e');
+    }
+    push_bstr(&mut out, b"info");
+    out.extend_from_slice(info_bytes); // verbatim — preserves info_hash
+    out.push(b'e');
+    out
 }
 
 /// Add a torrent from a `magnet:?xt=urn:btih:…` URI at runtime.
@@ -492,7 +526,7 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
         let torrent = match crate::metainfo::TorrentFile::from_info_dict_bytes(
             &info_bytes,
             info_hash,
-            magnet.trackers,
+            magnet.trackers.clone(),
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -500,13 +534,20 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
                 return;
             }
         };
+        // Assemble `.torrent` bytes (info dict verbatim → info_hash
+        // preserved) so the daemon can persist + resume this magnet add.
+        let raw_torrent = assemble_torrent_bytes(&info_bytes, &magnet.trackers);
         let cfg = crate::engine::EngineConfig {
             output_dir: st.output.clone(),
             listen_port: st.base_port,
             enable_dht: !st.no_dht,
             ..Default::default()
         };
-        match st.mgr.add(torrent, st.peer_id, cfg).await {
+        match st
+            .mgr
+            .add_persistent(torrent, st.peer_id, cfg, &raw_torrent)
+            .await
+        {
             Some(ih) => {
                 tracing::info!(target: "web", info_hash = %crate::util::hex(&ih), "magnet add: session started")
             }
@@ -891,5 +932,46 @@ mod tests {
         assert!(resolve_under(&base, base.join("nope.torrent").to_str().unwrap()).is_err());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn assemble_torrent_bytes_preserves_info_hash() {
+        use crate::metainfo::TorrentFile;
+        use sha1::{Digest, Sha1};
+        // A minimal valid info dict; its SHA-1 is the info-hash.
+        let mut info = Vec::new();
+        info.extend_from_slice(b"d6:lengthi16384e4:name5:t.bin12:piece lengthi16384e6:pieces20:");
+        info.extend_from_slice(&[0u8; 20]);
+        info.push(b'e');
+
+        let trackers = vec![
+            "http://a.example/announce".to_string(),
+            "http://b.example/announce".to_string(),
+        ];
+        let bytes = assemble_torrent_bytes(&info, &trackers);
+
+        // Round-trips through the parser, and the info-hash equals the
+        // SHA-1 of the verbatim info dict — proving we didn't re-encode it.
+        let t = TorrentFile::from_bytes(&bytes).unwrap();
+        let mut h = Sha1::new();
+        h.update(&info);
+        let expected: [u8; 20] = h.finalize().into();
+        assert_eq!(t.info_hash, expected);
+        assert_eq!(t.info.name, "t.bin");
+        assert_eq!(t.announce.as_deref(), Some("http://a.example/announce"));
+        assert_eq!(t.announce_list.len(), 2);
+    }
+
+    #[test]
+    fn assemble_torrent_bytes_no_trackers_is_valid() {
+        use crate::metainfo::TorrentFile;
+        let mut info = Vec::new();
+        info.extend_from_slice(b"d6:lengthi16384e4:name5:t.bin12:piece lengthi16384e6:pieces20:");
+        info.extend_from_slice(&[0u8; 20]);
+        info.push(b'e');
+        let bytes = assemble_torrent_bytes(&info, &[]);
+        let t = TorrentFile::from_bytes(&bytes).unwrap();
+        assert_eq!(t.info.name, "t.bin");
+        assert!(t.announce.is_none());
     }
 }

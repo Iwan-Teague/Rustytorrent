@@ -272,8 +272,16 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   (`owns_dht`); the manager shuts it down once on daemon exit so the
   routing-table state persists cleanly. Per-torrent gating still applies
   (anonymous/private sessions get no handle).
-- [ ] **P2 — daemon persistence:** save/restore the hosted torrent set
-  across restarts.
+- [x] **P2 — daemon persistence:** save/restore the hosted torrent set
+  across restarts. DONE: new `src/daemon_store.rs` (`DaemonStore`) stores
+  each hosted torrent as `<ih>.torrent` (verbatim metainfo — info-hash
+  preserved) + a `<ih>.json` sidecar (output dir, DHT intent).
+  `SessionManager::add_persistent` saves on add; `remove` forgets; daemon
+  shutdown deliberately keeps the set so the next start restores it.
+  `cmd_daemon` restores on startup; both web add paths persist (magnet
+  via `assemble_torrent_bytes`, which splices the info dict verbatim).
+  Unit + integration tested (info-hash preservation, save/forget,
+  shutdown-keeps-set).
 - [ ] **P2 — selective download: skip allocating unwanted files** (today
   the full layout is created; boundary pieces still write into unwanted
   files — acceptable, but a `--no-pad` could trim).

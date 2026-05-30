@@ -775,7 +775,42 @@ async fn cmd_daemon(
     };
 
     let acceptor_task = rustytorrent::acceptor::spawn(listener, None, registry.clone(), peer_id);
-    let mgr = SessionManager::with_shared(registry, dht, port, acceptor_task);
+
+    // Persistence: resume the hosted set across restarts.
+    let store = match rustytorrent::daemon_store::DaemonStore::open(
+        rustytorrent::daemon_store::DaemonStore::default_dir(),
+    ) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("warning: daemon state dir unavailable ({e}); not persisting torrents");
+            None
+        }
+    };
+    let restore = store.as_ref().map(|s| s.load_all()).unwrap_or_default();
+    let mgr = SessionManager::with_shared(registry, dht, port, acceptor_task, store);
+
+    // Restore persisted torrents first, so a CLI duplicate is a no-op.
+    for entry in restore {
+        let t = match TorrentFile::from_bytes(&entry.torrent_bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skip restore: {e}");
+                continue;
+            }
+        };
+        let cfg = rustytorrent::engine::EngineConfig {
+            output_dir: entry.output,
+            listen_port: port,
+            // Honor the saved intent, but the manager still forces it off
+            // if this daemon ran --no-dht.
+            enable_dht: entry.enable_dht && !no_dht,
+            ..Default::default()
+        };
+        // Already on disk — plain add (re-persisting would be redundant).
+        if let Some(ih) = mgr.add(t, peer_id, cfg).await {
+            println!("restored [{}]", hex(&ih));
+        }
+    }
 
     for path in torrents.iter() {
         let raw = match tokio::fs::read(path).await {
@@ -803,7 +838,7 @@ async fn cmd_daemon(
             enable_dht: !no_dht,
             ..Default::default()
         };
-        match mgr.add(t, peer_id, cfg).await {
+        match mgr.add_persistent(t, peer_id, cfg, &raw).await {
             Some(ih) => println!("added {} [{}]", path.display(), hex(&ih)),
             None => println!("skip {} (already running)", path.display()),
         }

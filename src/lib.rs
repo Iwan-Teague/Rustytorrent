@@ -1,5 +1,6 @@
 pub mod acceptor;
 pub mod create;
+pub mod daemon_store;
 pub mod dht;
 pub mod engine;
 pub mod error;

@@ -55,6 +55,11 @@ struct Shared {
     listen_port: u16,
     /// The acceptor's accept-loop task; aborted on daemon shutdown.
     acceptor_task: JoinHandle<()>,
+    /// Persists the hosted-torrent set so a restart resumes it. `None`
+    /// disables persistence. Written on [`SessionManager::add_persistent`],
+    /// erased on [`SessionManager::remove`]; deliberately *not* erased on
+    /// daemon shutdown (that's exactly when we want the set to survive).
+    store: Option<crate::daemon_store::DaemonStore>,
 }
 
 /// Owns the running sessions. Cheap to clone (shared behind `Arc`s), so
@@ -79,6 +84,7 @@ impl SessionManager {
         dht: Option<crate::dht::Dht>,
         listen_port: u16,
         acceptor_task: JoinHandle<()>,
+        store: Option<crate::daemon_store::DaemonStore>,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
@@ -87,6 +93,7 @@ impl SessionManager {
                 dht,
                 listen_port,
                 acceptor_task,
+                store,
             })),
         }
     }
@@ -164,6 +171,33 @@ impl SessionManager {
             },
         );
         Some(info_hash)
+    }
+
+    /// Like [`add`](Self::add), but also persists the torrent so the
+    /// daemon resumes it after a restart. `raw_torrent` is the original
+    /// `.torrent` bytes (info-hash preserved verbatim). No-op persistence
+    /// in standalone mode or when the store is disabled. The persisted
+    /// `enable_dht` is the caller's *intent* (captured before `add` may
+    /// downgrade it), so a restart re-requests the DHT and the manager
+    /// decides afresh.
+    pub async fn add_persistent(
+        &self,
+        torrent: TorrentFile,
+        peer_id: PeerId,
+        cfg: EngineConfig,
+        raw_torrent: &[u8],
+    ) -> Option<InfoHash> {
+        let output = cfg.output_dir.clone();
+        let enable_dht = cfg.enable_dht;
+        let ih = self.add(torrent, peer_id, cfg).await?;
+        if let Some(shared) = &self.shared {
+            if let Some(store) = &shared.store {
+                if let Err(e) = store.save(&ih, raw_torrent, &output, enable_dht) {
+                    tracing::warn!(target: "session", error = %e, "failed to persist torrent (still hosting)");
+                }
+            }
+        }
+        Some(ih)
     }
 
     /// Drop a session's entry from the shared acceptor registry (no-op in
@@ -252,8 +286,15 @@ impl SessionManager {
         let session = self.inner.lock().await.remove(info_hash);
         match session {
             Some(s) => {
-                // Stop the acceptor routing new connections to this session.
+                // Stop the acceptor routing new connections to this session,
+                // and drop it from persistence so a restart doesn't resume
+                // a torrent the user explicitly removed.
                 self.unregister(info_hash).await;
+                if let Some(shared) = &self.shared {
+                    if let Some(store) = &shared.store {
+                        store.forget(info_hash);
+                    }
+                }
                 let _ = s.ctl_tx.send(EngineControl::Shutdown).await;
                 // Give the graceful teardown a moment, then ensure the
                 // task is gone so we never leak it.
