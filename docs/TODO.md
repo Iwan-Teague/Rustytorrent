@@ -147,11 +147,11 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 
 ## 5. User experience & CLI
 
-- [ ] **P0 — no real-time progress in the terminal.** [verified]
-  Without `--web`, the binary prints name/output then only emits tracing
-  logs. Add a periodic stdout progress line (pieces, %, ↓/↑ rate, ETA,
-  peers) for `download`/`magnet`, like the `[progress]` line that already
-  exists in `log_progress` but is gated behind the info log.
+- [x] **P0/P1 — terminal progress line.** [DONE] (Correction: a
+  `[progress]` line already existed, but used the session-*average* rate
+  with no ETA/peers.) `log_progress` now prints instantaneous ↓/↑ rates,
+  connected-peer count, and an ETA every progress tick — wanted-relative,
+  so it reads correctly under `--select`/paused.
 - [ ] **P1 — `--verbose` / `--quiet` flags.** [verified] Verbosity is
   only via `RUST_LOG`. Add flags that set the tracing filter so users
   don't need the env var.

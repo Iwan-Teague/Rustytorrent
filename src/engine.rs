@@ -882,22 +882,23 @@ impl TorrentEngine {
                     }
                 }
                 _ = progress_timer.tick() => {
-                    self.log_progress();
+                    // Instantaneous rates over the interval since the last
+                    // sample — used by both the terminal line and the web
+                    // UI, so compute them unconditionally.
+                    let now = Instant::now();
+                    let (down_rate, up_rate) = match self.rate_last {
+                        Some((t0, d0, u0)) => {
+                            let dt = now.duration_since(t0).as_secs_f64().max(0.001);
+                            (
+                                (self.downloaded.saturating_sub(d0) as f64 / dt) as u64,
+                                (self.uploaded.saturating_sub(u0) as f64 / dt) as u64,
+                            )
+                        }
+                        None => (0, 0),
+                    };
+                    self.rate_last = Some((now, self.downloaded, self.uploaded));
+                    self.log_progress(down_rate, up_rate, peers.connected_count());
                     if web_tx.is_some() {
-                        // Instantaneous rates over the interval since the
-                        // last sample (the UI wants current speed).
-                        let now = Instant::now();
-                        let (down_rate, up_rate) = match self.rate_last {
-                            Some((t0, d0, u0)) => {
-                                let dt = now.duration_since(t0).as_secs_f64().max(0.001);
-                                (
-                                    (self.downloaded.saturating_sub(d0) as f64 / dt) as u64,
-                                    (self.uploaded.saturating_sub(u0) as f64 / dt) as u64,
-                                )
-                            }
-                            None => (0, 0),
-                        };
-                        self.rate_last = Some((now, self.downloaded, self.uploaded));
                         let addrs: Vec<String> = peers.addrs().map(|a| a.to_string()).collect();
                         let files = self.file_progress(&layout);
                         if let Some(tx) = &web_tx {
@@ -1640,27 +1641,74 @@ impl TorrentEngine {
             .collect()
     }
 
-    fn log_progress(&mut self) {
+    fn log_progress(&mut self, down_rate_bps: u64, up_rate_bps: u64, peers_connected: usize) {
         self.last_progress = Instant::now();
         let done = self.pm.wanted_complete_count();
         let total = self.pm.wanted_count();
-        let pct = (done as f64) / (total as f64) * 100.0;
-        let secs = self.start_time.elapsed().as_secs_f64().max(0.001);
-        let rate = (self.downloaded as f64) / secs;
+        let pct = if total == 0 {
+            100.0
+        } else {
+            (done as f64) / (total as f64) * 100.0
+        };
+        // Instantaneous-rate ETA over the remaining wanted bytes.
+        let remaining = (self.pm.missing_count() as u64)
+            .saturating_mul(self.pm.piece_length())
+            .min(self.torrent.total_length().saturating_sub(self.downloaded));
+        let eta = if self.pm.is_complete() {
+            "done".to_string()
+        } else if self.paused {
+            "paused".to_string()
+        } else if down_rate_bps > 0 {
+            fmt_duration(remaining / down_rate_bps)
+        } else {
+            "—".to_string()
+        };
         tracing::info!(
             target: "engine",
             pct = format!("{pct:.1}%"),
-            pieces = format!("{}/{}", done, total),
-            down_bytes = self.downloaded,
-            rate_kbps = format!("{:.0}", rate / 1024.0),
+            pieces = format!("{done}/{total}"),
+            down_bps = down_rate_bps,
+            up_bps = up_rate_bps,
+            peers = peers_connected,
+            eta = %eta,
             "progress"
         );
         println!(
-            "[progress] {done:>5}/{total} pieces  {pct:>5.1}%  down {:>7.1} KiB  {:>7.1} KiB/s",
-            self.downloaded as f64 / 1024.0,
-            rate / 1024.0,
+            "[progress] {done:>5}/{total} pieces {pct:>5.1}%  ↓{:>8}/s ↑{:>8}/s  {peers_connected} peers  ETA {eta}",
+            fmt_bytes(down_rate_bps),
+            fmt_bytes(up_rate_bps),
         );
     }
+}
+
+/// Compact human byte size, e.g. "1.5 MiB".
+fn fmt_bytes(b: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} {}", b, U[i])
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
+}
+
+/// Compact duration, e.g. "1h 3m 5s".
+fn fmt_duration(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
+    let mut out = String::new();
+    if h > 0 {
+        out.push_str(&format!("{h}h "));
+    }
+    if m > 0 || h > 0 {
+        out.push_str(&format!("{m}m "));
+    }
+    out.push_str(&format!("{s}s"));
+    out
 }
 
 /// Lowercase hex of a byte slice (for the info-hash in web stats).
