@@ -213,6 +213,14 @@ pub struct TorrentEngine {
     /// standalone behaviour (create channels, spawn web iff `web_port`).
     managed_web_tx: Option<tokio::sync::watch::Sender<EngineStats>>,
     managed_ctl_rx: Option<mpsc::Receiver<EngineControl>>,
+    /// **Daemon seam.** When set (via [`Self::set_managed_inbound`]), the
+    /// engine does NOT bind its own TCP/µTP listener; instead it reads
+    /// already-routed (and, for the daemon, already-handshaken) inbound
+    /// connections from this channel, fed by the daemon's one shared
+    /// acceptor. `None` → standalone behaviour (bind own listener on
+    /// `listen_port`). Independent of `managed_web_tx`/`managed_ctl_rx` so
+    /// a session can mix-and-match.
+    managed_incoming_rx: Option<mpsc::Receiver<crate::peer::inbound::Inbound>>,
     /// Memoized per-file progress for the web UI, keyed on the count of
     /// locally-complete pieces. Completed pieces only ever increase, so if
     /// the count is unchanged since the last computation the per-file
@@ -280,6 +288,7 @@ impl TorrentEngine {
             paused: false,
             managed_web_tx: None,
             managed_ctl_rx: None,
+            managed_incoming_rx: None,
             file_progress_cache: None,
             upload_cache: PieceCache::default(),
             download_bucket,
@@ -302,6 +311,15 @@ impl TorrentEngine {
     ) {
         self.managed_web_tx = Some(web_tx);
         self.managed_ctl_rx = Some(ctl_rx);
+    }
+
+    /// **Daemon seam.** Hand the engine a shared-acceptor inbound channel.
+    /// When set, the engine skips binding its own TCP/µTP listener and
+    /// instead services inbound connections delivered on `rx` by the
+    /// daemon's one shared acceptor (which has already routed them by
+    /// info_hash and handshaken them). Call before [`Self::run`].
+    pub fn set_managed_inbound(&mut self, rx: mpsc::Receiver<crate::peer::inbound::Inbound>) {
+        self.managed_incoming_rx = Some(rx);
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -426,136 +444,175 @@ impl TorrentEngine {
         peers.set_bind_iface(self.cfg.bind_iface.clone());
         peers.set_anonymous(self.cfg.anonymous);
 
-        // µTP transport (BEP 29): bind a UDP socket on the listen port
-        // when enabled on a clearnet direct path. Still gated off under
-        // anonymous and SOCKS5 — UDP can't ride a SOCKS5 CONNECT, and
-        // anonymous mode wants no UDP egress at all. Under `--bind-iface`
-        // we now DO enable µTP, binding the datagram socket to the same
-        // interface as the TCP path (the VPN kill switch) so it can't
-        // leak onto the default route.
-        let utp_socket: Option<Arc<UtpSocket>> = if self.cfg.utp_enabled
-            && !self.cfg.anonymous
-            && self.cfg.proxies.is_empty()
-        {
-            let bind: SocketAddr = (std::net::Ipv4Addr::UNSPECIFIED, self.cfg.listen_port).into();
-            // With an interface pin, build the UDP socket through the
-            // device-bind helper first; otherwise a plain bind.
-            let built = match &self.cfg.bind_iface {
-                Some(iface) => {
-                    crate::netbind::bind_udp_to_interface(bind, iface).and_then(UtpSocket::from_udp)
-                }
-                None => UtpSocket::bind(bind).await,
-            };
-            match built {
-                Ok(s) => {
-                    match &self.cfg.bind_iface {
-                        Some(iface) => {
-                            tracing::info!(target: "engine", port = self.cfg.listen_port, iface = %iface, "µTP transport enabled (interface-bound)")
-                        }
-                        None => {
-                            tracing::info!(target: "engine", port = self.cfg.listen_port, "µTP transport enabled (TCP+µTP dial race)")
-                        }
-                    }
-                    Some(Arc::new(s))
-                }
-                Err(e) => {
-                    tracing::warn!(target: "engine", error = %e, "µTP bind failed; continuing TCP-only");
-                    None
-                }
-            }
+        // Inbound connections funnel through one channel of `Inbound`
+        // values so the accept path is uniform regardless of source.
+        //
+        // Two modes:
+        //  - managed (daemon): a shared acceptor owns the listener, routes
+        //    by info_hash, and feeds us already-handshaken connections on
+        //    `managed_incoming_rx`. We bind nothing of our own.
+        //  - standalone (single-torrent `download`/`magnet`): we bind our
+        //    own TCP listener (+ µTP socket) on `listen_port` and emit
+        //    `Inbound::Raw` for the per-peer task to handshake — exactly
+        //    the pre-daemon behavior.
+        let (mut incoming_rx, listener_handle): (
+            mpsc::Receiver<crate::peer::inbound::Inbound>,
+            Option<tokio::task::JoinHandle<()>>,
+        ) = if let Some(rx) = self.managed_incoming_rx.take() {
+            tracing::info!(
+                target: "engine",
+                "managed inbound: serving the shared acceptor (no own listener / µTP socket)"
+            );
+            // Outbound µTP dialing is not offered in managed mode (the
+            // daemon's shared transport story is TCP-only for now).
+            peers.set_utp(None);
+            (rx, None)
         } else {
-            None
-        };
-        peers.set_utp(utp_socket.clone());
-
-        // Incoming connections (TCP and/or µTP) funnel through one
-        // channel as `Transport` values so the accept path is uniform.
-        let (incoming_tx, mut incoming_rx) = mpsc::channel::<(Transport, SocketAddr)>(32);
-
-        // µTP inbound accept loop. The per-peer cap + ban list are still
-        // enforced in `accept_incoming`. Skipped under anonymous mode
-        // (no inbound at all then) since `utp_socket` is already None.
-        if let Some(utp) = utp_socket.clone() {
-            let tx = incoming_tx.clone();
-            tokio::spawn(async move {
-                while let Ok((stream, addr)) = utp.accept().await {
-                    if tx.send((Transport::Utp(stream), addr)).await.is_err() {
-                        break; // engine gone
-                    }
-                }
-            });
-        }
-        let listener_handle = if self.cfg.anonymous {
-            drop(incoming_tx);
-            None
-        } else {
-            match bind_dual_stack_listener(self.cfg.listen_port) {
-                Ok(l) => {
-                    tracing::info!(
-                        target: "engine",
-                        port = self.cfg.listen_port,
-                        "listening for incoming peers"
-                    );
-                    Some(tokio::spawn(async move {
-                        // B4 — per-source-IP rate limit on inbound
-                        // connection attempts. A token bucket per IP
-                        // (lazily created on first sight, GC'd to keep
-                        // the map bounded) caps how fast any single
-                        // source can hammer us. We *accept* the TCP
-                        // connection (we have to, to read the source
-                        // IP) and then drop it without engaging the
-                        // handshake when the bucket's dry.
-                        let mut buckets: HashMap<std::net::IpAddr, TokenBucket> = HashMap::new();
-                        let mut last_gc = Instant::now();
-                        loop {
-                            match l.accept().await {
-                                Ok((s, addr)) => {
-                                    let ip = addr.ip();
-                                    let bucket = buckets.entry(ip).or_insert_with(|| {
-                                        // 10 attempts in the first second,
-                                        // then 1/sec sustained — comfortably
-                                        // above any honest peer-discovery
-                                        // pattern, well below the rate a
-                                        // SYN-flood-style probe would use.
-                                        TokenBucket::new(10.0, 1.0)
-                                    });
-                                    if !bucket.try_consume(1.0) {
-                                        tracing::debug!(
-                                            target: "engine",
-                                            %addr,
-                                            "per-IP connect rate limit; dropping"
-                                        );
-                                        drop(s);
-                                        continue;
-                                    }
-                                    // Cheap GC: every 5 minutes drop
-                                    // bucket entries that look full
-                                    // (no recent activity → idle, safe
-                                    // to forget). Keeps the map from
-                                    // growing without bound on a
-                                    // long-lived seeding session.
-                                    if last_gc.elapsed() > Duration::from_secs(300) {
-                                        buckets.retain(|_, b| b.available() < 9.0);
-                                        last_gc = Instant::now();
-                                    }
-                                    if incoming_tx.send((Transport::Tcp(s), addr)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::debug!(target: "engine", error = %e, "accept");
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                }
+            // µTP transport (BEP 29): bind a UDP socket on the listen port
+            // when enabled on a clearnet direct path. Still gated off under
+            // anonymous and SOCKS5 — UDP can't ride a SOCKS5 CONNECT, and
+            // anonymous mode wants no UDP egress at all. Under `--bind-iface`
+            // we now DO enable µTP, binding the datagram socket to the same
+            // interface as the TCP path (the VPN kill switch) so it can't
+            // leak onto the default route.
+            let utp_socket: Option<Arc<UtpSocket>> = if self.cfg.utp_enabled
+                && !self.cfg.anonymous
+                && self.cfg.proxies.is_empty()
+            {
+                let bind: SocketAddr =
+                    (std::net::Ipv4Addr::UNSPECIFIED, self.cfg.listen_port).into();
+                // With an interface pin, build the UDP socket through the
+                // device-bind helper first; otherwise a plain bind.
+                let built = match &self.cfg.bind_iface {
+                    Some(iface) => crate::netbind::bind_udp_to_interface(bind, iface)
+                        .and_then(UtpSocket::from_udp),
+                    None => UtpSocket::bind(bind).await,
+                };
+                match built {
+                    Ok(s) => {
+                        match &self.cfg.bind_iface {
+                            Some(iface) => {
+                                tracing::info!(target: "engine", port = self.cfg.listen_port, iface = %iface, "µTP transport enabled (interface-bound)")
+                            }
+                            None => {
+                                tracing::info!(target: "engine", port = self.cfg.listen_port, "µTP transport enabled (TCP+µTP dial race)")
                             }
                         }
-                    }))
+                        Some(Arc::new(s))
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "engine", error = %e, "µTP bind failed; continuing TCP-only");
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(target: "engine", error = %e, "listener bind failed");
-                    drop(incoming_tx);
-                    None
-                }
+            } else {
+                None
+            };
+            peers.set_utp(utp_socket.clone());
+
+            let (incoming_tx, incoming_rx) = mpsc::channel::<crate::peer::inbound::Inbound>(32);
+
+            // µTP inbound accept loop. The per-peer cap + ban list are still
+            // enforced in `accept_incoming`. Skipped under anonymous mode
+            // (no inbound at all then) since `utp_socket` is already None.
+            if let Some(utp) = utp_socket.clone() {
+                let tx = incoming_tx.clone();
+                tokio::spawn(async move {
+                    while let Ok((stream, addr)) = utp.accept().await {
+                        if tx
+                            .send(crate::peer::inbound::Inbound::Raw(
+                                Transport::Utp(stream),
+                                addr,
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break; // engine gone
+                        }
+                    }
+                });
             }
+            let listener_handle = if self.cfg.anonymous {
+                drop(incoming_tx);
+                None
+            } else {
+                match bind_dual_stack_listener(self.cfg.listen_port) {
+                    Ok(l) => {
+                        tracing::info!(
+                            target: "engine",
+                            port = self.cfg.listen_port,
+                            "listening for incoming peers"
+                        );
+                        Some(tokio::spawn(async move {
+                            // B4 — per-source-IP rate limit on inbound
+                            // connection attempts. A token bucket per IP
+                            // (lazily created on first sight, GC'd to keep
+                            // the map bounded) caps how fast any single
+                            // source can hammer us. We *accept* the TCP
+                            // connection (we have to, to read the source
+                            // IP) and then drop it without engaging the
+                            // handshake when the bucket's dry.
+                            let mut buckets: HashMap<std::net::IpAddr, TokenBucket> =
+                                HashMap::new();
+                            let mut last_gc = Instant::now();
+                            loop {
+                                match l.accept().await {
+                                    Ok((s, addr)) => {
+                                        let ip = addr.ip();
+                                        let bucket = buckets.entry(ip).or_insert_with(|| {
+                                            // 10 attempts in the first second,
+                                            // then 1/sec sustained — comfortably
+                                            // above any honest peer-discovery
+                                            // pattern, well below the rate a
+                                            // SYN-flood-style probe would use.
+                                            TokenBucket::new(10.0, 1.0)
+                                        });
+                                        if !bucket.try_consume(1.0) {
+                                            tracing::debug!(
+                                                target: "engine",
+                                                %addr,
+                                                "per-IP connect rate limit; dropping"
+                                            );
+                                            drop(s);
+                                            continue;
+                                        }
+                                        // Cheap GC: every 5 minutes drop
+                                        // bucket entries that look full
+                                        // (no recent activity → idle, safe
+                                        // to forget). Keeps the map from
+                                        // growing without bound on a
+                                        // long-lived seeding session.
+                                        if last_gc.elapsed() > Duration::from_secs(300) {
+                                            buckets.retain(|_, b| b.available() < 9.0);
+                                            last_gc = Instant::now();
+                                        }
+                                        if incoming_tx
+                                            .send(crate::peer::inbound::Inbound::Raw(
+                                                Transport::Tcp(s),
+                                                addr,
+                                            ))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(target: "engine", error = %e, "accept");
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                    }
+                                }
+                            }
+                        }))
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "engine", error = %e, "listener bind failed");
+                        drop(incoming_tx);
+                        None
+                    }
+                }
+            };
+            (incoming_rx, listener_handle)
         };
 
         let layout = Layout::from_torrent(self.cfg.output_dir.clone(), &self.torrent);
@@ -977,9 +1034,19 @@ impl TorrentEngine {
                         }
                     }
                 }
-                Some((stream, addr)) = incoming_rx.recv() => {
-                    if !peers.accept_incoming(stream, addr) {
-                        tracing::debug!(target: "engine", %addr, "incoming peer rejected");
+                Some(inbound) = incoming_rx.recv() => {
+                    match inbound {
+                        crate::peer::inbound::Inbound::Raw(stream, addr) => {
+                            if !peers.accept_incoming(stream, addr) {
+                                tracing::debug!(target: "engine", %addr, "incoming peer rejected");
+                            }
+                        }
+                        crate::peer::inbound::Inbound::Handshaken(p) => {
+                            let addr = p.addr;
+                            if !peers.accept_handshaken(p) {
+                                tracing::debug!(target: "engine", %addr, "handshaken peer rejected");
+                            }
+                        }
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {

@@ -1,6 +1,7 @@
 pub mod connection;
 pub mod extension;
 pub mod handshake;
+pub mod inbound;
 pub mod manager;
 pub mod message;
 pub mod metadata_fetch;

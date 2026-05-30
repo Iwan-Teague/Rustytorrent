@@ -305,6 +305,39 @@ impl PeerManager {
         true
     }
 
+    /// Accept a connection the shared acceptor already handshook (daemon
+    /// path). Honors the same max-peer cap and ban list as
+    /// [`accept_incoming`](Self::accept_incoming); returns false if
+    /// rejected. The acceptor verified the info_hash during the handshake,
+    /// so by the time we get here the peer is known to be in our swarm.
+    pub fn accept_handshaken(&mut self, peer: crate::peer::inbound::HandshakenPeer) -> bool {
+        let addr = peer.addr;
+        if self.peers.len() >= self.max_peers || self.peers.contains_key(&addr) {
+            return false;
+        }
+        if self.banned.contains(&addr.ip()) {
+            return false;
+        }
+        let (cmd_tx, cmd_rx) = mpsc::channel(PER_PEER_CMD_BUFFER);
+        let event_tx = self.event_tx.clone();
+        let anonymous = self.anonymous;
+        let task = tokio::spawn(async move {
+            if let Err(e) =
+                crate::peer::connection::run_handshaken(peer, event_tx, cmd_rx, anonymous).await
+            {
+                tracing::debug!(target: "peer", %addr, error = %e, "handshaken peer task ended");
+            }
+        });
+        self.peers.insert(
+            addr,
+            PeerSlot {
+                handle: cmd_tx,
+                task,
+            },
+        );
+        true
+    }
+
     /// Mark a peer slot freed because the engine observed `Disconnected`.
     pub fn forget(&mut self, addr: &SocketAddr) {
         if let Some(slot) = self.peers.remove(addr) {

@@ -568,6 +568,50 @@ pub async fn run_with_stream(
     outcome
 }
 
+/// Run a peer task for a connection the *shared acceptor* already drove
+/// through the full handshake (plain or MSE). The acceptor owns the
+/// handshake because an MSE peer's info_hash is only knowable after the
+/// DH exchange; here we just emit `Connected`, run the post-handshake
+/// loop on the supplied (type-erased) reader/writer, and emit
+/// `Disconnected` on exit — mirroring [`run_with_stream`] so the engine
+/// sees the same event lifecycle regardless of which path accepted the
+/// peer.
+pub async fn run_handshaken(
+    peer: crate::peer::inbound::HandshakenPeer,
+    event_tx: mpsc::Sender<PeerEvent>,
+    cmd_rx: mpsc::Receiver<PeerCommand>,
+    anonymous: bool,
+) -> Result<()> {
+    let crate::peer::inbound::HandshakenPeer {
+        addr,
+        peer_id,
+        supports_ext,
+        reader,
+        writer,
+        ..
+    } = peer;
+    let _ = event_tx.send(PeerEvent::Connected { addr, peer_id }).await;
+    let outcome = post_handshake_loop(
+        reader,
+        writer,
+        addr,
+        event_tx.clone(),
+        cmd_rx,
+        supports_ext,
+        anonymous,
+    )
+    .await;
+    let (reason, violation) = classify_outcome(&outcome);
+    let _ = event_tx
+        .send(PeerEvent::Disconnected {
+            addr,
+            reason,
+            violation,
+        })
+        .await;
+    outcome
+}
+
 /// Plain BT handshake on an already-connected stream, then the standard
 /// post-handshake loop.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct dial-time knob
