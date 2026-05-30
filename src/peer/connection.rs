@@ -882,24 +882,38 @@ where
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     let Some(cmd) = cmd else { return Ok(()); };
-                    let bytes = match cmd {
-                        PeerCommand::Request { index, begin, length } =>
-                            Message::Request { index, begin, length }.encode(),
-                        PeerCommand::Cancel { index, begin, length } =>
-                            Message::Cancel { index, begin, length }.encode(),
-                        PeerCommand::Have(i) => Message::Have(i).encode(),
-                        PeerCommand::Choke => Message::Choke.encode(),
-                        PeerCommand::Unchoke => Message::Unchoke.encode(),
-                        PeerCommand::Interested => Message::Interested.encode(),
-                        PeerCommand::NotInterested => Message::NotInterested.encode(),
-                        PeerCommand::Piece { index, begin, data } =>
-                            Message::Piece { index, begin, data }.encode(),
-                        PeerCommand::Bitfield(b) => Message::Bitfield(b).encode(),
-                        PeerCommand::Extension { ext_id, payload } =>
-                            Message::Extended { ext_id, payload }.encode(),
-                    };
-                    writer.write_all(&bytes).await
-                        .map_err(|e| Error::Network(format!("write: {e}")))?;
+                    match cmd {
+                        // Upload-hot path: route Piece through write_message,
+                        // whose specialized branch builds the wire frame in a
+                        // single pass. Going via encode() here would copy the
+                        // (up to 16 KiB) block twice (payload scratch + tag).
+                        PeerCommand::Piece { index, begin, data } => {
+                            crate::peer::message::write_message(
+                                &mut writer,
+                                &Message::Piece { index, begin, data },
+                            )
+                            .await?;
+                        }
+                        other => {
+                            let bytes = match other {
+                                PeerCommand::Request { index, begin, length } =>
+                                    Message::Request { index, begin, length }.encode(),
+                                PeerCommand::Cancel { index, begin, length } =>
+                                    Message::Cancel { index, begin, length }.encode(),
+                                PeerCommand::Have(i) => Message::Have(i).encode(),
+                                PeerCommand::Choke => Message::Choke.encode(),
+                                PeerCommand::Unchoke => Message::Unchoke.encode(),
+                                PeerCommand::Interested => Message::Interested.encode(),
+                                PeerCommand::NotInterested => Message::NotInterested.encode(),
+                                PeerCommand::Piece { .. } => unreachable!("handled above"),
+                                PeerCommand::Bitfield(b) => Message::Bitfield(b).encode(),
+                                PeerCommand::Extension { ext_id, payload } =>
+                                    Message::Extended { ext_id, payload }.encode(),
+                            };
+                            writer.write_all(&bytes).await
+                                .map_err(|e| Error::Network(format!("write: {e}")))?;
+                        }
+                    }
                     last_send = Instant::now();
                 }
                 _ = tokio::time::sleep(until_next_keepalive) => {

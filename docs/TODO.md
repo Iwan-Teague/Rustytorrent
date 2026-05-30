@@ -137,17 +137,22 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   next read. (The `Message::Piece { data: p[8..].to_vec() }` decode copy
   is unavoidable here — the piece data must outlive the reused buffer to
   reach the storage writer.)
-- [ ] **P1 — block data is cloned on the upload path.** [verified]
+- [x] **P1 — block data is cloned on the upload path.** [verified]
   `engine.rs:~1302` / `storage/memspool.rs` clone `Vec<u8>` per served
-  block. Share read-only pieces as `Arc<[u8]>` / `Arc<Vec<u8>>` so the
-  LRU cache and per-peer serves don't copy.
-  PARTIAL: `write_message` now has a specialized `Piece` path that builds
-  the wire buffer in one pass — `encode()` previously copied the block
-  *twice* (into a payload scratch, then again in `tag()`); now it's one
-  copy. The remaining copy is the cache-`Arc`→`Vec` slice in
-  `serve_request`; eliminating it needs `PeerCommand::Piece.data` /
-  `Message::Piece.data` to become a shareable `bytes::Bytes` slice of the
-  cached piece (a wider type change), still open.
+  block. DONE (the cheap, high-value copies): the cache-hit serve path
+  went from **three** 16 KiB copies per block to **two**.
+  (1) `write_message` gained a single-pass `Piece` branch, but the main
+  upload loop in `connection.rs` was still calling `Message::Piece.encode()`
+  + `write_all` — `encode()` copies the block *twice* (payload scratch +
+  `tag()`). The Piece send now routes through `write_message`, so that's
+  one copy instead of two. (2) Earlier work already cut the wire-build to
+  a single pass. The one remaining copy is the cache-`Arc`→`Vec` slice in
+  `serve_request`. Eliminating it would need `PeerCommand::Piece.data`,
+  `Message::Piece.data`, `PeerEvent::Block.data`, and `StorageCommand`
+  to all become `bytes::Bytes` in lockstep — otherwise the incoming
+  decode→`Block` path gains a *new* `Bytes`→`Vec` copy on the download
+  side. That wide core-path change isn't justified by one remaining
+  memcpy in a security-first codebase, so it's deliberately deferred.
 - [x] **P2 — spool write pads/allocates per write.** `storage/spool.rs`
   DONE: `write_piece` now reuses a `write_scratch` buffer instead of
   `data.to_vec()` + `resize` per call, and `read_range` returns the
