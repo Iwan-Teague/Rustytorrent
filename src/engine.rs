@@ -169,6 +169,11 @@ pub struct TorrentEngine {
     downloaded: u64,
     start_time: Instant,
     last_progress: Instant,
+    /// Last `(instant, downloaded, uploaded)` sample, for computing the
+    /// *instantaneous* transfer rate between progress ticks (the web UI
+    /// wants current speed, not the session average). `None` until the
+    /// first sample.
+    rate_last: Option<(Instant, u64, u64)>,
     /// In-memory LRU of whole pieces, populated on each upload-side miss.
     /// Lets us serve all blocks of a popular piece from RAM after the first
     /// read instead of going back to disk per-block.
@@ -225,6 +230,7 @@ impl TorrentEngine {
             downloaded: 0,
             start_time: Instant::now(),
             last_progress: Instant::now(),
+            rate_last: None,
             upload_cache: PieceCache::default(),
             download_bucket,
             upload_bucket,
@@ -677,7 +683,7 @@ impl TorrentEngine {
         // non-fatal — monitoring must never take down a download.
         let web_tx: Option<tokio::sync::watch::Sender<EngineStats>> = match self.cfg.web_port {
             Some(port) => {
-                let (tx, rx) = tokio::sync::watch::channel(self.build_stats(Vec::new()));
+                let (tx, rx) = tokio::sync::watch::channel(self.build_stats(Vec::new(), 0, 0));
                 tokio::spawn(crate::web::serve(port, rx));
                 Some(tx)
             }
@@ -770,9 +776,25 @@ impl TorrentEngine {
                 }
                 _ = progress_timer.tick() => {
                     self.log_progress();
-                    if let Some(tx) = &web_tx {
+                    if web_tx.is_some() {
+                        // Instantaneous rates over the interval since the
+                        // last sample (the UI wants current speed).
+                        let now = Instant::now();
+                        let (down_rate, up_rate) = match self.rate_last {
+                            Some((t0, d0, u0)) => {
+                                let dt = now.duration_since(t0).as_secs_f64().max(0.001);
+                                (
+                                    (self.downloaded.saturating_sub(d0) as f64 / dt) as u64,
+                                    (self.uploaded.saturating_sub(u0) as f64 / dt) as u64,
+                                )
+                            }
+                            None => (0, 0),
+                        };
+                        self.rate_last = Some((now, self.downloaded, self.uploaded));
                         let addrs: Vec<String> = peers.addrs().map(|a| a.to_string()).collect();
-                        let _ = tx.send(self.build_stats(addrs));
+                        if let Some(tx) = &web_tx {
+                            let _ = tx.send(self.build_stats(addrs, down_rate, up_rate));
+                        }
                     }
                 }
                 _ = violation_gc_timer.tick() => {
@@ -1405,9 +1427,7 @@ impl TorrentEngine {
     /// Build a stats snapshot for the web monitoring layer. The peer
     /// addresses come from the `PeerManager` (which lives in `run`'s
     /// scope, not on `self`), so the caller passes them in.
-    fn build_stats(&self, peers: Vec<String>) -> EngineStats {
-        let secs = self.start_time.elapsed().as_secs_f64().max(0.001);
-        let down_rate_bps = (self.downloaded as f64 / secs) as u64;
+    fn build_stats(&self, peers: Vec<String>, down_rate_bps: u64, up_rate_bps: u64) -> EngineStats {
         EngineStats {
             name: self.torrent.info.name.clone(),
             info_hash: hex_lower(&self.torrent.info_hash),
@@ -1419,6 +1439,7 @@ impl TorrentEngine {
             peers_connected: peers.len(),
             elapsed_secs: self.start_time.elapsed().as_secs(),
             down_rate_bps,
+            up_rate_bps,
             complete: self.pm.is_complete(),
             peers,
         }

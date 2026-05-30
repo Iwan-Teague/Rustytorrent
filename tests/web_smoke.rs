@@ -17,6 +17,7 @@ fn sample() -> EngineStats {
         peers_connected: 4,
         elapsed_secs: 5,
         down_rate_bps: 60,
+        up_rate_bps: 10,
         complete: false,
         peers: vec!["10.0.0.1:6881".into(), "10.0.0.2:6881".into()],
     }

@@ -52,8 +52,12 @@ pub struct EngineStats {
     pub peers_connected: usize,
     /// Seconds since the engine started.
     pub elapsed_secs: u64,
-    /// Average download rate over the session, bytes/sec.
+    /// Instantaneous download rate (over the last progress interval),
+    /// bytes/sec.
     pub down_rate_bps: u64,
+    /// Instantaneous upload rate (over the last progress interval),
+    /// bytes/sec.
+    pub up_rate_bps: u64,
     /// True once every piece is downloaded.
     pub complete: bool,
     /// Addresses of the currently-connected peers (`ip:port`). Loopback-
@@ -122,9 +126,15 @@ impl EngineStats {
         );
         metric(
             "down_rate_bps",
-            "Average download rate, bytes/sec",
+            "Instantaneous download rate, bytes/sec",
             "gauge",
             self.down_rate_bps.to_string(),
+        );
+        metric(
+            "up_rate_bps",
+            "Instantaneous upload rate, bytes/sec",
+            "gauge",
+            self.up_rate_bps.to_string(),
         );
         metric(
             "complete",
@@ -214,7 +224,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <span class="k">Pieces</span><span id="pieces">—</span>
     <span class="k">Downloaded</span><span id="down">—</span>
     <span class="k">Uploaded</span><span id="up">—</span>
-    <span class="k">Rate</span><span id="rate">—</span>
+    <span class="k">Down rate</span><span id="rate">—</span>
+    <span class="k">Up rate</span><span id="urate">—</span>
     <span class="k">Peers</span><span id="peers">—</span>
     <span class="k">Elapsed</span><span id="elapsed">—</span>
     <span class="k">Info hash</span><span class="mono" id="ih">—</span>
@@ -246,6 +257,7 @@ async function tick() {
     document.getElementById("down").textContent = fmtBytes(s.downloaded_bytes) + " / " + fmtBytes(s.total_bytes);
     document.getElementById("up").textContent = fmtBytes(s.uploaded_bytes);
     document.getElementById("rate").textContent = fmtBytes(s.down_rate_bps) + "/s";
+    document.getElementById("urate").textContent = fmtBytes(s.up_rate_bps) + "/s";
     document.getElementById("peers").textContent = s.peers_connected;
     document.getElementById("elapsed").textContent = fmtDur(s.elapsed_secs);
     document.getElementById("ih").textContent = s.info_hash;
@@ -283,6 +295,7 @@ mod tests {
             peers_connected: 7,
             elapsed_secs: 90,
             down_rate_bps: 11_000,
+            up_rate_bps: 2_000,
             complete: false,
             peers: vec!["1.2.3.4:6881".into(), "[::1]:51413".into()],
         }
@@ -319,8 +332,11 @@ mod tests {
         assert!(p.contains(
             "rustytorrent_complete{info_hash=\"0123456789abcdef0123456789abcdef01234567\"} 0"
         ));
+        assert!(p.contains(
+            "rustytorrent_up_rate_bps{info_hash=\"0123456789abcdef0123456789abcdef01234567\"} 2000"
+        ));
         // Every metric must carry HELP + TYPE lines.
         assert_eq!(p.matches("# HELP ").count(), p.matches("# TYPE ").count());
-        assert!(p.matches("# TYPE ").count() >= 8);
+        assert!(p.matches("# TYPE ").count() >= 9);
     }
 }
