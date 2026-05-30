@@ -32,10 +32,12 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   forbids `unsafe`, and that it's acceptable because MSE is
   obfuscation-only with ephemeral keys (the derived RC4 state IS
   `ZeroizeOnDrop`). No longer overstates the guarantee.
-- [ ] **P2 — bencode `parse_bytes` defensive bound.** [verified]
+- [x] **P2 — bencode `parse_bytes` defensive bound.** [verified]
   `metainfo/bencode.rs` guards `rest.len() < len` before `split_at(len)`,
-  so it's safe today, but add an explicit pre-check comment / assert so a
-  future refactor can't reintroduce a panic path.
+  so it's safe today. DONE: added an explicit comment noting `len` is
+  attacker-controlled and that `split_at` panics if unbounded, plus a
+  `debug_assert!(len <= rest.len())` immediately before the split to pin
+  the invariant against a future refactor.
 - [ ] **P2 — ut_metadata per-session memory budget.** [verified cap]
   `peer/extension.rs` caps a single `metadata_size` at 100 MB, but a peer
   flood across many connections could each allocate up to that. Add a

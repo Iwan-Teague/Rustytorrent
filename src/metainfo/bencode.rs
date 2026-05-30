@@ -177,6 +177,12 @@ fn parse_bytes(input: &[u8]) -> Result<(BencodeValue, &[u8])> {
         .parse()
         .map_err(|e| Error::Bencode(format!("byte string len: {e}")))?;
     let rest = &input[colon + 1..];
+    // Bound check BEFORE split_at. `len` is attacker-controlled (a peer's
+    // metadata or a hostile .torrent can claim any length), and
+    // `split_at(len)` panics if `len > rest.len()`. This guard converts
+    // that into a clean parse error. Do not remove or reorder it: the
+    // debug_assert below pins the invariant so a future refactor can't
+    // silently reintroduce the panic path.
     if rest.len() < len {
         return Err(Error::Bencode(format!(
             "byte string too short: need {} have {}",
@@ -184,6 +190,7 @@ fn parse_bytes(input: &[u8]) -> Result<(BencodeValue, &[u8])> {
             rest.len()
         )));
     }
+    debug_assert!(len <= rest.len(), "split_at bound must hold before split");
     let (val, rest) = rest.split_at(len);
     Ok((BencodeValue::Bytes(val.to_vec()), rest))
 }
