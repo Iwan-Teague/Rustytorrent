@@ -216,6 +216,40 @@ where
     Ok(buf)
 }
 
+/// Like [`read_frame`], but reads the body into a caller-owned buffer
+/// that's reused across calls, saving one allocation per frame on the
+/// hot read path. `buf` is resized to the frame length and filled; the
+/// frame contents are `&buf[..]` on success. A zero-length (keep-alive)
+/// frame clears `buf`. The buffer's capacity is retained between calls,
+/// so steady-state reads do no allocation once it has grown to the
+/// largest frame seen. Safe because `Message::decode` copies every
+/// variable-length field into an owned `Vec`, so the borrow ends before
+/// the next read overwrites the buffer.
+pub async fn read_frame_into<R>(reader: &mut R, max_len: u32, buf: &mut Vec<u8>) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut len_buf = [0u8; 4];
+    reader
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| Error::Network(format!("frame len: {e}")))?;
+    let len = u32::from_be_bytes(len_buf);
+    if len > max_len {
+        return Err(Error::Network(format!("frame too large: {len}")));
+    }
+    buf.clear();
+    if len == 0 {
+        return Ok(());
+    }
+    buf.resize(len as usize, 0);
+    reader
+        .read_exact(buf)
+        .await
+        .map_err(|e| Error::Network(format!("frame body: {e}")))?;
+    Ok(())
+}
+
 /// Write a single wire frame. `payload` is `[id][body…]` or empty for keep-alive.
 pub async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> Result<()>
 where
@@ -439,5 +473,42 @@ mod tests {
         let frame = read_frame(&mut b, 1024).await.unwrap();
         assert!(frame.is_empty());
         assert_eq!(Message::decode(&frame).unwrap(), Message::KeepAlive);
+    }
+
+    #[tokio::test]
+    async fn read_frame_into_reuses_buffer_across_frames() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        // A large frame then a small one, to exercise resize-down.
+        let big = Message::Bitfield(vec![0xAB; 1000]);
+        let small = Message::Have(7);
+        let big_bytes = big.encode();
+        let small_bytes = small.encode();
+        write_frame(&mut a, &big_bytes[4..]).await.unwrap();
+        write_frame(&mut a, &small_bytes[4..]).await.unwrap();
+
+        let mut buf = Vec::new();
+        read_frame_into(&mut b, 1 << 20, &mut buf).await.unwrap();
+        assert_eq!(Message::decode(&buf).unwrap(), big);
+        let cap_after_big = buf.capacity();
+        assert!(cap_after_big >= 1000);
+
+        read_frame_into(&mut b, 1 << 20, &mut buf).await.unwrap();
+        assert_eq!(Message::decode(&buf).unwrap(), small);
+        // Capacity retained — no shrink, so the next big frame reuses it.
+        assert_eq!(buf.capacity(), cap_after_big);
+
+        // Keep-alive clears the buffer but keeps capacity.
+        write_frame(&mut a, &[]).await.unwrap();
+        read_frame_into(&mut b, 1 << 20, &mut buf).await.unwrap();
+        assert!(buf.is_empty());
+        assert_eq!(Message::decode(&buf).unwrap(), Message::KeepAlive);
+    }
+
+    #[tokio::test]
+    async fn read_frame_into_rejects_oversize() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        write_frame(&mut a, &[0u8; 10]).await.unwrap();
+        let mut buf = Vec::new();
+        assert!(read_frame_into(&mut b, 4, &mut buf).await.is_err());
     }
 }

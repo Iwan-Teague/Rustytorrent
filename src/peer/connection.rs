@@ -9,7 +9,7 @@ use tokio::time::{timeout, Instant};
 
 use crate::error::{Error, Result};
 use crate::peer::handshake::Handshake;
-use crate::peer::message::{read_frame, write_frame, Message, BLOCK_SIZE};
+use crate::peer::message::{read_frame_into, write_frame, Message, BLOCK_SIZE};
 use crate::peer::mse;
 use crate::peer::transport::Transport;
 use crate::peer::utp::UtpSocket;
@@ -750,8 +750,11 @@ where
     let read_task = tokio::spawn(async move {
         let res: Result<()> = async {
             let mut request_bucket = TokenBucket::new(REQUEST_BURST_TOKENS, REQUEST_TOKENS_PER_SEC);
+            // Reused across frames so the steady-state read path allocates
+            // nothing once it's grown to the largest frame seen.
+            let mut frame = Vec::new();
             loop {
-                let frame = read_frame(&mut reader, MAX_FRAME_LEN).await?;
+                read_frame_into(&mut reader, MAX_FRAME_LEN, &mut frame).await?;
                 let msg = Message::decode(&frame)?;
                 // B3 — throttle inbound Request messages per peer. Drop the
                 // event when the bucket's dry; the peer will re-request

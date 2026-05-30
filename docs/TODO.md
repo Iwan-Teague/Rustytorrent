@@ -91,11 +91,16 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   each ~2 s, and `build_stats` re-collects connected-peer addresses every
   tick. Update per-file completion incrementally on piece-complete events
   and cache the peer list, updating on connect/disconnect.
-- [ ] **P1 — `read_frame` allocates a fresh `Vec` per wire frame.**
+- [x] **P1 — `read_frame` allocates a fresh `Vec` per wire frame.**
   [verified] `peer/message.rs:211` `vec![0u8; len]` per frame (per 16 KiB
-  block on the download path). Reuse a per-peer buffer or adopt
-  `bytes::BytesMut`. Same for `Message::Piece { data: p[8..].to_vec() }`
-  decode copy.
+  block on the download path). DONE: added `read_frame_into(reader,
+  max_len, &mut buf)` reading into a per-peer reusable `Vec` (capacity
+  retained across frames); the read loop in `connection.rs` now allocates
+  nothing in steady state. Safe because `Message::decode` copies every
+  variable-length field into an owned `Vec`, so the borrow ends before the
+  next read. (The `Message::Piece { data: p[8..].to_vec() }` decode copy
+  is unavoidable here — the piece data must outlive the reused buffer to
+  reach the storage writer.)
 - [ ] **P1 — block data is cloned on the upload path.** [verified]
   `engine.rs:~1302` / `storage/memspool.rs` clone `Vec<u8>` per served
   block. Share read-only pieces as `Arc<[u8]>` / `Arc<Vec<u8>>` so the
