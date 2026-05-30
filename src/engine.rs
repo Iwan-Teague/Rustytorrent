@@ -677,7 +677,7 @@ impl TorrentEngine {
         // non-fatal — monitoring must never take down a download.
         let web_tx: Option<tokio::sync::watch::Sender<EngineStats>> = match self.cfg.web_port {
             Some(port) => {
-                let (tx, rx) = tokio::sync::watch::channel(self.build_stats(0));
+                let (tx, rx) = tokio::sync::watch::channel(self.build_stats(Vec::new()));
                 tokio::spawn(crate::web::serve(port, rx));
                 Some(tx)
             }
@@ -771,7 +771,8 @@ impl TorrentEngine {
                 _ = progress_timer.tick() => {
                     self.log_progress();
                     if let Some(tx) = &web_tx {
-                        let _ = tx.send(self.build_stats(peers.connected_count()));
+                        let addrs: Vec<String> = peers.addrs().map(|a| a.to_string()).collect();
+                        let _ = tx.send(self.build_stats(addrs));
                     }
                 }
                 _ = violation_gc_timer.tick() => {
@@ -1401,10 +1402,10 @@ impl TorrentEngine {
         }
     }
 
-    /// Build a stats snapshot for the web monitoring layer. `peers_connected`
-    /// comes from the `PeerManager` (which lives in `run`'s scope, not on
-    /// `self`), so the caller passes it in.
-    fn build_stats(&self, peers_connected: usize) -> EngineStats {
+    /// Build a stats snapshot for the web monitoring layer. The peer
+    /// addresses come from the `PeerManager` (which lives in `run`'s
+    /// scope, not on `self`), so the caller passes them in.
+    fn build_stats(&self, peers: Vec<String>) -> EngineStats {
         let secs = self.start_time.elapsed().as_secs_f64().max(0.001);
         let down_rate_bps = (self.downloaded as f64 / secs) as u64;
         EngineStats {
@@ -1415,10 +1416,11 @@ impl TorrentEngine {
             downloaded_bytes: self.downloaded,
             uploaded_bytes: self.uploaded,
             total_bytes: self.torrent.total_length(),
-            peers_connected,
+            peers_connected: peers.len(),
             elapsed_secs: self.start_time.elapsed().as_secs(),
             down_rate_bps,
             complete: self.pm.is_complete(),
+            peers,
         }
     }
 

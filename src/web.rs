@@ -56,6 +56,9 @@ pub struct EngineStats {
     pub down_rate_bps: u64,
     /// True once every piece is downloaded.
     pub complete: bool,
+    /// Addresses of the currently-connected peers (`ip:port`). Loopback-
+    /// only endpoint, so listing the swarm we're talking to is fine.
+    pub peers: Vec<String>,
 }
 
 impl EngineStats {
@@ -139,6 +142,7 @@ pub fn router(rx: watch::Receiver<EngineStats>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/status", get(status_json))
+        .route("/api/peers", get(peers_json))
         .route("/metrics", get(metrics))
         .with_state(rx)
 }
@@ -167,6 +171,11 @@ async fn status_json(State(rx): State<watch::Receiver<EngineStats>>) -> impl Int
     let stats = rx.borrow().clone();
     // Hand to axum's Json so the name field is correctly escaped.
     axum::Json(stats)
+}
+
+async fn peers_json(State(rx): State<watch::Receiver<EngineStats>>) -> impl IntoResponse {
+    let peers = rx.borrow().peers.clone();
+    axum::Json(peers)
 }
 
 async fn metrics(State(rx): State<watch::Receiver<EngineStats>>) -> impl IntoResponse {
@@ -210,6 +219,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <span class="k">Elapsed</span><span id="elapsed">—</span>
     <span class="k">Info hash</span><span class="mono" id="ih">—</span>
   </div>
+  <details style="margin-top:1rem">
+    <summary class="k">Connected peers (<span id="pcount">0</span>)</summary>
+    <ul class="mono" id="peers" style="margin:.5rem 0 0; padding-left:1.25rem"></ul>
+  </details>
 <script>
 const fmtBytes = b => {
   const u = ["B","KiB","MiB","GiB","TiB"]; let i = 0; b = Number(b);
@@ -236,6 +249,16 @@ async function tick() {
     document.getElementById("peers").textContent = s.peers_connected;
     document.getElementById("elapsed").textContent = fmtDur(s.elapsed_secs);
     document.getElementById("ih").textContent = s.info_hash;
+    const peers = s.peers || [];
+    document.getElementById("pcount").textContent = peers.length;
+    const ul = document.getElementById("peers");
+    ul.innerHTML = "";
+    for (const p of peers) {
+      const li = document.createElement("li");
+      li.textContent = p; // textContent — never innerHTML, so a hostile
+                          // peer address can't inject markup
+      ul.appendChild(li);
+    }
   } catch (e) { /* engine gone or starting — keep last values */ }
 }
 tick(); setInterval(tick, 1000);
@@ -261,6 +284,7 @@ mod tests {
             elapsed_secs: 90,
             down_rate_bps: 11_000,
             complete: false,
+            peers: vec!["1.2.3.4:6881".into(), "[::1]:51413".into()],
         }
     }
 

@@ -18,6 +18,7 @@ fn sample() -> EngineStats {
         elapsed_secs: 5,
         down_rate_bps: 60,
         complete: false,
+        peers: vec!["10.0.0.1:6881".into(), "10.0.0.2:6881".into()],
     }
 }
 
@@ -47,6 +48,21 @@ async fn serves_status_metrics_and_index() {
     assert_eq!(v["total_pieces"], 10);
     assert_eq!(v["peers_connected"], 4);
     assert_eq!(v["name"], "demo");
+
+    // Peer list endpoint returns the connected addresses.
+    let peers: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/api/peers"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(peers.as_array().unwrap().len(), 2);
+    assert_eq!(peers[0], "10.0.0.1:6881");
 
     // Prometheus endpoint exposes the series with the info_hash label.
     let metrics = client
