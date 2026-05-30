@@ -121,6 +121,8 @@ rustytorrent download <file> [OPTIONS]
                             (status page + /api/status JSON + /metrics)
   --select SUBSTR           selective download: only fetch files whose path
                             contains SUBSTR (repeatable; multi-file torrents)
+  --sequential              fetch pieces in order (stream media while it
+                            downloads) instead of rarest-first
 
 rustytorrent decrypt <file> [OPTIONS]      # extract a --paranoid spool afterwards
 
