@@ -205,6 +205,14 @@ pub struct TorrentEngine {
     /// Download paused via the control API: while true we issue no new
     /// block requests (in-flight ones still land; uploads continue).
     paused: bool,
+    /// **Daemon seam.** When set (via [`Self::set_managed`]), `run`
+    /// publishes stats into this externally-owned channel and reads
+    /// control from the supplied receiver instead of creating its own +
+    /// spawning a web server. A `SessionManager` uses this to host the
+    /// engine behind one shared web/control surface. `None` →
+    /// standalone behaviour (create channels, spawn web iff `web_port`).
+    managed_web_tx: Option<tokio::sync::watch::Sender<EngineStats>>,
+    managed_ctl_rx: Option<mpsc::Receiver<EngineControl>>,
     /// In-memory LRU of whole pieces, populated on each upload-side miss.
     /// Lets us serve all blocks of a popular piece from RAM after the first
     /// read instead of going back to disk per-block.
@@ -263,12 +271,29 @@ impl TorrentEngine {
             last_progress: Instant::now(),
             rate_last: None,
             paused: false,
+            managed_web_tx: None,
+            managed_ctl_rx: None,
             upload_cache: PieceCache::default(),
             download_bucket,
             upload_bucket,
             peer_pex_ids: HashMap::new(),
             peer_pex_snapshot: HashMap::new(),
         }
+    }
+
+    /// **Daemon seam.** Hand the engine externally-owned stats/control
+    /// channels: `run` will publish [`EngineStats`] into `web_tx` and
+    /// read [`EngineControl`] from `ctl_rx` instead of creating its own
+    /// and spawning a web server. Call before [`Self::run`]. A
+    /// `SessionManager` keeps the matching `watch::Receiver` +
+    /// `mpsc::Sender` to drive and observe the session.
+    pub fn set_managed(
+        &mut self,
+        web_tx: tokio::sync::watch::Sender<EngineStats>,
+        ctl_rx: mpsc::Receiver<EngineControl>,
+    ) {
+        self.managed_web_tx = Some(web_tx);
+        self.managed_ctl_rx = Some(ctl_rx);
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -743,21 +768,33 @@ impl TorrentEngine {
         // tick; the axum server (loopback only) serves whatever the
         // latest value is. A bind failure inside `web::serve` is
         // non-fatal — monitoring must never take down a download.
-        // Control channel: the web server (pause/resume) sends commands
-        // into the loop. Always created so the select arm is uniform;
-        // when web is off the sender is dropped and the arm goes inert.
-        let (ctl_tx, mut ctl_rx) = mpsc::channel::<EngineControl>(8);
-        let web_tx: Option<tokio::sync::watch::Sender<EngineStats>> = match self.cfg.web_port {
-            Some(port) => {
-                let (tx, rx) =
-                    tokio::sync::watch::channel(self.build_stats(Vec::new(), 0, 0, Vec::new()));
-                tokio::spawn(crate::web::serve(port, rx, ctl_tx));
-                Some(tx)
-            }
-            None => {
-                drop(ctl_tx);
-                None
-            }
+        // Stats + control wiring. Two modes:
+        //  - daemon-driven: a SessionManager supplied the channels via
+        //    `set_managed`; use them and do NOT spawn our own web server
+        //    (the daemon owns one shared server for all sessions).
+        //  - standalone: create the channels ourselves and spawn the web
+        //    server iff `--web` was given (the control sender is dropped
+        //    when web is off so the select arm goes inert).
+        let (web_tx, mut ctl_rx): (
+            Option<tokio::sync::watch::Sender<EngineStats>>,
+            mpsc::Receiver<EngineControl>,
+        ) = if let Some(rx) = self.managed_ctl_rx.take() {
+            (self.managed_web_tx.take(), rx)
+        } else {
+            let (ctl_tx, ctl_rx) = mpsc::channel::<EngineControl>(8);
+            let web_tx = match self.cfg.web_port {
+                Some(port) => {
+                    let (tx, rx) =
+                        tokio::sync::watch::channel(self.build_stats(Vec::new(), 0, 0, Vec::new()));
+                    tokio::spawn(crate::web::serve(port, rx, ctl_tx));
+                    Some(tx)
+                }
+                None => {
+                    drop(ctl_tx);
+                    None
+                }
+            };
+            (web_tx, ctl_rx)
         };
 
         // C2 — engage the seccomp sandbox last in startup. By now the
