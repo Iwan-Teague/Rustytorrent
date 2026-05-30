@@ -54,6 +54,55 @@ use crate::socks5::{self, ProxyConfig};
 /// Cap parallel dials during bootstrap. Higher = faster on average but
 /// more connections opened that we'll just drop after the first success.
 const MAX_CONCURRENT_FETCH: usize = 16;
+
+/// Process-wide ceiling on metadata-assembly memory in flight. The
+/// per-peer cap (`MAX_METADATA_SIZE`, 100 MB in extension.rs) bounds one
+/// dial, but `MAX_CONCURRENT_FETCH` of them — across every concurrent
+/// magnet — could each allocate up to that (16 × 100 MB = 1.6 GB per
+/// magnet, more with several magnets). This shared budget bounds the
+/// total: a fetch must reserve its `total_size` here before allocating
+/// the assembly buffer, and is refused if that would exceed the ceiling.
+/// 256 MB comfortably fits any real torrent's info dict (normally
+/// <100 KB; even a multi-TB torrent's piece-hash string is tens of MB)
+/// while capping a flood. The common case never comes near it.
+const GLOBAL_METADATA_BUDGET: usize = 256 * 1024 * 1024;
+static METADATA_BYTES_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII reservation against [`GLOBAL_METADATA_BUDGET`]. Releases the
+/// bytes on drop (whether the fetch succeeded, errored, or was aborted),
+/// so a panicking or timed-out dial can't leak budget.
+struct MetadataReservation(usize);
+
+impl MetadataReservation {
+    /// Try to reserve `bytes`. Returns `None` if it would exceed the
+    /// global budget, leaving the counter unchanged.
+    fn try_acquire(bytes: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut cur = METADATA_BYTES_IN_FLIGHT.load(Ordering::Relaxed);
+        loop {
+            let next = cur.checked_add(bytes)?;
+            if next > GLOBAL_METADATA_BUDGET {
+                return None;
+            }
+            match METADATA_BYTES_IN_FLIGHT.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self(bytes)),
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+}
+
+impl Drop for MetadataReservation {
+    fn drop(&mut self) {
+        METADATA_BYTES_IN_FLIGHT.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 /// Per-peer step timeouts. Generous because peers behind slow links
 /// genuinely take seconds to respond to ut_metadata requests.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -275,6 +324,15 @@ where
         Error::Network("peer doesn't advertise metadata_size — can't bootstrap".into())
     })?;
 
+    // Reserve the assembly memory against the process-wide budget BEFORE
+    // allocating. Held for the duration of this fetch; released on drop
+    // (success, error, or abort) by the RAII guard.
+    let _budget = MetadataReservation::try_acquire(total_size as usize).ok_or_else(|| {
+        Error::Network(format!(
+            "metadata fetch refused: {total_size} bytes would exceed the global budget"
+        ))
+    })?;
+
     // Request pieces 0..ceil(total_size / METADATA_PIECE_SIZE), assemble.
     let num_pieces = (total_size as usize).div_ceil(METADATA_PIECE_SIZE);
     let mut assembled = vec![0u8; total_size as usize];
@@ -455,3 +513,39 @@ const _: usize = HANDSHAKE_LEN;
 // the two happen to coincide at 16 KiB but mean different things.
 #[allow(dead_code)]
 const _: u32 = BLOCK_SIZE;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn metadata_reservation_bounds_and_releases() {
+        let base = METADATA_BYTES_IN_FLIGHT.load(Ordering::Relaxed);
+
+        // A small reservation within budget succeeds and bumps the counter.
+        let r = MetadataReservation::try_acquire(1024).unwrap();
+        assert_eq!(
+            METADATA_BYTES_IN_FLIGHT.load(Ordering::Relaxed),
+            base + 1024
+        );
+
+        // A reservation that would exceed the global ceiling is refused
+        // and leaves the counter untouched.
+        assert!(MetadataReservation::try_acquire(GLOBAL_METADATA_BUDGET).is_none());
+        assert_eq!(
+            METADATA_BYTES_IN_FLIGHT.load(Ordering::Relaxed),
+            base + 1024
+        );
+
+        // Dropping the guard releases the bytes.
+        drop(r);
+        assert_eq!(METADATA_BYTES_IN_FLIGHT.load(Ordering::Relaxed), base);
+    }
+
+    #[test]
+    fn metadata_reservation_rejects_overflow() {
+        // checked_add guards against usize overflow in the ceiling math.
+        assert!(MetadataReservation::try_acquire(usize::MAX).is_none());
+    }
+}

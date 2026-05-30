@@ -38,10 +38,15 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   attacker-controlled and that `split_at` panics if unbounded, plus a
   `debug_assert!(len <= rest.len())` immediately before the split to pin
   the invariant against a future refactor.
-- [ ] **P2 — ut_metadata per-session memory budget.** [verified cap]
+- [x] **P2 — ut_metadata per-session memory budget.** [verified cap]
   `peer/extension.rs` caps a single `metadata_size` at 100 MB, but a peer
-  flood across many connections could each allocate up to that. Add a
-  global/per-session metadata budget for `MAX_CONCURRENT_FETCH` dials.
+  flood across many connections could each allocate up to that. DONE:
+  added a process-wide `GLOBAL_METADATA_BUDGET` (256 MB) with an RAII
+  `MetadataReservation` guard (CAS against an `AtomicUsize`). Each fetch
+  reserves `total_size` before allocating the assembly buffer and is
+  refused if it would exceed the ceiling; the guard releases on drop
+  (success/error/abort), so 16 × 100 MB × N-magnets can no longer blow up
+  memory. Unit-tested bound + release + overflow.
 - [ ] **P2 — Windows AppContainer sandbox.** `sandbox.rs` supports Linux
   seccomp + macOS SBPL; Windows `--sandbox` is refused. Implement
   AppContainer (roadmap C2 remainder).
