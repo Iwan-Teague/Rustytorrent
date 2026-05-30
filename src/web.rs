@@ -199,7 +199,7 @@ async fn index() -> Html<&'static str> {
 
 /// Self-contained status page — no external assets, polls `/api/status`
 /// once a second and redraws a progress bar + counters.
-const INDEX_HTML: &str = r#"<!doctype html>
+const INDEX_HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -219,6 +219,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <body>
   <h1 id="name">RustyTorrent</h1>
   <div class="bar"><div class="fill" id="fill"></div></div>
+  <canvas id="spark" width="608" height="56" style="width:100%;height:56px;margin-top:1rem;background:#fafafa;border-radius:4px"></canvas>
+  <div class="k" style="text-align:right;font-size:12px" id="sparkmax">—</div>
   <div class="grid">
     <span class="k">Progress</span><span id="pct">—</span>
     <span class="k">Pieces</span><span id="pieces">—</span>
@@ -244,6 +246,27 @@ const fmtDur = s => {
   s = Number(s); const h = Math.floor(s/3600), m = Math.floor(s%3600/60), sec = s%60;
   return (h?h+"h ":"") + (m||h?m+"m ":"") + sec + "s";
 };
+// Rolling download-rate history for the sparkline (last ~2 minutes at 1s).
+const HIST = 120;
+const rates = [];
+function drawSpark() {
+  const c = document.getElementById("spark"), ctx = c.getContext("2d");
+  const w = c.width, h = c.height;
+  ctx.clearRect(0, 0, w, h);
+  if (rates.length < 2) return;
+  const max = Math.max(1, ...rates);
+  document.getElementById("sparkmax").textContent = "peak " + fmtBytes(max) + "/s";
+  ctx.beginPath();
+  rates.forEach((r, i) => {
+    const x = (i / (HIST - 1)) * w;
+    const y = h - (r / max) * (h - 4) - 2;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.strokeStyle = "#2d7"; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.lineTo((rates.length - 1) / (HIST - 1) * w, h);
+  ctx.lineTo(0, h); ctx.closePath();
+  ctx.fillStyle = "rgba(34,221,119,.12)"; ctx.fill();
+}
 async function tick() {
   try {
     const s = await (await fetch("/api/status")).json();
@@ -258,6 +281,9 @@ async function tick() {
     document.getElementById("up").textContent = fmtBytes(s.uploaded_bytes);
     document.getElementById("rate").textContent = fmtBytes(s.down_rate_bps) + "/s";
     document.getElementById("urate").textContent = fmtBytes(s.up_rate_bps) + "/s";
+    rates.push(Number(s.down_rate_bps) || 0);
+    if (rates.length > HIST) rates.shift();
+    drawSpark();
     document.getElementById("peers").textContent = s.peers_connected;
     document.getElementById("elapsed").textContent = fmtDur(s.elapsed_secs);
     document.getElementById("ih").textContent = s.info_hash;
@@ -277,7 +303,7 @@ tick(); setInterval(tick, 1000);
 </script>
 </body>
 </html>
-"#;
+"##;
 
 #[cfg(test)]
 mod tests {
