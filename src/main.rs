@@ -266,6 +266,34 @@ enum Commands {
         #[arg(long, default_value = ".")]
         torrent_dir: PathBuf,
     },
+    /// Create a `.torrent` from a file or directory: hash the content,
+    /// build the info dict, and write the metainfo file. Prints the
+    /// resulting info-hash.
+    Create {
+        /// File or directory to package.
+        path: PathBuf,
+        /// Output `.torrent` path. Defaults to `<name>.torrent` in the
+        /// current directory.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Tracker announce URL. Repeatable; the first becomes `announce`
+        /// and all go into `announce-list`. Omit for a trackerless
+        /// (DHT-only) torrent.
+        #[arg(long = "tracker")]
+        trackers: Vec<String>,
+        /// Piece length in bytes (default 256 KiB). Must be > 0; powers of
+        /// two are conventional.
+        #[arg(long, default_value_t = rustytorrent::create::DEFAULT_PIECE_LENGTH)]
+        piece_length: u64,
+        /// Override the torrent display name (defaults to the input's
+        /// file/dir name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Set the BEP 27 `private` flag (disables DHT/PEX for this
+        /// torrent — peers come only from the tracker).
+        #[arg(long, default_value_t = false)]
+        private: bool,
+    },
 }
 
 #[tokio::main]
@@ -361,6 +389,14 @@ async fn main() -> Result<()> {
             port,
             torrent_dir,
         } => cmd_daemon(torrents, output, web, port, torrent_dir).await,
+        Commands::Create {
+            path,
+            output,
+            trackers,
+            piece_length,
+            name,
+            private,
+        } => cmd_create(path, output, trackers, piece_length, name, private).await,
         Commands::Magnet {
             uri,
             output,
@@ -749,6 +785,48 @@ async fn cmd_daemon(
     }
     mgr.shutdown_all().await;
     println!("Done.");
+    Ok(())
+}
+
+async fn cmd_create(
+    path: PathBuf,
+    output: Option<PathBuf>,
+    trackers: Vec<String>,
+    piece_length: u64,
+    name: Option<String>,
+    private: bool,
+) -> Result<()> {
+    // Hashing a large directory is blocking, CPU- and IO-bound work, so
+    // run it off the async runtime's worker threads.
+    let path_for_msg = path.clone();
+    let (bytes, info_hash) = tokio::task::spawn_blocking(move || {
+        rustytorrent::create::create_torrent(&path, &trackers, piece_length, name, private)
+    })
+    .await
+    .context("create task panicked")??;
+
+    // Default output: <name>.torrent in the current dir. We re-parse to
+    // recover the chosen name rather than thread it back out of the
+    // creator.
+    let out_path = match output {
+        Some(p) => p,
+        None => {
+            let t = TorrentFile::from_bytes(&bytes)
+                .context("internal: created torrent failed to re-parse")?;
+            PathBuf::from(format!("{}.torrent", t.info.name))
+        }
+    };
+    tokio::fs::write(&out_path, &bytes)
+        .await
+        .with_context(|| format!("writing {}", out_path.display()))?;
+
+    println!("Created:    {}", out_path.display());
+    println!("Source:     {}", path_for_msg.display());
+    println!("Info-hash:  {}", hex(&info_hash));
+    println!("Size:       {} bytes (.torrent)", bytes.len());
+    if private {
+        println!("Private:    yes (DHT/PEX disabled for this torrent)");
+    }
     Ok(())
 }
 

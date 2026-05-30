@@ -210,10 +210,19 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   Added `SessionManager::contains` for the cheap pre-check, wired the
   daemon UI's add box to route `magnet:` links to the new endpoint, and
   covered parse-error / no-tracker / accepted cases in the smoke test.
-- [ ] **P1 — torrent-creation command (`create`).** [verified gap] No way
-  to make a `.torrent` from a file/dir; users need `mktorrent`. Add
-  `rustytorrent create <path> [--tracker URL]` (piece hashing → info dict
-  → info_hash).
+- [x] **P1 — torrent-creation command (`create`).** [verified gap] No way
+  to make a `.torrent` from a file/dir; users needed `mktorrent`. DONE:
+  added `src/create.rs` (`create_torrent`) + a `create` subcommand:
+  `rustytorrent create <path> [--tracker URL]... [--piece-length N]
+  [--name NAME] [-o OUT] [--private]`. Streams the input in piece-length
+  chunks (single file or recursively-walked dir, symlinks skipped),
+  builds the canonical info dict via the existing `BencodeValue::to_bytes`
+  (BTreeMap ⇒ sorted keys), computes the info-hash, and writes the
+  metainfo (`announce` + BEP 12 `announce-list`, optional BEP 27
+  `private`). Hashing runs on `spawn_blocking`. Verified the output
+  re-parses through our own loader AND that an independent Python bencode
+  parser computes the identical info-hash (interop). Unit tests cover
+  single-file, multi-file, private, and zero-piece-length rejection.
 - [ ] **P2 — single-download queue / resume-list.** Without the daemon,
   one torrent per process and no persisted queue. Either document "use
   `daemon`" or add a simple resume-list the daemon restores on startup.
