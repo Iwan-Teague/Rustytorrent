@@ -259,6 +259,12 @@ enum Commands {
         /// Base listen port; torrent `i` uses `base + i`.
         #[arg(long, default_value_t = 6881)]
         port: u16,
+        /// Directory the runtime web `add` endpoint may load `.torrent`
+        /// files from. Requests for paths outside it are refused, so a
+        /// loopback foothold can't read arbitrary host files. Defaults to
+        /// the current directory.
+        #[arg(long, default_value = ".")]
+        torrent_dir: PathBuf,
     },
 }
 
@@ -353,7 +359,8 @@ async fn main() -> Result<()> {
             output,
             web,
             port,
-        } => cmd_daemon(torrents, output, web, port).await,
+            torrent_dir,
+        } => cmd_daemon(torrents, output, web, port, torrent_dir).await,
         Commands::Magnet {
             uri,
             output,
@@ -665,6 +672,7 @@ async fn cmd_daemon(
     output: PathBuf,
     web: u16,
     base_port: u16,
+    torrent_dir: PathBuf,
 ) -> Result<()> {
     use rustytorrent::session::SessionManager;
 
@@ -711,6 +719,7 @@ async fn cmd_daemon(
         output,
         peer_id,
         base_port,
+        torrent_dir,
     };
     // Serve until ctrl-c, then stop every session gracefully.
     tokio::select! {

@@ -14,12 +14,16 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 
 ## 1. Security & hardening
 
-- [ ] **P1 — Daemon `POST /api/add` path read is unconstrained.** [verified]
+- [x] **P1 — Daemon `POST /api/add` path read is unconstrained.** [verified]
   `web.rs daemon_add` does `tokio::fs::read(body.trim())` on any
-  server-side path. Loopback-only so low exposure, but a co-hosted XSS /
-  container-localhost foothold could read any file the process can.
-  Fix: `canonicalize()` and require the path to live under a configured
-  torrent dir (or accept an uploaded `.torrent` body instead of a path).
+  server-side path. DONE: added `resolve_under(dir, requested)` which
+  canonicalizes both (following symlinks, collapsing `..`) and requires
+  the resolved path to live under a configured torrent dir, else 403.
+  Wired a `--torrent-dir` daemon flag (defaults to cwd) into
+  `DaemonState.torrent_dir`. Containment is checked *before* any
+  `fs::read`, so an out-of-tree path is never even stat'd. Startup
+  positional torrents bypass the check (trusted CLI input). Unit-tested
+  inside/escape/absolute/nonexistent cases.
 - [ ] **P2 — DH private-key wipe is best-effort.** [verified]
   `peer/mse/dh.rs` `Drop` overwrites the `BigUint` with `0` but doesn't
   scrub the freed limb allocation; not constant-time. Acceptable (MSE is

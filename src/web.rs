@@ -301,6 +301,38 @@ pub struct DaemonState {
     pub output: std::path::PathBuf,
     pub peer_id: crate::peer_id::PeerId,
     pub base_port: u16,
+    /// Directory the runtime `POST /api/add` path must live under. The
+    /// request body path is canonicalized and rejected unless it resolves
+    /// inside this dir — so a loopback foothold (co-hosted XSS, a
+    /// container sharing localhost) can't coerce the daemon into reading
+    /// arbitrary host files. Startup positional torrents bypass this;
+    /// they're trusted CLI input.
+    pub torrent_dir: std::path::PathBuf,
+}
+
+/// Resolve `requested` and require it to live under `dir`. Both are
+/// canonicalized (following symlinks, collapsing `..`) so a path like
+/// `dir/../../etc/passwd` or a symlink escape is caught. Returns the
+/// canonical path on success, or an error string for the 403 body.
+/// `dir` itself is canonicalized per call — cheap (one stat) and keeps
+/// the check correct if the dir is created/replaced after startup.
+fn resolve_under(
+    dir: &std::path::Path,
+    requested: &str,
+) -> std::result::Result<std::path::PathBuf, String> {
+    let base = dir
+        .canonicalize()
+        .map_err(|e| format!("torrent dir {}: {e}", dir.display()))?;
+    let full = std::path::Path::new(requested)
+        .canonicalize()
+        .map_err(|e| format!("resolve {requested}: {e}"))?;
+    if full.starts_with(&base) {
+        Ok(full)
+    } else {
+        Err(format!(
+            "path {requested} is outside the permitted torrent dir"
+        ))
+    }
 }
 
 /// Build the daemon router. `GET /api/status` returns an *array* of
@@ -346,7 +378,13 @@ async fn daemon_add(State(st): State<DaemonState>, body: String) -> impl IntoRes
     if path.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty path".to_string());
     }
-    let raw = match tokio::fs::read(path).await {
+    // Containment check first — never touch a path outside the permitted
+    // dir, not even to stat it via fs::read's error.
+    let safe = match resolve_under(&st.torrent_dir, path) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::FORBIDDEN, e),
+    };
+    let raw = match tokio::fs::read(&safe).await {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("read {path}: {e}")),
     };
@@ -701,5 +739,36 @@ mod tests {
         // Every metric must carry HELP + TYPE lines.
         assert_eq!(p.matches("# HELP ").count(), p.matches("# TYPE ").count());
         assert!(p.matches("# TYPE ").count() >= 9);
+    }
+
+    #[test]
+    fn resolve_under_accepts_inside_rejects_escape() {
+        // Unique scratch dir under the system temp, no external crates.
+        let base = std::env::temp_dir().join(format!("rt_resolve_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // A real file inside the dir resolves and passes.
+        let inside = base.join("a.torrent");
+        std::fs::write(&inside, b"x").unwrap();
+        let ok = resolve_under(&base, inside.to_str().unwrap()).unwrap();
+        assert!(ok.starts_with(base.canonicalize().unwrap()));
+
+        // A traversal escape is rejected (doesn't resolve inside).
+        let escape = format!("{}/../../etc/hosts", base.display());
+        assert!(resolve_under(&base, &escape).is_err());
+
+        // An absolute path to a well-known outside file exists but is
+        // outside the dir → Err (not a resolve failure).
+        let outside = resolve_under(&base, "/etc/hosts");
+        if let Ok(p) = &outside {
+            assert!(!p.starts_with(base.canonicalize().unwrap()));
+        }
+        assert!(outside.is_err());
+
+        // A nonexistent path inside the dir fails to canonicalize → Err,
+        // so we never hand a missing path to fs::read.
+        assert!(resolve_under(&base, base.join("nope.torrent").to_str().unwrap()).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
