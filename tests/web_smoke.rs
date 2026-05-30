@@ -143,4 +143,17 @@ async fn serves_status_metrics_and_index() {
         .expect("control command should arrive")
         .expect("channel open");
     assert!(matches!(cmd, EngineControl::Pause));
+
+    // POST /api/shutdown forwards a graceful-stop command.
+    let resp = client
+        .post(format!("{base}/api/shutdown"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), ctl_rx.recv())
+        .await
+        .expect("shutdown command should arrive")
+        .expect("channel open");
+    assert!(matches!(cmd, EngineControl::Shutdown));
 }

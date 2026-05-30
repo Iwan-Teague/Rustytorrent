@@ -35,6 +35,10 @@ pub enum EngineControl {
     Pause,
     /// Resume issuing block requests.
     Resume,
+    /// Stop the torrent: run the same graceful teardown as ctrl-c
+    /// (tracker `stopped`, storage flush, DHT-state save). In the
+    /// daemon this is how a session is removed.
+    Shutdown,
 }
 
 /// Outstanding block requests per unchoked peer.
@@ -882,6 +886,10 @@ impl TorrentEngine {
                             for a in addrs {
                                 self.maybe_request_blocks(a, &peers);
                             }
+                        }
+                        EngineControl::Shutdown => {
+                            tracing::info!(target: "engine", "shutdown via control API — graceful stop");
+                            break Ok(());
                         }
                     }
                 }

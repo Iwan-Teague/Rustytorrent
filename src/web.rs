@@ -190,6 +190,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/files", get(files_json))
         .route("/api/pause", post(pause))
         .route("/api/resume", post(resume))
+        .route("/api/shutdown", post(shutdown))
         .route("/metrics", get(metrics))
         .with_state(state)
 }
@@ -243,6 +244,10 @@ async fn resume(State(st): State<WebState>) -> impl IntoResponse {
     control(&st, EngineControl::Resume).await
 }
 
+async fn shutdown(State(st): State<WebState>) -> impl IntoResponse {
+    control(&st, EngineControl::Shutdown).await
+}
+
 async fn control(st: &WebState, cmd: EngineControl) -> impl IntoResponse {
     match st.ctl.send(cmd).await {
         Ok(()) => (StatusCode::OK, "ok"),
@@ -276,7 +281,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
 </style>
 </head>
 <body>
-  <h1 id="name">RustyTorrent <button id="pause" style="float:right;font:inherit;padding:.15rem .6rem;cursor:pointer">Pause</button></h1>
+  <h1 id="name">RustyTorrent <button id="stop" style="float:right;font:inherit;padding:.15rem .6rem;cursor:pointer;margin-left:.4rem">Stop</button><button id="pause" style="float:right;font:inherit;padding:.15rem .6rem;cursor:pointer">Pause</button></h1>
   <div class="bar"><div class="fill" id="fill"></div></div>
   <canvas id="spark" width="608" height="56" style="width:100%;height:56px;margin-top:1rem;background:#fafafa;border-radius:4px"></canvas>
   <div class="k" style="text-align:right;font-size:12px" id="sparkmax">—</div>
@@ -396,6 +401,10 @@ document.getElementById("pause").addEventListener("click", async (e) => {
   const action = e.target.dataset.action || "pause";
   try { await fetch("/api/" + action, { method: "POST" }); await tick(); }
   catch (err) { /* engine gone */ }
+});
+document.getElementById("stop").addEventListener("click", async () => {
+  if (!confirm("Stop the download and exit? (graceful shutdown)")) return;
+  try { await fetch("/api/shutdown", { method: "POST" }); } catch (err) {}
 });
 tick(); setInterval(tick, 1000);
 </script>
