@@ -106,11 +106,15 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   tie-shuffle) is identical, all picker tests green. The fully incremental
   availability-bucket structure remains a possible future step but wasn't
   needed to kill the sort — left as a note, not a blocker.
-- [ ] **P1 — `file_progress` + peer-list scan every progress tick.**
-  [verified] `engine.rs` `file_progress` iterates all pieces × all files
-  each ~2 s, and `build_stats` re-collects connected-peer addresses every
-  tick. Update per-file completion incrementally on piece-complete events
-  and cache the peer list, updating on connect/disconnect.
+- [x] **P1 — `file_progress` + peer-list scan every progress tick.**
+  [verified] `engine.rs` `file_progress` iterated all pieces × all files
+  each ~2 s. DONE: (1) the scan was already gated behind a connected web
+  watcher (`web_tx.is_some()`), so it never runs headless; (2) added a
+  memo keyed on `pm.complete_count()` (a cheap popcount) — completed
+  pieces only grow, so an unchanged count means byte-identical fractions
+  and the O(pieces × files) rescan is skipped, reused from cache. The
+  per-tick peer-address `collect()` is left as-is: it's O(connected
+  peers) (≤ the peer cap, a few dozen), negligible vs the piece scan.
 - [x] **P1 — `read_frame` allocates a fresh `Vec` per wire frame.**
   [verified] `peer/message.rs:211` `vec![0u8; len]` per frame (per 16 KiB
   block on the download path). DONE: added `read_frame_into(reader,

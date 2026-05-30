@@ -213,6 +213,13 @@ pub struct TorrentEngine {
     /// standalone behaviour (create channels, spawn web iff `web_port`).
     managed_web_tx: Option<tokio::sync::watch::Sender<EngineStats>>,
     managed_ctl_rx: Option<mpsc::Receiver<EngineControl>>,
+    /// Memoized per-file progress for the web UI, keyed on the count of
+    /// locally-complete pieces. Completed pieces only ever increase, so if
+    /// the count is unchanged since the last computation the per-file
+    /// fractions are byte-identical — we skip the O(pieces × files)
+    /// rescan and reuse the cached vec. Invalidated implicitly by a count
+    /// change. `None` until first computed.
+    file_progress_cache: Option<(usize, Vec<crate::web::FileProgress>)>,
     /// In-memory LRU of whole pieces, populated on each upload-side miss.
     /// Lets us serve all blocks of a popular piece from RAM after the first
     /// read instead of going back to disk per-block.
@@ -273,6 +280,7 @@ impl TorrentEngine {
             paused: false,
             managed_web_tx: None,
             managed_ctl_rx: None,
+            file_progress_cache: None,
             upload_cache: PieceCache::default(),
             download_bucket,
             upload_bucket,
@@ -1625,10 +1633,20 @@ impl TorrentEngine {
     /// selective-download set. Single-file torrents return an empty list
     /// (the top-level progress already says everything). Computed from
     /// the completed-piece bitfield and the file→piece overlap map.
-    fn file_progress(&self, layout: &Layout) -> Vec<crate::web::FileProgress> {
+    fn file_progress(&mut self, layout: &Layout) -> Vec<crate::web::FileProgress> {
         if layout.files.len() <= 1 {
             return Vec::new();
         }
+        // Cheap popcount cache key: completed pieces only ever grow, so an
+        // unchanged count ⇒ identical per-file fractions. Reuse the cached
+        // vec and skip the O(pieces × files) rescan on idle/seeding ticks.
+        let complete = self.pm.complete_count();
+        if let Some((cached_at, ref cached)) = self.file_progress_cache {
+            if cached_at == complete {
+                return cached.clone();
+            }
+        }
+
         let local = self.pm.local_bitfield();
         let mut done = vec![0u64; layout.files.len()];
         for i in 0..self.pm.num_pieces() {
@@ -1640,7 +1658,7 @@ impl TorrentEngine {
             }
         }
         let selectors = &self.cfg.selected_files;
-        layout
+        let result: Vec<crate::web::FileProgress> = layout
             .files
             .iter()
             .enumerate()
@@ -1660,7 +1678,9 @@ impl TorrentEngine {
                     wanted,
                 }
             })
-            .collect()
+            .collect();
+        self.file_progress_cache = Some((complete, result.clone()));
+        result
     }
 
     fn log_progress(&mut self, down_rate_bps: u64, up_rate_bps: u64, peers_connected: usize) {
