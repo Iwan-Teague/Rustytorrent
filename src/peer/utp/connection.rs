@@ -22,11 +22,16 @@
 //!   (`process_sack`). When a SACK reports >= 3 packets past the gap
 //!   (TCP-style duplicate-ack loss signal) the sender fast-retransmits
 //!   the gap immediately instead of waiting out its RTO.
-//! - **Not implemented**: LEDBAT congestion control (we use a fixed
-//!   send window of `INITIAL_WINDOW_PACKETS`); sequence-number
-//!   wraparound (16-bit seq_nr wraps after 65 536 packets — a real
-//!   long-lived connection would need to handle it, the typical
-//!   BitTorrent block-exchange session won't).
+//! - **LEDBAT (BEP 29)**: a delay-based controller ([`Ledbat`]) sizes
+//!   the send window from one-way-delay samples (the peer's echoed
+//!   `timestamp_diff`), yielding to other traffic as queuing delay
+//!   builds. Falls back to the fixed `INITIAL_WINDOW_PACKETS` until a
+//!   usable sample arrives, with a 2-packet floor so it can't stall.
+//! - **Not implemented**: sequence-number wraparound (16-bit seq_nr
+//!   wraps after 65 536 packets — a real long-lived connection would
+//!   need to handle it, the typical BitTorrent block-exchange session
+//!   won't); LEDBAT's full 13-slot per-minute base-delay history (we
+//!   use a simpler running min — see [`Ledbat`]).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -67,6 +72,93 @@ pub const RECV_WINDOW_BYTES: u32 = 1024 * 1024;
 /// peer just gets its excess out-of-order packets dropped and must
 /// retransmit them in order.
 pub const MAX_PENDING_IN: usize = RECV_WINDOW_BYTES as usize / MAX_DATA_PAYLOAD + 1;
+
+/// LEDBAT (BEP 29) delay-based congestion controller. Pure logic: fed
+/// one-way-delay samples + bytes acked, it sizes the send window in
+/// bytes so the connection yields to other traffic once it detects
+/// queuing delay building past `TARGET_MICROS`.
+///
+/// ## Base-delay tracking
+///
+/// We keep a single running minimum of the observed delay samples
+/// rather than libtorrent's 13-slot per-minute history. The simplification
+/// fails *safe*: a running min can only be too low, never too high, and
+/// a too-low base makes the measured queuing delay look *larger*, which
+/// shrinks the window — i.e. we under-utilise rather than congest. The
+/// cost is that on a route whose true base delay rises (e.g. a path
+/// change) we'd stay overly conservative until reset; acceptable for an
+/// opt-in transport. A future version can add the rolling-minute history.
+#[derive(Debug, Clone)]
+struct Ledbat {
+    /// Current congestion window, in bytes.
+    cwnd_bytes: f64,
+    /// Lowest delay sample seen so far (micros), our base-delay estimate.
+    base_delay: Option<u32>,
+    /// True once we've fed at least one usable sample. Until then the
+    /// caller falls back to the fixed window — our own µTP↔µTP loopback
+    /// and any peer that doesn't echo `timestamp_diff` leave samples at
+    /// zero, and we must not let that stall the transfer.
+    has_sample: bool,
+}
+
+/// Target one-way queuing delay (micros). LEDBAT aims to keep the
+/// standing queue at ~100 ms and backs off above it.
+const LEDBAT_TARGET_MICROS: f64 = 100_000.0;
+/// Cap on how fast the window grows, in bytes per RTT. One MSS/RTT —
+/// deliberately gentler than libtorrent's 3000 so we ramp conservatively.
+const LEDBAT_MAX_CWND_INCREASE: f64 = MAX_DATA_PAYLOAD as f64;
+/// Window floor so the controller can never stall the connection.
+const LEDBAT_MIN_WINDOW: f64 = (2 * MAX_DATA_PAYLOAD) as f64;
+/// Window ceiling — matches our advertised receive window; plenty for
+/// any BitTorrent block-exchange flow and bounds runaway growth.
+const LEDBAT_MAX_WINDOW: f64 = RECV_WINDOW_BYTES as f64;
+
+impl Ledbat {
+    fn new() -> Self {
+        Self {
+            // Start at the fixed window so behaviour matches the legacy
+            // pacing until the first real sample arrives.
+            cwnd_bytes: (INITIAL_WINDOW_PACKETS * MAX_DATA_PAYLOAD) as f64,
+            base_delay: None,
+            has_sample: false,
+        }
+    }
+
+    /// Fold one ack into the window. `delay_sample` is the peer's
+    /// `timestamp_diff` (their measurement of our send→their-recv delay);
+    /// `bytes_acked` is how many payload bytes this ack freed;
+    /// `peer_wnd` is the peer's advertised receive window (0 = unknown).
+    fn on_ack(&mut self, delay_sample: u32, bytes_acked: usize, peer_wnd: u32) {
+        if delay_sample == 0 || bytes_acked == 0 {
+            return; // not a usable sample — keep the fixed-window fallback
+        }
+        self.has_sample = true;
+        let base = self
+            .base_delay
+            .map_or(delay_sample, |b| b.min(delay_sample));
+        self.base_delay = Some(base);
+
+        let queuing = delay_sample.saturating_sub(base) as f64;
+        let off_target = (LEDBAT_TARGET_MICROS - queuing) / LEDBAT_TARGET_MICROS;
+        let window_factor = bytes_acked as f64 / self.cwnd_bytes;
+        let gain = LEDBAT_MAX_CWND_INCREASE * off_target * window_factor;
+        self.cwnd_bytes = (self.cwnd_bytes + gain).clamp(LEDBAT_MIN_WINDOW, LEDBAT_MAX_WINDOW);
+
+        // Never send past what the peer says it can buffer.
+        if peer_wnd > 0 {
+            self.cwnd_bytes = self.cwnd_bytes.min(peer_wnd as f64).max(LEDBAT_MIN_WINDOW);
+        }
+    }
+
+    /// The send window in packets, or `None` if no sample has arrived yet
+    /// (caller uses the fixed window). Always at least 2 packets.
+    fn window_packets(&self) -> Option<usize> {
+        if !self.has_sample {
+            return None;
+        }
+        Some(((self.cwnd_bytes / MAX_DATA_PAYLOAD as f64) as usize).max(2))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -136,6 +228,9 @@ pub struct Connection {
     /// recovery falls to the normal RTO). Cleared implicitly when the
     /// gap advances to a new seq_nr.
     last_fast_rtx_seq: Option<u16>,
+    /// LEDBAT congestion controller sizing the send window. Falls back
+    /// to the fixed window until the first usable delay sample arrives.
+    cc: Ledbat,
 }
 
 impl Connection {
@@ -164,6 +259,7 @@ impl Connection {
             deadline: now + HARD_TIMEOUT,
             fast_rtx_seq: None,
             last_fast_rtx_seq: None,
+            cc: Ledbat::new(),
         };
         // The SYN packet uses our recv_id as its connection_id; the
         // peer will read this as its OWN send_id and use it on its
@@ -208,6 +304,7 @@ impl Connection {
             deadline: now + HARD_TIMEOUT,
             fast_rtx_seq: None,
             last_fast_rtx_seq: None,
+            cc: Ledbat::new(),
         };
         // STATE acks the SYN. seq_nr is our chosen initial; ack_nr
         // is the SYN's seq_nr.
@@ -304,9 +401,11 @@ impl Connection {
         // (cumulative). The peer's ack_nr names the highest seq_nr
         // they've delivered in order.
         let acked_through = packet.ack_nr;
+        let mut bytes_acked = 0usize;
         while let Some(front) = self.in_flight.front() {
             if seq_le(front.seq_nr, acked_through) {
-                self.in_flight.pop_front();
+                let entry = self.in_flight.pop_front().expect("front just checked");
+                bytes_acked += entry.packet.payload.len();
             } else {
                 break;
             }
@@ -320,7 +419,15 @@ impl Connection {
             .iter()
             .find(|e| e.kind == EXT_SELECTIVE_ACK)
         {
-            self.process_sack(acked_through, &sack.data);
+            bytes_acked += self.process_sack(acked_through, &sack.data);
+        }
+        // LEDBAT: fold this ack's freshly-acked bytes and the peer's
+        // delay measurement (its `timestamp_diff`) into the send window.
+        // A zero diff (peer doesn't echo, or our own loopback) is ignored
+        // by the controller, which keeps the fixed-window fallback.
+        if bytes_acked > 0 {
+            self.cc
+                .on_ack(packet.timestamp_diff_micros, bytes_acked, packet.wnd_size);
         }
         match packet.packet_type {
             PacketType::Syn => {
@@ -418,7 +525,10 @@ impl Connection {
             }
         }
         // Packetize as much of the send buffer as the window allows.
-        while !self.out_buf.is_empty() && self.in_flight.len() < INITIAL_WINDOW_PACKETS {
+        // LEDBAT sizes the window once delay samples arrive; until then
+        // (loopback / non-echoing peers) we use the fixed window.
+        let window = self.cc.window_packets().unwrap_or(INITIAL_WINDOW_PACKETS);
+        while !self.out_buf.is_empty() && self.in_flight.len() < window {
             let chunk_len = self.out_buf.len().min(MAX_DATA_PAYLOAD);
             let payload: Vec<u8> = self.out_buf.drain(..chunk_len).collect();
             let pkt = Packet {
@@ -564,14 +674,23 @@ impl Connection {
     /// below the cumulative gap (`ack_nr + 1`) are never represented, so
     /// their `wrapping_sub(base)` lands outside the mask and they're
     /// correctly retained for retransmit.
-    fn process_sack(&mut self, ack_nr: u16, mask: &[u8]) {
+    /// Returns the number of payload bytes pruned (selectively acked),
+    /// which the caller folds into the LEDBAT window.
+    fn process_sack(&mut self, ack_nr: u16, mask: &[u8]) -> usize {
         let base = ack_nr.wrapping_add(2);
-        self.in_flight.retain(|entry| {
+        let mut pruned_bytes = 0usize;
+        let mut kept: VecDeque<InFlight> = VecDeque::with_capacity(self.in_flight.len());
+        while let Some(entry) = self.in_flight.pop_front() {
             let offset = entry.seq_nr.wrapping_sub(base) as usize;
             let byte = offset / 8;
             let sacked = byte < mask.len() && (mask[byte] >> (offset % 8)) & 1 == 1;
-            !sacked
-        });
+            if sacked {
+                pruned_bytes += entry.packet.payload.len();
+            } else {
+                kept.push_back(entry);
+            }
+        }
+        self.in_flight = kept;
         // Fast retransmit: a SACK reporting >= 3 packets received past
         // the gap is the µTP analogue of TCP's three-duplicate-ack loss
         // signal (the threshold tolerates mild reordering). Schedule one
@@ -588,6 +707,7 @@ impl Connection {
                 }
             }
         }
+        pruned_bytes
     }
 }
 
@@ -931,6 +1051,114 @@ mod tests {
         assert!(
             init.pending_send_packets(t).is_empty(),
             "same-gap SACK must fast-retransmit only once"
+        );
+    }
+
+    // ---- LEDBAT controller ----
+
+    #[test]
+    fn ledbat_starts_in_fixed_window_fallback() {
+        let cc = Ledbat::new();
+        assert_eq!(
+            cc.window_packets(),
+            None,
+            "no sample yet → caller uses fixed window"
+        );
+    }
+
+    #[test]
+    fn ledbat_grows_when_below_target() {
+        let mut cc = Ledbat::new();
+        let before = cc.cwnd_bytes;
+        // First sample sets base; queuing 0 → off_target 1 → grow.
+        cc.on_ack(1000, MAX_DATA_PAYLOAD * INITIAL_WINDOW_PACKETS, 0);
+        assert!(cc.cwnd_bytes > before);
+        assert!(cc.window_packets().unwrap() >= INITIAL_WINDOW_PACKETS);
+    }
+
+    #[test]
+    fn ledbat_shrinks_when_above_target() {
+        let mut cc = Ledbat::new();
+        cc.on_ack(1000, MAX_DATA_PAYLOAD, 0); // establish base = 1000
+        let grown = cc.cwnd_bytes;
+        // A sample 300 ms above base → queuing 300ms >> 100ms target → shrink.
+        cc.on_ack(1000 + 300_000, MAX_DATA_PAYLOAD, 0);
+        assert!(cc.cwnd_bytes < grown);
+    }
+
+    #[test]
+    fn ledbat_never_drops_below_floor() {
+        let mut cc = Ledbat::new();
+        cc.on_ack(1000, MAX_DATA_PAYLOAD, 0);
+        for _ in 0..200 {
+            cc.on_ack(1000 + 5_000_000, MAX_DATA_PAYLOAD * 8, 0); // massive queuing
+        }
+        assert!(cc.cwnd_bytes >= LEDBAT_MIN_WINDOW);
+        assert!(cc.window_packets().unwrap() >= 2);
+    }
+
+    #[test]
+    fn ledbat_base_delay_tracks_min() {
+        let mut cc = Ledbat::new();
+        cc.on_ack(5000, MAX_DATA_PAYLOAD, 0);
+        cc.on_ack(1000, MAX_DATA_PAYLOAD, 0);
+        cc.on_ack(8000, MAX_DATA_PAYLOAD, 0);
+        assert_eq!(cc.base_delay, Some(1000));
+    }
+
+    #[test]
+    fn ledbat_ignores_unusable_samples() {
+        let mut cc = Ledbat::new();
+        cc.on_ack(0, MAX_DATA_PAYLOAD, 0); // zero delay (peer doesn't echo)
+        cc.on_ack(1000, 0, 0); // zero bytes acked
+        assert_eq!(
+            cc.window_packets(),
+            None,
+            "no usable sample → still fallback"
+        );
+    }
+
+    #[test]
+    fn ledbat_respects_peer_receive_window() {
+        let mut cc = Ledbat::new();
+        cc.on_ack(1000, MAX_DATA_PAYLOAD * 8, 3 * MAX_DATA_PAYLOAD as u32);
+        assert!(cc.cwnd_bytes <= 3.0 * MAX_DATA_PAYLOAD as f64);
+        assert!(cc.cwnd_bytes >= LEDBAT_MIN_WINDOW);
+    }
+
+    /// Low-delay acks must open the connection's effective send window
+    /// past the fixed INITIAL_WINDOW_PACKETS.
+    #[test]
+    fn ledbat_window_opens_with_low_delay_acks() {
+        let t = now();
+        let (mut init, syn) = Connection::new_initiator(830, t);
+        let (_recv, state) = Connection::new_receiver(&syn, t).unwrap();
+        let _ = init.handle_incoming(&state, t);
+        init.enqueue_send(&vec![0u8; MAX_DATA_PAYLOAD * 20]);
+
+        // First batch is the fixed window (no delay sample yet).
+        let first = init.pending_send_packets(t);
+        assert_eq!(first.len(), INITIAL_WINDOW_PACKETS);
+
+        // Peer acks all of them with a low one-way delay → window opens.
+        let last_seq = first.last().unwrap().seq_nr;
+        let ack = Packet {
+            packet_type: PacketType::State,
+            connection_id: init.recv_id,
+            timestamp_micros: 0,
+            timestamp_diff_micros: 1000,
+            wnd_size: RECV_WINDOW_BYTES,
+            seq_nr: 1,
+            ack_nr: last_seq,
+            extensions: Vec::new(),
+            payload: Vec::new(),
+        };
+        let _ = init.handle_incoming(&ack, t);
+        let second = init.pending_send_packets(t);
+        assert!(
+            second.len() > INITIAL_WINDOW_PACKETS,
+            "window should open past {INITIAL_WINDOW_PACKETS}, sent {}",
+            second.len()
         );
     }
 

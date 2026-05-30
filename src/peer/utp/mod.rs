@@ -9,26 +9,27 @@
 //!
 //! ## Scope of this implementation
 //!
-//! Three layers, each a focused commit so a reviewer can audit them
+//! Layers, each a focused commit so a reviewer can audit them
 //! independently: the packet codec (`packet`), the pure-logic
-//! per-connection state machine (`connection`), and the UDP socket
-//! runtime + `AsyncRead`/`AsyncWrite` bridge (`socket`). Engine
-//! integration (parallel TCP+µTP dial; off under `--anonymous` since
-//! UDP can't ride SOCKS5) is the remaining step.
+//! per-connection state machine (`connection`), the UDP socket runtime
+//! + `AsyncRead`/`AsyncWrite` bridge (`socket`), and the engine
+//! integration (`--utp`: parallel TCP+µTP dial; off under `--anonymous`
+//! / SOCKS5 / `--bind-iface` since UDP can't ride a proxy or be
+//! interface-bound here).
 //!
-//! ## What we deliberately don't implement
+//! ## Congestion control & loss recovery
 //!
-//! - Full LEDBAT congestion control. The spec describes a delay-based
-//!   AIMD that targets a constant queuing delay; we use a much
-//!   simpler fixed-window approach. Means we won't be as friendly to
-//!   coexisting TCP flows under load, but data still moves.
-//! - Selective Ack (BEP 29) IS acted on: the receiver emits a SACK
-//!   bitmask, the sender prunes selectively-acked packets from its
-//!   retransmit queue, and a SACK reporting >= 3 packets past the gap
-//!   triggers an immediate fast retransmit of the gap (no RTO wait).
-//!
-//! Both gaps are noted on each call site so a future contributor can
-//! tighten without first re-deriving the design.
+//! - **LEDBAT (BEP 29)**: a delay-based controller sizes the send
+//!   window from one-way-delay samples (the peer's echoed
+//!   `timestamp_diff`, which the driver also echoes back so the peer's
+//!   controller works), yielding to other traffic as queuing delay
+//!   builds. Falls back to a fixed window with a 2-packet floor until a
+//!   usable sample arrives. Simplification vs libtorrent: a running-min
+//!   base delay rather than the 13-slot per-minute history.
+//! - **Selective Ack (BEP 29)** is acted on: the receiver emits a SACK
+//!   bitmask, the sender prunes selectively-acked packets, and a SACK
+//!   reporting >= 3 packets past the gap triggers an immediate fast
+//!   retransmit of the gap (no RTO wait).
 
 pub mod connection;
 pub mod packet;

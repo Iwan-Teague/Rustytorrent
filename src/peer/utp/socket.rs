@@ -120,6 +120,12 @@ struct Entry {
     /// entries just reap at `HARD_TIMEOUT`. `None` once surfaced (or for
     /// outbound connections).
     pending_accept: Option<(UtpStream, SocketAddr)>,
+    /// Most recent one-way delay measurement for this connection:
+    /// `local_recv_micros - peer_timestamp_micros` on the last packet we
+    /// received. Echoed back as `timestamp_diff_micros` on our outgoing
+    /// packets so the peer's LEDBAT controller (and ours, against another
+    /// rustytorrent) has a delay signal to work from.
+    last_timestamp_diff: u32,
 }
 
 /// A connected µTP stream. Implements `AsyncRead` + `AsyncWrite` so it
@@ -358,10 +364,11 @@ impl Driver {
     }
 
     /// Encode and send a batch of packets to one peer, stamping the
-    /// send timestamp on each.
-    async fn flush(&self, peer: SocketAddr, packets: Vec<Packet>) {
+    /// send timestamp and the echoed delay measurement on each.
+    async fn flush(&self, peer: SocketAddr, diff: u32, packets: Vec<Packet>) {
         for mut p in packets {
             p.timestamp_micros = self.now_micros();
+            p.timestamp_diff_micros = diff;
             let _ = self.socket.send_to(&p.encode(), peer).await;
         }
     }
@@ -372,11 +379,16 @@ impl Driver {
             Err(_) => return, // garbage / non-µTP datagram — ignore.
         };
         let now = Instant::now();
+        // One-way delay of this packet (peer clock vs ours, offset and
+        // all — LEDBAT only uses relative changes / the running min).
+        // Echoed on our outgoing packets so the peer can run LEDBAT.
+        let recv_diff = self.now_micros().wrapping_sub(pkt.timestamp_micros);
         let key: ConnKey = (peer, pkt.connection_id);
         let mut outgoing = Vec::new();
 
         if self.conns.contains_key(&key) {
             if let Some(entry) = self.conns.get_mut(&key) {
+                entry.last_timestamp_diff = recv_diff;
                 if let Some(resp) = entry.conn.handle_incoming(&pkt, now) {
                     outgoing.push(resp);
                 }
@@ -404,6 +416,7 @@ impl Driver {
                 // Duplicate SYN (our STATE was lost) — re-ack via the
                 // existing connection.
                 if let Some(entry) = self.conns.get_mut(&recv_key) {
+                    entry.last_timestamp_diff = recv_diff;
                     if let Some(resp) = entry.conn.handle_incoming(&pkt, now) {
                         outgoing.push(resp);
                     }
@@ -428,6 +441,7 @@ impl Driver {
                         // packet confirms the return path (anti-spoofing);
                         // only then is it handed to accept().
                         pending_accept: Some((stream, peer)),
+                        last_timestamp_diff: recv_diff,
                     },
                 );
                 outgoing.push(state);
@@ -435,7 +449,7 @@ impl Driver {
         }
         // Non-SYN packets with no matching connection are ignored.
 
-        self.flush(peer, outgoing).await;
+        self.flush(peer, recv_diff, outgoing).await;
     }
 
     async fn on_command(&mut self, cmd: Command) {
@@ -453,9 +467,11 @@ impl Driver {
                         deliver: dtx,
                         pending: Some((resp, drx)),
                         pending_accept: None,
+                        last_timestamp_diff: 0,
                     },
                 );
-                self.flush(peer, vec![syn]).await;
+                // No packet received yet → no delay measurement to echo.
+                self.flush(peer, 0, vec![syn]).await;
             }
             Command::Send { key, data } => {
                 if let Some(entry) = self.conns.get_mut(&key) {
@@ -463,7 +479,8 @@ impl Driver {
                 }
                 let mut outgoing = Vec::new();
                 self.collect_after(&key, now, &mut outgoing);
-                self.flush(key.0, outgoing).await;
+                let diff = self.diff_for(&key);
+                self.flush(key.0, diff, outgoing).await;
             }
             Command::Close { key } => {
                 if let Some(entry) = self.conns.get_mut(&key) {
@@ -471,9 +488,17 @@ impl Driver {
                 }
                 let mut outgoing = Vec::new();
                 self.collect_after(&key, now, &mut outgoing);
-                self.flush(key.0, outgoing).await;
+                let diff = self.diff_for(&key);
+                self.flush(key.0, diff, outgoing).await;
             }
         }
+    }
+
+    /// The last delay measurement to echo on packets we send for `key`
+    /// outside the receive path (timer-driven retransmits, app writes).
+    /// 0 if the connection is gone or hasn't received anything yet.
+    fn diff_for(&self, key: &ConnKey) -> u32 {
+        self.conns.get(key).map_or(0, |e| e.last_timestamp_diff)
     }
 
     async fn on_tick(&mut self) {
@@ -485,7 +510,8 @@ impl Driver {
                 outgoing.extend(entry.conn.tick(now));
             }
             self.collect_after(&key, now, &mut outgoing);
-            self.flush(key.0, outgoing).await;
+            let diff = self.diff_for(&key);
+            self.flush(key.0, diff, outgoing).await;
         }
     }
 
