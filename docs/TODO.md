@@ -168,9 +168,11 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   per-minute history.** [verified, documented] Fails safe (over-
   conservative) but can get stuck low after a route change. Add the
   rolling-minute base-delay window per BEP 29 / libtorrent.
-- [ ] **P2 — engine dropped-`ctl_tx` when `--web` is off** means the
+- [x] **P2 — engine dropped-`ctl_tx` when `--web` is off** means the
   control select-arm is permanently inert by design — fine, but document
-  it so it's not mistaken for a bug.
+  it so it's not mistaken for a bug. DONE: added an explicit comment at
+  the `ctl_rx.recv()` select-arm explaining that the closed channel
+  disables the arm by design (no controller without web/daemon), not a bug.
 
 ## 5. User experience & CLI
 

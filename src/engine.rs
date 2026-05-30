@@ -924,6 +924,13 @@ impl TorrentEngine {
                 _ = violation_gc_timer.tick() => {
                     peers.gc_violations();
                 }
+                // Control arm. NOTE: in standalone mode with `--web` off,
+                // the only `ctl_tx` was dropped above, so this channel is
+                // closed from the start: `recv()` returns `None`, the
+                // `Some(..) =` pattern never matches, and `tokio::select!`
+                // treats the arm as permanently disabled. That's by design
+                // (no controller exists without the web server / daemon),
+                // NOT a bug — the engine just runs to completion uncontrolled.
                 Some(ctl) = ctl_rx.recv() => {
                     match ctl {
                         EngineControl::Pause => {
