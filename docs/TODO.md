@@ -152,8 +152,12 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   `padded.resize()` allocates a full piece buffer each write; reuse a
   scratch buffer. `plaintext[..].to_vec()` on read clones — return a slice
   where possible.
-- [ ] **P2 — disk `flush()` per piece recomputes `slices_for_piece`.**
-  `storage/disk.rs` — cache the slice mapping; consider batching flushes.
+- [x] **P2 — disk `flush()` per piece recomputes `slices_for_piece`.**
+  `storage/disk.rs` — DONE: `write_piece` called `slices_for_piece` twice
+  (write loop + flush loop). Now it records the touched file indices
+  during the write (slices are in file order, so a last-element check
+  dedups) and flushes exactly those, dropping the redundant recompute.
+  Verified by the multi-file disk test + the multi-file download e2e.
 - [ ] **P2 — µTP `Send` command allocates `Vec<u8>` per chunk.**
   `utp/socket.rs` — a block split into N packets allocates N times;
   consider `Arc<[u8]>` or a ring buffer.

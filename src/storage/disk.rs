@@ -115,15 +115,22 @@ async fn write_piece(layout: &Layout, files: &mut [File], index: usize, data: &[
     }
     let slices = layout.slices_for_piece(index, piece_size);
     let mut data_off: usize = 0;
+    // Track which files this piece touched (slices are in file order, so a
+    // last-element check dedups) to flush exactly those without recomputing
+    // the slice mapping a second time.
+    let mut touched: Vec<usize> = Vec::new();
     for (file_idx, file_off, count) in slices {
         let f = &mut files[file_idx];
         f.seek(SeekFrom::Start(file_off)).await?;
         f.write_all(&data[data_off..data_off + count as usize])
             .await?;
         data_off += count as usize;
+        if touched.last() != Some(&file_idx) {
+            touched.push(file_idx);
+        }
     }
     // Flush after every piece — safer than buffering and losing on crash.
-    for (file_idx, _, _) in layout.slices_for_piece(index, piece_size) {
+    for file_idx in touched {
         files[file_idx].flush().await?;
     }
     Ok(())
