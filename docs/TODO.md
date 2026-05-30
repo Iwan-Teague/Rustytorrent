@@ -193,19 +193,21 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 
 ## 7. Testing
 
-- [ ] **P0 — no end-to-end seeder↔leecher download test.** [verified]
-  All integration tests are component-level (`utp_engine_smoke` tests the
-  handshake only, not transfer; `web_smoke`/`daemon_smoke` test HTTP).
-  Add a test that seeds a generated torrent from one in-process engine
-  and downloads it with another over loopback, asserting byte-identical
-  output + matching hashes. This is the single biggest coverage gap and
-  would have caught regressions across this whole session.
+- [x] **P0 — end-to-end seeder↔leecher download test.** [DONE]
+  `tests/download_e2e.rs`: a seeder engine (started complete) serves a
+  leecher over loopback (no tracker, direct `--peer`); asserts
+  byte-identical output. Exercises the whole download path — handshake,
+  bitfield, rarest-first picker, pipelining, SHA-1 verify, disk writes,
+  completion — in ~0.5 s.
+- [x] **P1 — multi-file write-offset correctness test.** [DONE] Second
+  test in `download_e2e.rs`: a 2-file torrent whose boundary falls inside
+  a piece; asserts each file is written byte-identical (the virtual
+  offset map splits the straddling piece correctly).
 - [ ] **P1 — resume/restart test:** partial download persists and resumes
-  correctly (scan_resume rebuilds the bitfield).
-- [ ] **P1 — multi-file write-offset correctness test:** a multi-file
-  torrent writes pieces to the right file regions (virtual offset map).
+  correctly (scan_resume rebuilds the bitfield). (The e2e harness now
+  makes this easy to add.)
 - [ ] **P1 — `--select` end-to-end engine test** (only the
-  `PieceManager` unit is covered today).
+  `PieceManager` unit is covered today; reuse the e2e harness).
 - [ ] **P2 — choke scheduler under load** (many peers competing for the
   3+1 unchoke slots; fairness + anti-snubbing).
 - [ ] **P2 — property/fuzz the bencode + KRPC + message parsers** on

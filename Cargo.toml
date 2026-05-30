@@ -33,3 +33,4 @@ libc         = "0.2"                                        # if_nametoindex for
 
 [dev-dependencies]
 tokio-test   = "0.4"
+sha1         = "0.10"  # build piece hashes in the end-to-end download test
