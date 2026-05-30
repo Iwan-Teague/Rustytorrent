@@ -147,6 +147,8 @@ rustytorrent magnet <URI> [OPTIONS]        # download from a magnet link
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — module map, data flow, dependencies
 - [docs/ANONYMITY.md](docs/ANONYMITY.md) — threat model + verification
 - [docs/ROADMAP.md](docs/ROADMAP.md) — phase plan, current status
+- [docs/TODO.md](docs/TODO.md) — whole-project improvement backlog (security, privacy, perf, UX, tests, debt)
+- [docs/DAEMON.md](docs/DAEMON.md) — multi-torrent daemon design + remaining optimisations
 - [docs/TASKS.md](docs/TASKS.md) — granular task checklist per phase
 - [docs/AGENT_BUILD_GUIDE.md](docs/AGENT_BUILD_GUIDE.md) — original build-from-scratch guide
 
