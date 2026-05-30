@@ -9,6 +9,13 @@ use rustytorrent::tracker;
 #[derive(Parser)]
 #[command(name = "rustytorrent", about = "A BitTorrent client built in Rust")]
 struct Cli {
+    /// Increase log verbosity: -v = debug, -vv = trace. Overridden by
+    /// the RUST_LOG environment variable if set.
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+    /// Quiet: show only warnings and errors. Overridden by RUST_LOG.
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    quiet: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -257,13 +264,23 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // RUST_LOG wins if set; otherwise --quiet / -v(v) pick the default.
+    let default_level = if cli.quiet {
+        "warn"
+    } else {
+        match cli.verbose {
+            0 => "info",
+            1 => "debug",
+            _ => "trace",
+        }
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
         )
         .init();
-    let cli = Cli::parse();
     match cli.command {
         Commands::Info { file } => cmd_info(file).await,
         Commands::Peers {

@@ -126,11 +126,13 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   storage flush / tracker-stopped isn't truncated by the old fixed
   500 ms. (`remove()`'s detached 10 s reaper is left: it self-completes,
   so it's bounded, not a real leak.)
-- [ ] **P1 — storage-task channel sends `.unwrap()` in production.**
-  [claim] `main.rs` storage `cmd_tx.send(..).unwrap()` will panic if the
-  storage task died first. Audit all production `.send().unwrap()` /
-  `.unwrap()` against the "no panics in production paths" principle and
-  convert to graceful handling.
+- [x] **P1 — production panic audit.** [DONE — clean] Scanned the hot
+  files' non-test code: there are NO production `.unwrap()`s (the agent's
+  `main.rs send().unwrap()` claim was a false positive). The only
+  `.expect()`s left (`engine.rs` passphrase/dht, `dht/server.rs` persist)
+  are all locally invariant-guarded with comments ("checked above",
+  "guarded by `if`") — acceptable assertions, not input-panics. The "no
+  panics in production paths" principle already holds.
 - [ ] **P2 — 16-bit µTP seq_nr wraparound.** [verified, documented]
   `utp/connection.rs` `pending_in: BTreeMap<u16,...>` orders by raw u16,
   which breaks across a 65535→0 wrap (a >65k-packet, ~80 MB single µTP
@@ -152,9 +154,9 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   with no ETA/peers.) `log_progress` now prints instantaneous ↓/↑ rates,
   connected-peer count, and an ETA every progress tick — wanted-relative,
   so it reads correctly under `--select`/paused.
-- [ ] **P1 — `--verbose` / `--quiet` flags.** [verified] Verbosity is
-  only via `RUST_LOG`. Add flags that set the tracing filter so users
-  don't need the env var.
+- [x] **P1 — `--verbose` / `--quiet` flags.** [DONE] Global `-v` (debug),
+  `-vv` (trace), `-q` (warn) set the default tracing filter; `RUST_LOG`
+  still overrides. No more env-var-only verbosity control.
 - [ ] **P1 — magnet `add` to the daemon.** [verified gap] Daemon
   `POST /api/add` only takes a `.torrent` path; magnet URIs need the
   metadata-fetch flow wired into the add path (`fetch_metadata` →
