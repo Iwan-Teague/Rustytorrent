@@ -236,6 +236,23 @@ enum Commands {
         #[arg(long)]
         passphrase: Option<String>,
     },
+    /// Run as a multi-torrent daemon: host several torrents behind one
+    /// loopback web UI (status array + per-torrent pause/resume/remove).
+    /// First cut — tracker-only (DHT off) and one listen port per torrent;
+    /// see docs/DAEMON.md.
+    Daemon {
+        /// `.torrent` files to load at startup.
+        torrents: Vec<PathBuf>,
+        /// Destination directory for all torrents.
+        #[arg(long, default_value = ".")]
+        output: PathBuf,
+        /// Web UI port (bound to 127.0.0.1).
+        #[arg(long, default_value_t = 8080)]
+        web: u16,
+        /// Base listen port; torrent `i` uses `base + i`.
+        #[arg(long, default_value_t = 6881)]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -314,6 +331,12 @@ async fn main() -> Result<()> {
             spool,
             passphrase,
         } => cmd_decrypt(file, output, spool, passphrase).await,
+        Commands::Daemon {
+            torrents,
+            output,
+            web,
+            port,
+        } => cmd_daemon(torrents, output, web, port).await,
         Commands::Magnet {
             uri,
             output,
@@ -624,6 +647,64 @@ fn resolve_passphrase(flag: Option<String>) -> Result<String> {
         }
     }
     anyhow::bail!("--paranoid requires --passphrase or RUSTYTORRENT_PASSPHRASE (non-empty)")
+}
+
+async fn cmd_daemon(
+    torrents: Vec<PathBuf>,
+    output: PathBuf,
+    web: u16,
+    base_port: u16,
+) -> Result<()> {
+    use rustytorrent::session::SessionManager;
+
+    let mgr = SessionManager::new();
+    let peer_id = rustytorrent::peer_id::load_or_generate(&rustytorrent::peer_id::default_path());
+
+    for (i, path) in torrents.iter().enumerate() {
+        let raw = match tokio::fs::read(path).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skip {}: {e}", path.display());
+                continue;
+            }
+        };
+        let t = match TorrentFile::from_bytes(&raw) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skip {}: {e}", path.display());
+                continue;
+            }
+        };
+        let cfg = rustytorrent::engine::EngineConfig {
+            output_dir: output.clone(),
+            // One listen port per torrent (v1 — see docs/DAEMON.md).
+            listen_port: base_port.wrapping_add(i as u16),
+            // Tracker-only for now: a shared DHT is the documented
+            // follow-up; per-session DHTs would race on the state file.
+            enable_dht: false,
+            ..Default::default()
+        };
+        match mgr.add(t, peer_id, cfg).await {
+            Some(ih) => println!("added {} [{}]", path.display(), hex(&ih)),
+            None => println!("skip {} (already running)", path.display()),
+        }
+    }
+
+    println!(
+        "Daemon:     {} torrent(s); UI at http://127.0.0.1:{web}/ (loopback)",
+        mgr.len().await
+    );
+
+    // Serve until ctrl-c, then stop every session gracefully.
+    tokio::select! {
+        _ = rustytorrent::web::serve_daemon(web, mgr.clone()) => {}
+        _ = tokio::signal::ctrl_c() => {
+            println!("\nshutting down daemon...");
+        }
+    }
+    mgr.shutdown_all().await;
+    println!("Done.");
+    Ok(())
 }
 
 async fn cmd_decrypt(

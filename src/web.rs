@@ -22,7 +22,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
@@ -31,6 +31,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 
 use crate::engine::EngineControl;
+use crate::session::{InfoHash, SessionManager};
 
 /// Shared state for the web handlers: the latest stats (read) plus a
 /// control channel back into the engine (pause/resume).
@@ -100,6 +101,35 @@ pub struct FileProgress {
 }
 
 impl EngineStats {
+    /// A zeroed snapshot for a freshly-added session, before the engine
+    /// publishes its first real one. Used by the daemon's `watch`
+    /// channel initial value.
+    pub fn placeholder(
+        name: String,
+        info_hash: String,
+        total_bytes: u64,
+        total_pieces: usize,
+    ) -> Self {
+        Self {
+            name,
+            info_hash,
+            complete_pieces: 0,
+            total_pieces,
+            downloaded_bytes: 0,
+            uploaded_bytes: 0,
+            total_bytes,
+            peers_connected: 0,
+            elapsed_secs: 0,
+            down_rate_bps: 0,
+            up_rate_bps: 0,
+            complete: false,
+            paused: false,
+            remaining_bytes: total_bytes,
+            peers: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+
     /// Fraction complete in `[0.0, 1.0]`. Zero-piece torrents read as 1.0
     /// (nothing to download) rather than NaN.
     pub fn fraction(&self) -> f64 {
@@ -260,6 +290,160 @@ async fn control(st: &WebState, cmd: EngineControl) -> impl IntoResponse {
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
+
+// ---- Multi-torrent daemon router ----
+
+/// Build the daemon router over a [`SessionManager`]. `GET /api/status`
+/// returns an *array* of per-session stats; control is per info-hash.
+pub fn daemon_router(mgr: SessionManager) -> Router {
+    Router::new()
+        .route("/", get(daemon_index))
+        .route("/api/status", get(daemon_status))
+        .route("/api/torrent/:ih/pause", post(daemon_pause))
+        .route("/api/torrent/:ih/resume", post(daemon_resume))
+        .route("/api/torrent/:ih/remove", post(daemon_remove))
+        .with_state(mgr)
+}
+
+/// Serve the daemon UI/API on `127.0.0.1:port` (loopback only, same as
+/// the single-torrent server).
+pub async fn serve_daemon(port: u16, mgr: SessionManager) {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(target: "web", %addr, error = %e, "daemon web bind failed");
+            return;
+        }
+    };
+    tracing::info!(target: "web", %addr, "daemon UI at http://{addr}/");
+    if let Err(e) = axum::serve(listener, daemon_router(mgr)).await {
+        tracing::warn!(target: "web", error = %e, "daemon web server stopped");
+    }
+}
+
+async fn daemon_status(State(mgr): State<SessionManager>) -> impl IntoResponse {
+    axum::Json(mgr.snapshot().await)
+}
+
+async fn daemon_pause(
+    State(mgr): State<SessionManager>,
+    Path(ih): Path<String>,
+) -> impl IntoResponse {
+    daemon_ctl(&mgr, &ih, EngineControl::Pause).await
+}
+async fn daemon_resume(
+    State(mgr): State<SessionManager>,
+    Path(ih): Path<String>,
+) -> impl IntoResponse {
+    daemon_ctl(&mgr, &ih, EngineControl::Resume).await
+}
+async fn daemon_remove(
+    State(mgr): State<SessionManager>,
+    Path(ih): Path<String>,
+) -> impl IntoResponse {
+    let Some(h) = parse_info_hash(&ih) else {
+        return (StatusCode::BAD_REQUEST, "bad info_hash");
+    };
+    if mgr.remove(&h).await {
+        (StatusCode::OK, "removed")
+    } else {
+        (StatusCode::NOT_FOUND, "no such torrent")
+    }
+}
+
+async fn daemon_ctl(
+    mgr: &SessionManager,
+    ih: &str,
+    cmd: EngineControl,
+) -> (StatusCode, &'static str) {
+    let Some(h) = parse_info_hash(ih) else {
+        return (StatusCode::BAD_REQUEST, "bad info_hash");
+    };
+    if mgr.control(&h, cmd).await {
+        (StatusCode::OK, "ok")
+    } else {
+        (StatusCode::NOT_FOUND, "no such torrent")
+    }
+}
+
+/// Parse a 40-char lowercase-hex info-hash into 20 bytes.
+fn parse_info_hash(s: &str) -> Option<InfoHash> {
+    if s.len() != 40 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+async fn daemon_index() -> Html<&'static str> {
+    Html(DAEMON_HTML)
+}
+
+/// Multi-torrent dashboard: a row per torrent with a progress bar and
+/// pause/resume/remove actions. Polls the array endpoint once a second.
+const DAEMON_HTML: &str = r##"<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RustyTorrent — daemon</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.25rem; }
+  .t { border: 1px solid #eee; border-radius: 6px; padding: .75rem 1rem; margin: .75rem 0; }
+  .row { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+  .name { font-weight: 600; word-break: break-all; }
+  .bar { height: 1rem; background: #eee; border-radius: 4px; overflow: hidden; margin: .4rem 0; }
+  .fill { height: 100%; background: #2d7; width: 0; transition: width .3s; }
+  .done .fill { background: #29f; }
+  .meta { color: #666; font-size: 13px; }
+  button { font: inherit; padding: .1rem .5rem; cursor: pointer; margin-left: .25rem; }
+  .empty { color: #999; }
+</style></head><body>
+<h1>RustyTorrent <span class="meta" id="count"></span></h1>
+<div id="list"><p class="empty">Loading…</p></div>
+<script>
+const fmtBytes = b => { const u=["B","KiB","MiB","GiB","TiB"]; let i=0; b=Number(b); while(b>=1024&&i<u.length-1){b/=1024;i++;} return b.toFixed(i?1:0)+" "+u[i]; };
+async function act(ih, action) { try { await fetch(`/api/torrent/${ih}/${action}`, {method:"POST"}); await tick(); } catch(e){} }
+async function tick() {
+  let list;
+  try { list = await (await fetch("/api/status")).json(); } catch(e){ return; }
+  document.getElementById("count").textContent = list.length ? `(${list.length})` : "";
+  const root = document.getElementById("list");
+  if (!list.length) { root.innerHTML = '<p class="empty">No torrents.</p>'; return; }
+  root.innerHTML = "";
+  for (const s of list) {
+    const frac = s.total_pieces ? s.complete_pieces/s.total_pieces : 1;
+    const div = document.createElement("div");
+    div.className = "t" + (s.complete ? " done" : "");
+    const head = document.createElement("div"); head.className = "row";
+    const name = document.createElement("span"); name.className = "name"; name.textContent = s.name;
+    const pct = document.createElement("span"); pct.className = "meta";
+    pct.textContent = (frac*100).toFixed(1) + "%" + (s.complete?" ✓":s.paused?" (paused)":"");
+    head.append(name, pct);
+    const bar = document.createElement("div"); bar.className = "bar";
+    const fill = document.createElement("div"); fill.className = "fill"; fill.style.width=(frac*100).toFixed(1)+"%";
+    bar.appendChild(fill);
+    const meta = document.createElement("div"); meta.className = "row meta";
+    const stat = document.createElement("span");
+    stat.textContent = `${fmtBytes(s.downloaded_bytes)} / ${fmtBytes(s.total_bytes)} · ↓${fmtBytes(s.down_rate_bps)}/s · ${s.peers_connected} peers`;
+    const actions = document.createElement("span");
+    const pause = document.createElement("button");
+    pause.textContent = s.paused ? "Resume" : "Pause";
+    pause.onclick = () => act(s.info_hash, s.paused ? "resume" : "pause");
+    const rm = document.createElement("button"); rm.textContent = "Remove";
+    rm.onclick = () => { if (confirm("Remove " + s.name + "?")) act(s.info_hash, "remove"); };
+    actions.append(pause, rm);
+    meta.append(stat, actions);
+    div.append(head, bar, meta);
+    root.appendChild(div);
+  }
+}
+tick(); setInterval(tick, 1000);
+</script></body></html>
+"##;
 
 /// Self-contained status page — no external assets, polls `/api/status`
 /// once a second and redraws a progress bar + counters.

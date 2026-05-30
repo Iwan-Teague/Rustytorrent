@@ -10,6 +10,7 @@ pub mod piece;
 pub mod ratelimit;
 pub mod sandbox;
 pub mod scheduler;
+pub mod session;
 pub mod socks5;
 pub mod storage;
 pub mod tracker;

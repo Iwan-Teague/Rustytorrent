@@ -97,11 +97,16 @@ pub(super) async fn spawn(
             rt.insert(c);
         }
     }
+    // Compute the table size before the macro: holding the lock guard's
+    // borrow across the await inside the tracing args makes the enclosing
+    // future non-Send, which breaks `tokio::spawn(engine.run())` in the
+    // daemon (the single-torrent path runs un-spawned and never noticed).
+    let warm_contacts = state.routing.lock().await.len();
     tracing::info!(
         target: "dht",
         port = listen_port,
         node_id = %local_id,
-        warm_contacts = state.routing.lock().await.len(),
+        warm_contacts,
         "dht listening"
     );
     tokio::spawn(run(sock, state, bootstrap, persist_path, cmd_rx));
