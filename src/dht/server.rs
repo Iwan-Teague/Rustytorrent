@@ -68,6 +68,7 @@ const MAX_QUERY_LIMIT_IPS: usize = 4096;
 /// announce_peer queries.
 type PeerStore = HashMap<[u8; 20], Vec<(SocketAddr, Instant)>>;
 
+#[allow(clippy::too_many_arguments)] // each arg is a distinct spawn-time knob
 pub(super) async fn spawn(
     listen_port: u16,
     bootstrap: Vec<String>,
@@ -75,9 +76,16 @@ pub(super) async fn spawn(
     warm_contacts: Vec<Contact>,
     persist_path: Option<std::path::PathBuf>,
     cmd_rx: mpsc::Receiver<DhtCommand>,
+    bind_iface: Option<String>,
 ) -> Result<(), std::io::Error> {
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port);
-    let sock = UdpSocket::bind(bind).await?;
+    // With a kill-switch interface set, pin the DHT's UDP socket to it so
+    // its traffic fails closed if the tunnel drops — matching the TCP peer
+    // dials. Without it, a normal unbound bind.
+    let sock = match bind_iface.as_deref() {
+        Some(iface) => crate::netbind::bind_udp_to_interface(bind, iface)?,
+        None => UdpSocket::bind(bind).await?,
+    };
     let sock = Arc::new(sock);
     let local_id = node_id.unwrap_or_else(NodeId::random);
     let state = Arc::new(SharedState::new(local_id));

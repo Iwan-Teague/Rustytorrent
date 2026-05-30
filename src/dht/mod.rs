@@ -66,10 +66,16 @@ impl Dht {
     /// `persist_path` is where the routing table is loaded from on startup
     /// (if present) and saved to every 5 minutes. Pass `None` to disable
     /// persistence — the DHT will re-bootstrap from scratch each run.
+    ///
+    /// `bind_iface` pins the DHT's UDP socket to a network interface (the
+    /// VPN kill switch): `Some("utun0")` makes DHT traffic fail closed if
+    /// the tunnel drops, just like the TCP peer dials. `None` binds the
+    /// default route.
     pub async fn spawn(
         listen_port: u16,
         bootstrap: Vec<String>,
         persist_path: Option<PathBuf>,
+        bind_iface: Option<String>,
     ) -> Result<Self, std::io::Error> {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         // Try loading previously-persisted state. Failure → empty start.
@@ -91,6 +97,7 @@ impl Dht {
             warm_contacts,
             persist_path,
             cmd_rx,
+            bind_iface,
         )
         .await?;
         Ok(Self { cmd_tx })

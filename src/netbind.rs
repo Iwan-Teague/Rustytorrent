@@ -20,7 +20,7 @@ use std::io;
 use std::net::SocketAddr;
 
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 /// Connect to `target` with the outgoing socket bound to interface `iface`.
 ///
@@ -51,6 +51,28 @@ pub async fn connect_via_interface(target: SocketAddr, iface: &str) -> io::Resul
     })
     .await
     .map_err(|e| io::Error::other(format!("join error: {e}")))?
+}
+
+/// Bind a UDP socket to `local` with traffic pinned to interface `iface`
+/// — the kill-switch equivalent for the DHT's datagram socket. Returns an
+/// `io::Error` if the interface doesn't exist (so DHT fails to start
+/// rather than leaking onto the default route).
+///
+/// Unlike the TCP path there's no blocking `connect`, so this is a plain
+/// (non-async) constructor; it must be called from within a tokio runtime
+/// because `UdpSocket::from_std` registers the socket with the reactor.
+pub fn bind_udp_to_interface(local: SocketAddr, iface: &str) -> io::Result<UdpSocket> {
+    let domain = if local.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    bind_socket_to_interface(&socket, iface, local.is_ipv4())?;
+    socket.bind(&local.into())?;
+    socket.set_nonblocking(true)?;
+    let std_sock: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_sock)
 }
 
 /// Apply the per-platform setsockopt that binds `socket` to `iface`.
@@ -145,5 +167,16 @@ mod tests {
                 "rt_nonexistent_iface_xyz123",
             ));
         assert!(res.is_err(), "expected error for missing interface");
+    }
+
+    #[test]
+    fn udp_missing_interface_is_rejected() {
+        // The DHT-socket kill-switch path must also fail closed on an
+        // interface that doesn't exist rather than binding the default route.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(async {
+            bind_udp_to_interface("0.0.0.0:0".parse().unwrap(), "rt_nonexistent_iface_xyz123")
+        });
+        assert!(res.is_err(), "expected error for missing interface (UDP)");
     }
 }

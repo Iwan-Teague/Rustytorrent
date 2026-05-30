@@ -93,10 +93,11 @@ the default route and leaking your real IP.
 
 - ✅ **Peer dials** (TCP, and the first hop of a SOCKS5 chain) are bound to
   the interface. If it disappears, the dial fails rather than re-routing.
-- ✅ **DHT is force-disabled** when `--bind-iface` is set. Its UDP socket
-  isn't interface-bound, so leaving it on could leak past the kill switch;
-  we fail closed.
-- ✅ **µTP is force-disabled** likewise (UDP, not interface-bound).
+- ✅ **The DHT's UDP socket is bound to the interface** (`IP_BOUND_IF` /
+  `SO_BINDTODEVICE`), so DHT traffic fails closed with the rest of the kill
+  switch if the tunnel drops — DHT stays usable under `--bind-iface`.
+- ✅ **µTP is force-disabled** under `--bind-iface` (its socket isn't
+  interface-bound in this build).
 - ⚠️ **Tracker HTTP is NOT interface-bound.** The HTTP client (`reqwest`)
   doesn't expose per-interface binding, so tracker announces ride the OS's
   normal routing. For a complete kill switch, **pair `--bind-iface` with

@@ -12,10 +12,10 @@
 //! Layers, each a focused commit so a reviewer can audit them
 //! independently: the packet codec (`packet`), the pure-logic
 //! per-connection state machine (`connection`), the UDP socket runtime
-//! + `AsyncRead`/`AsyncWrite` bridge (`socket`), and the engine
-//! integration (`--utp`: parallel TCP+µTP dial; off under `--anonymous`
-//! / SOCKS5 / `--bind-iface` since UDP can't ride a proxy or be
-//! interface-bound here).
+//! with its `AsyncRead`/`AsyncWrite` bridge (`socket`), and the engine
+//! integration (`--utp`: parallel TCP+µTP dial, disabled under
+//! `--anonymous`, SOCKS5, or `--bind-iface` since UDP can't ride a proxy
+//! or be interface-bound here).
 //!
 //! ## Congestion control & loss recovery
 //!

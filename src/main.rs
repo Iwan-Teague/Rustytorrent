@@ -496,7 +496,7 @@ async fn cmd_download(
 
     if let Some(iface) = &bind_iface {
         println!("Bound to:   {iface} (VPN kill switch)");
-        println!("            note: peer dials are bound to {iface} and DHT is disabled,");
+        println!("            note: peer dials and the DHT socket are bound to {iface},");
         println!("            but tracker HTTP (reqwest) can't be interface-bound — pair");
         println!("            with --socks5 for a tracker that also rides the tunnel.");
     }
@@ -822,7 +822,7 @@ async fn cmd_magnet(
             "router.utorrent.com:6881".to_string(),
             "dht.transmissionbt.com:6881".to_string(),
         ];
-        match rustytorrent::dht::Dht::spawn(port, bootstrap, None).await {
+        match rustytorrent::dht::Dht::spawn(port, bootstrap, None, None).await {
             Ok(d) => {
                 // Brief warm-up so get_peers has something to work
                 // with. Engine's persistent table would be better
@@ -884,7 +884,7 @@ async fn cmd_magnet(
     }
     if let Some(iface) = &bind_iface {
         println!("Bound to:   {iface} (VPN kill switch)");
-        println!("            note: peer dials are bound to {iface} and DHT is disabled,");
+        println!("            note: peer dials and the DHT socket are bound to {iface},");
         println!("            but tracker HTTP (reqwest) can't be interface-bound — pair");
         println!("            with --socks5 for a tracker that also rides the tunnel.");
     }
