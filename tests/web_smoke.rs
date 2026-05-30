@@ -2,8 +2,9 @@
 //! router on an ephemeral loopback port, then hit each route over real
 //! HTTP and check the responses reflect the published stats.
 
-use rustytorrent::web::{router, EngineStats};
-use tokio::sync::watch;
+use rustytorrent::engine::EngineControl;
+use rustytorrent::web::{router, EngineStats, WebState};
+use tokio::sync::{mpsc, watch};
 
 fn sample() -> EngineStats {
     EngineStats {
@@ -19,6 +20,7 @@ fn sample() -> EngineStats {
         down_rate_bps: 60,
         up_rate_bps: 10,
         complete: false,
+        paused: false,
         peers: vec!["10.0.0.1:6881".into(), "10.0.0.2:6881".into()],
         files: vec![rustytorrent::web::FileProgress {
             path: "movie.mkv".into(),
@@ -32,10 +34,11 @@ fn sample() -> EngineStats {
 #[tokio::test]
 async fn serves_status_metrics_and_index() {
     let (tx, rx) = watch::channel(sample());
+    let (ctl_tx, mut ctl_rx) = mpsc::channel::<EngineControl>(8);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router(rx)).await;
+        let _ = axum::serve(listener, router(WebState { rx, ctl: ctl_tx })).await;
     });
 
     let base = format!("http://{addr}");
@@ -126,4 +129,17 @@ async fn serves_status_metrics_and_index() {
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["complete_pieces"], 10);
     assert_eq!(v["complete"], true);
+
+    // POST /api/pause forwards a control command into the engine channel.
+    let resp = client
+        .post(format!("{base}/api/pause"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), ctl_rx.recv())
+        .await
+        .expect("control command should arrive")
+        .expect("channel open");
+    assert!(matches!(cmd, EngineControl::Pause));
 }

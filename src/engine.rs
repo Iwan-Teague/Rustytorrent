@@ -25,6 +25,18 @@ use crate::storage::{
 use crate::tracker::{self, AnnounceRequest, Event};
 use crate::web::EngineStats;
 
+/// Control messages the web UI (or any controller) can send into a
+/// running engine. Kept minimal — pause/resume of the single torrent,
+/// which fits the one-torrent-per-process model (no daemon needed).
+#[derive(Debug, Clone, Copy)]
+pub enum EngineControl {
+    /// Stop issuing new block requests (download pauses; we keep
+    /// seeding what we have).
+    Pause,
+    /// Resume issuing block requests.
+    Resume,
+}
+
 /// Outstanding block requests per unchoked peer.
 pub const PIPELINE_DEPTH: usize = 5;
 
@@ -186,6 +198,9 @@ pub struct TorrentEngine {
     /// wants current speed, not the session average). `None` until the
     /// first sample.
     rate_last: Option<(Instant, u64, u64)>,
+    /// Download paused via the control API: while true we issue no new
+    /// block requests (in-flight ones still land; uploads continue).
+    paused: bool,
     /// In-memory LRU of whole pieces, populated on each upload-side miss.
     /// Lets us serve all blocks of a popular piece from RAM after the first
     /// read instead of going back to disk per-block.
@@ -243,6 +258,7 @@ impl TorrentEngine {
             start_time: Instant::now(),
             last_progress: Instant::now(),
             rate_last: None,
+            paused: false,
             upload_cache: PieceCache::default(),
             download_bucket,
             upload_bucket,
@@ -723,14 +739,21 @@ impl TorrentEngine {
         // tick; the axum server (loopback only) serves whatever the
         // latest value is. A bind failure inside `web::serve` is
         // non-fatal — monitoring must never take down a download.
+        // Control channel: the web server (pause/resume) sends commands
+        // into the loop. Always created so the select arm is uniform;
+        // when web is off the sender is dropped and the arm goes inert.
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<EngineControl>(8);
         let web_tx: Option<tokio::sync::watch::Sender<EngineStats>> = match self.cfg.web_port {
             Some(port) => {
                 let (tx, rx) =
                     tokio::sync::watch::channel(self.build_stats(Vec::new(), 0, 0, Vec::new()));
-                tokio::spawn(crate::web::serve(port, rx));
+                tokio::spawn(crate::web::serve(port, rx, ctl_tx));
                 Some(tx)
             }
-            None => None,
+            None => {
+                drop(ctl_tx);
+                None
+            }
         };
 
         // C2 — engage the seccomp sandbox last in startup. By now the
@@ -843,6 +866,24 @@ impl TorrentEngine {
                 }
                 _ = violation_gc_timer.tick() => {
                     peers.gc_violations();
+                }
+                Some(ctl) = ctl_rx.recv() => {
+                    match ctl {
+                        EngineControl::Pause => {
+                            self.paused = true;
+                            tracing::info!(target: "engine", "download paused via control API");
+                        }
+                        EngineControl::Resume => {
+                            self.paused = false;
+                            tracing::info!(target: "engine", "download resumed via control API");
+                            // Kick the pipeline back into motion for every
+                            // peer that isn't choking us.
+                            let addrs: Vec<SocketAddr> = peers.addrs().copied().collect();
+                            for a in addrs {
+                                self.maybe_request_blocks(a, &peers);
+                            }
+                        }
+                    }
                 }
                 Some((stream, addr)) = incoming_rx.recv() => {
                     if !peers.accept_incoming(stream, addr) {
@@ -1381,6 +1422,11 @@ impl TorrentEngine {
     }
 
     fn maybe_request_blocks(&mut self, addr: SocketAddr, peers: &PeerManager) {
+        // Paused: issue no new requests. In-flight blocks still arrive
+        // and complete; we just stop asking for more.
+        if self.paused {
+            return;
+        }
         if *self.peer_choking_us.get(&addr).unwrap_or(&true) {
             return;
         }
@@ -1493,6 +1539,7 @@ impl TorrentEngine {
             down_rate_bps,
             up_rate_bps,
             complete: self.pm.is_complete(),
+            paused: self.paused,
             peers,
             files,
         }

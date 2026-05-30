@@ -23,11 +23,22 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use serde::Serialize;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+
+use crate::engine::EngineControl;
+
+/// Shared state for the web handlers: the latest stats (read) plus a
+/// control channel back into the engine (pause/resume).
+#[derive(Clone)]
+pub struct WebState {
+    pub rx: watch::Receiver<EngineStats>,
+    pub ctl: mpsc::Sender<EngineControl>,
+}
 
 /// A snapshot of a running download, published to the web layer each
 /// progress tick. Cheap to clone; carries only scalars + the torrent
@@ -60,6 +71,8 @@ pub struct EngineStats {
     pub up_rate_bps: u64,
     /// True once every piece is downloaded.
     pub complete: bool,
+    /// True when the download is paused via the control API.
+    pub paused: bool,
     /// Addresses of the currently-connected peers (`ip:port`). Loopback-
     /// only endpoint, so listing the swarm we're talking to is fine.
     pub peers: Vec<String>,
@@ -164,24 +177,26 @@ impl EngineStats {
     }
 }
 
-/// Build the monitoring router over a stats `watch` receiver. Split out
-/// from [`serve`] so tests can drive it over an ephemeral listener.
-pub fn router(rx: watch::Receiver<EngineStats>) -> Router {
+/// Build the monitoring + control router. Split out from [`serve`] so
+/// tests can drive it over an ephemeral listener.
+pub fn router(state: WebState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/status", get(status_json))
         .route("/api/peers", get(peers_json))
         .route("/api/files", get(files_json))
+        .route("/api/pause", post(pause))
+        .route("/api/resume", post(resume))
         .route("/metrics", get(metrics))
-        .with_state(rx)
+        .with_state(state)
 }
 
 /// Spawn the monitoring server on `127.0.0.1:port`, reading the latest
-/// stats from `rx`. Runs until the process exits (or the bind fails, in
-/// which case it logs and returns — monitoring is non-essential and must
-/// never take down a download).
-pub async fn serve(port: u16, rx: watch::Receiver<EngineStats>) {
-    let app = router(rx);
+/// stats from `rx` and forwarding pause/resume to `ctl`. Runs until the
+/// process exits (or the bind fails, in which case it logs and returns —
+/// monitoring is non-essential and must never take down a download).
+pub async fn serve(port: u16, rx: watch::Receiver<EngineStats>, ctl: mpsc::Sender<EngineControl>) {
+    let app = router(WebState { rx, ctl });
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -196,25 +211,42 @@ pub async fn serve(port: u16, rx: watch::Receiver<EngineStats>) {
     }
 }
 
-async fn status_json(State(rx): State<watch::Receiver<EngineStats>>) -> impl IntoResponse {
-    let stats = rx.borrow().clone();
+async fn status_json(State(st): State<WebState>) -> impl IntoResponse {
+    let stats = st.rx.borrow().clone();
     // Hand to axum's Json so the name field is correctly escaped.
     axum::Json(stats)
 }
 
-async fn peers_json(State(rx): State<watch::Receiver<EngineStats>>) -> impl IntoResponse {
-    let peers = rx.borrow().peers.clone();
+async fn peers_json(State(st): State<WebState>) -> impl IntoResponse {
+    let peers = st.rx.borrow().peers.clone();
     axum::Json(peers)
 }
 
-async fn files_json(State(rx): State<watch::Receiver<EngineStats>>) -> impl IntoResponse {
-    let files = rx.borrow().files.clone();
+async fn files_json(State(st): State<WebState>) -> impl IntoResponse {
+    let files = st.rx.borrow().files.clone();
     axum::Json(files)
 }
 
-async fn metrics(State(rx): State<watch::Receiver<EngineStats>>) -> impl IntoResponse {
-    let body = rx.borrow().render_prometheus();
+async fn metrics(State(st): State<WebState>) -> impl IntoResponse {
+    let body = st.rx.borrow().render_prometheus();
     ([("content-type", "text/plain; version=0.0.4")], body)
+}
+
+async fn pause(State(st): State<WebState>) -> impl IntoResponse {
+    control(&st, EngineControl::Pause).await
+}
+
+async fn resume(State(st): State<WebState>) -> impl IntoResponse {
+    control(&st, EngineControl::Resume).await
+}
+
+async fn control(st: &WebState, cmd: EngineControl) -> impl IntoResponse {
+    match st.ctl.send(cmd).await {
+        Ok(()) => (StatusCode::OK, "ok"),
+        // The engine loop is gone (shutting down) — report it rather
+        // than pretend success.
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "engine unavailable"),
+    }
 }
 
 async fn index() -> Html<&'static str> {
@@ -241,7 +273,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
 </style>
 </head>
 <body>
-  <h1 id="name">RustyTorrent</h1>
+  <h1 id="name">RustyTorrent <button id="pause" style="float:right;font:inherit;padding:.15rem .6rem;cursor:pointer">Pause</button></h1>
   <div class="bar"><div class="fill" id="fill"></div></div>
   <canvas id="spark" width="608" height="56" style="width:100%;height:56px;margin-top:1rem;background:#fafafa;border-radius:4px"></canvas>
   <div class="k" style="text-align:right;font-size:12px" id="sparkmax">—</div>
@@ -315,6 +347,9 @@ async function tick() {
     document.getElementById("peers").textContent = s.peers_connected;
     document.getElementById("elapsed").textContent = fmtDur(s.elapsed_secs);
     document.getElementById("ih").textContent = s.info_hash;
+    const btn = document.getElementById("pause");
+    btn.textContent = s.paused ? "Resume" : "Pause";
+    btn.dataset.action = s.paused ? "resume" : "pause";
     const peers = s.peers || [];
     document.getElementById("pcount").textContent = peers.length;
     const ul = document.getElementById("peers");
@@ -347,6 +382,11 @@ async function tick() {
     }
   } catch (e) { /* engine gone or starting — keep last values */ }
 }
+document.getElementById("pause").addEventListener("click", async (e) => {
+  const action = e.target.dataset.action || "pause";
+  try { await fetch("/api/" + action, { method: "POST" }); await tick(); }
+  catch (err) { /* engine gone */ }
+});
 tick(); setInterval(tick, 1000);
 </script>
 </body>
@@ -371,6 +411,7 @@ mod tests {
             down_rate_bps: 11_000,
             up_rate_bps: 2_000,
             complete: false,
+            paused: false,
             peers: vec!["1.2.3.4:6881".into(), "[::1]:51413".into()],
             files: vec![FileProgress {
                 path: "a/b.txt".into(),
