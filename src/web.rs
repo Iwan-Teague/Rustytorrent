@@ -63,6 +63,24 @@ pub struct EngineStats {
     /// Addresses of the currently-connected peers (`ip:port`). Loopback-
     /// only endpoint, so listing the swarm we're talking to is fine.
     pub peers: Vec<String>,
+    /// Per-file download progress (multi-file torrents). Empty for a
+    /// single-file torrent.
+    pub files: Vec<FileProgress>,
+}
+
+/// Per-file progress for the status UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileProgress {
+    /// File path within the torrent (relative).
+    pub path: String,
+    /// File length in bytes.
+    pub length: u64,
+    /// Fraction of the file's bytes that live in completed pieces,
+    /// `[0.0, 1.0]`.
+    pub fraction: f64,
+    /// Whether this file is part of the selective-download set (always
+    /// true when no `--select` is given).
+    pub wanted: bool,
 }
 
 impl EngineStats {
@@ -153,6 +171,7 @@ pub fn router(rx: watch::Receiver<EngineStats>) -> Router {
         .route("/", get(index))
         .route("/api/status", get(status_json))
         .route("/api/peers", get(peers_json))
+        .route("/api/files", get(files_json))
         .route("/metrics", get(metrics))
         .with_state(rx)
 }
@@ -186,6 +205,11 @@ async fn status_json(State(rx): State<watch::Receiver<EngineStats>>) -> impl Int
 async fn peers_json(State(rx): State<watch::Receiver<EngineStats>>) -> impl IntoResponse {
     let peers = rx.borrow().peers.clone();
     axum::Json(peers)
+}
+
+async fn files_json(State(rx): State<watch::Receiver<EngineStats>>) -> impl IntoResponse {
+    let files = rx.borrow().files.clone();
+    axum::Json(files)
 }
 
 async fn metrics(State(rx): State<watch::Receiver<EngineStats>>) -> impl IntoResponse {
@@ -232,6 +256,10 @@ const INDEX_HTML: &str = r##"<!doctype html>
     <span class="k">Elapsed</span><span id="elapsed">—</span>
     <span class="k">Info hash</span><span class="mono" id="ih">—</span>
   </div>
+  <details id="filesbox" style="margin-top:1rem" hidden>
+    <summary class="k">Files (<span id="fcount">0</span>)</summary>
+    <table id="files" style="width:100%;border-collapse:collapse;margin-top:.5rem;font-size:13px"></table>
+  </details>
   <details style="margin-top:1rem">
     <summary class="k">Connected peers (<span id="pcount">0</span>)</summary>
     <ul class="mono" id="peers" style="margin:.5rem 0 0; padding-left:1.25rem"></ul>
@@ -297,6 +325,26 @@ async function tick() {
                           // peer address can't inject markup
       ul.appendChild(li);
     }
+    const files = s.files || [];
+    document.getElementById("filesbox").hidden = files.length === 0;
+    document.getElementById("fcount").textContent = files.length;
+    const tbl = document.getElementById("files");
+    tbl.innerHTML = "";
+    for (const f of files) {
+      const tr = document.createElement("tr");
+      tr.style.opacity = f.wanted ? "1" : "0.5";
+      const name = document.createElement("td");
+      name.textContent = f.path; // textContent — paths come from the torrent
+      name.style.cssText = "padding:1px 8px 1px 0;font-family:ui-monospace,monospace;word-break:break-all";
+      const pct = document.createElement("td");
+      pct.textContent = (f.wanted ? "" : "(skipped) ") + Math.round((f.fraction||0)*100) + "%";
+      pct.style.cssText = "text-align:right;white-space:nowrap;color:#666";
+      const sz = document.createElement("td");
+      sz.textContent = fmtBytes(f.length);
+      sz.style.cssText = "text-align:right;white-space:nowrap;color:#999;padding-left:8px";
+      tr.append(name, pct, sz);
+      tbl.appendChild(tr);
+    }
   } catch (e) { /* engine gone or starting — keep last values */ }
 }
 tick(); setInterval(tick, 1000);
@@ -324,6 +372,12 @@ mod tests {
             up_rate_bps: 2_000,
             complete: false,
             peers: vec!["1.2.3.4:6881".into(), "[::1]:51413".into()],
+            files: vec![FileProgress {
+                path: "a/b.txt".into(),
+                length: 1234,
+                fraction: 0.5,
+                wanted: true,
+            }],
         }
     }
 

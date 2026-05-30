@@ -725,7 +725,8 @@ impl TorrentEngine {
         // non-fatal — monitoring must never take down a download.
         let web_tx: Option<tokio::sync::watch::Sender<EngineStats>> = match self.cfg.web_port {
             Some(port) => {
-                let (tx, rx) = tokio::sync::watch::channel(self.build_stats(Vec::new(), 0, 0));
+                let (tx, rx) =
+                    tokio::sync::watch::channel(self.build_stats(Vec::new(), 0, 0, Vec::new()));
                 tokio::spawn(crate::web::serve(port, rx));
                 Some(tx)
             }
@@ -834,8 +835,9 @@ impl TorrentEngine {
                         };
                         self.rate_last = Some((now, self.downloaded, self.uploaded));
                         let addrs: Vec<String> = peers.addrs().map(|a| a.to_string()).collect();
+                        let files = self.file_progress(&layout);
                         if let Some(tx) = &web_tx {
-                            let _ = tx.send(self.build_stats(addrs, down_rate, up_rate));
+                            let _ = tx.send(self.build_stats(addrs, down_rate, up_rate, files));
                         }
                     }
                 }
@@ -1469,7 +1471,13 @@ impl TorrentEngine {
     /// Build a stats snapshot for the web monitoring layer. The peer
     /// addresses come from the `PeerManager` (which lives in `run`'s
     /// scope, not on `self`), so the caller passes them in.
-    fn build_stats(&self, peers: Vec<String>, down_rate_bps: u64, up_rate_bps: u64) -> EngineStats {
+    fn build_stats(
+        &self,
+        peers: Vec<String>,
+        down_rate_bps: u64,
+        up_rate_bps: u64,
+        files: Vec<crate::web::FileProgress>,
+    ) -> EngineStats {
         EngineStats {
             name: self.torrent.info.name.clone(),
             info_hash: hex_lower(&self.torrent.info_hash),
@@ -1486,7 +1494,51 @@ impl TorrentEngine {
             up_rate_bps,
             complete: self.pm.is_complete(),
             peers,
+            files,
         }
+    }
+
+    /// Per-file completion for the web UI: for each file, the fraction of
+    /// its bytes that live in completed pieces, plus whether it's in the
+    /// selective-download set. Single-file torrents return an empty list
+    /// (the top-level progress already says everything). Computed from
+    /// the completed-piece bitfield and the file→piece overlap map.
+    fn file_progress(&self, layout: &Layout) -> Vec<crate::web::FileProgress> {
+        if layout.files.len() <= 1 {
+            return Vec::new();
+        }
+        let local = self.pm.local_bitfield();
+        let mut done = vec![0u64; layout.files.len()];
+        for i in 0..self.pm.num_pieces() {
+            if local[i] {
+                let psize = self.pm.piece_size(i);
+                for (fi, _off, count) in layout.slices_for_piece(i, psize) {
+                    done[fi] += count;
+                }
+            }
+        }
+        let selectors = &self.cfg.selected_files;
+        layout
+            .files
+            .iter()
+            .enumerate()
+            .map(|(fi, f)| {
+                let path = f.path.to_string_lossy().into_owned();
+                let wanted =
+                    selectors.is_empty() || selectors.iter().any(|s| path.contains(s.as_str()));
+                let fraction = if f.length == 0 {
+                    1.0
+                } else {
+                    (done[fi] as f64 / f.length as f64).min(1.0)
+                };
+                crate::web::FileProgress {
+                    path,
+                    length: f.length,
+                    fraction,
+                    wanted,
+                }
+            })
+            .collect()
     }
 
     fn log_progress(&mut self) {

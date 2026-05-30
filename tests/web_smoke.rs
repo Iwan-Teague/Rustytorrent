@@ -20,6 +20,12 @@ fn sample() -> EngineStats {
         up_rate_bps: 10,
         complete: false,
         peers: vec!["10.0.0.1:6881".into(), "10.0.0.2:6881".into()],
+        files: vec![rustytorrent::web::FileProgress {
+            path: "movie.mkv".into(),
+            length: 1000,
+            fraction: 0.3,
+            wanted: true,
+        }],
     }
 }
 
@@ -64,6 +70,21 @@ async fn serves_status_metrics_and_index() {
     .unwrap();
     assert_eq!(peers.as_array().unwrap().len(), 2);
     assert_eq!(peers[0], "10.0.0.1:6881");
+
+    // Per-file progress endpoint.
+    let files: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/api/files"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(files[0]["path"], "movie.mkv");
+    assert_eq!(files[0]["wanted"], true);
 
     // Prometheus endpoint exposes the series with the info_hash label.
     let metrics = client
