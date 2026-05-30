@@ -345,8 +345,14 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 - [ ] **P2 — `engine.rs run()` is ~500 lines of one `select!`.** Extract
   per-event handlers (tracker tick, choke tick, dht tick, peer event,
   control) to shrink the loop body.
-- [ ] **P2 — remove/justify `#[allow(dead_code)]`** in
-  `metadata_fetch.rs` (×2), `dht/server.rs`, `storage/memspool.rs`.
+- [x] **P2 — remove/justify `#[allow(dead_code)]`** in
+  `metadata_fetch.rs` (×2), `dht/server.rs`, `storage/memspool.rs`. DONE:
+  removed the two `metadata_fetch.rs` `const _ = CONST` import-keeper
+  hacks (and the now-unused `HANDSHAKE_LEN`/`BLOCK_SIZE` imports); removed
+  the genuinely-unused `memspool::diagnostic_backing_path` (+ its
+  `PathBuf` import) as YAGNI. Kept `dht/server.rs KrpcReply::Error` — it
+  IS constructed, its fields are intentionally captured-but-unread for
+  future error tracing, and the comment already justifies it.
 - [x] **P2 — document magic constants** (`ENDGAME_REMAINING = 5`,
   `INITIAL_WINDOW_PACKETS`, choke slot counts) with the rationale. DONE:
   expanded the doc comments on `ENDGAME_REMAINING` + `PIPELINE_DEPTH`

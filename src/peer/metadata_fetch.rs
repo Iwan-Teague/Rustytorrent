@@ -46,8 +46,8 @@ use crate::peer::extension::{
     parse_metadata_response, MetadataResponse, EXT_HANDSHAKE_ID, METADATA_PIECE_SIZE,
     OUR_UT_METADATA_ID,
 };
-use crate::peer::handshake::{supports_extension_protocol, Handshake, HANDSHAKE_LEN};
-use crate::peer::message::{read_frame, write_message, Message, BLOCK_SIZE};
+use crate::peer::handshake::{supports_extension_protocol, Handshake};
+use crate::peer::message::{read_frame, write_message, Message};
 use crate::peer_id::PeerId;
 use crate::socks5::{self, ProxyConfig};
 
@@ -499,20 +499,6 @@ async fn dial(addr: SocketAddr, proxies: &[ProxyConfig]) -> Result<TcpStream> {
         .map_err(|_| Error::Network(format!("connect {addr}: timeout")))?
         .map_err(|e| Error::Network(format!("connect {addr}: {e}")))
 }
-
-// `HANDSHAKE_LEN` is part of the `handshake` API; reference it so the
-// `unused_imports` lint doesn't fire when this module is read
-// independently (it implicitly bounds our peer-frame buffer
-// expectations even though we delegate the buffer to `read_exact`
-// inside the codec).
-#[allow(dead_code)]
-const _: usize = HANDSHAKE_LEN;
-
-// `BLOCK_SIZE` from message.rs is the BT block size, distinct from
-// `METADATA_PIECE_SIZE` — kept as a constant import to document that
-// the two happen to coincide at 16 KiB but mean different things.
-#[allow(dead_code)]
-const _: u32 = BLOCK_SIZE;
 
 #[cfg(test)]
 mod tests {

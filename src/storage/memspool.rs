@@ -32,8 +32,6 @@
 //! No header, no key derivation, no on-disk format — there's nothing
 //! to interoperate with.
 
-use std::path::PathBuf;
-
 use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
@@ -204,25 +202,6 @@ pub async fn scan_memspool_resume(_layout: &Layout) -> Result<Vec<usize>> {
 pub const SUPPORTED: bool = true;
 #[cfg(windows)]
 pub const SUPPORTED: bool = false;
-
-/// Path the backing file would live at on the platforms that
-/// could expose one (currently Linux `/dev/shm`). Returned for
-/// diagnostic logging only — the present implementation keeps the
-/// pieces in a heap `Vec` rather than mapping a file. Kept for
-/// future use; do not rely on it for I/O.
-#[allow(dead_code)]
-pub fn diagnostic_backing_path(torrent_name: &str) -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        let p = PathBuf::from("/dev/shm").join(format!("{torrent_name}.rustytorrent-memspool"));
-        Some(p)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = torrent_name;
-        None
-    }
-}
 
 #[cfg(test)]
 mod tests {
