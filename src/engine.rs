@@ -1572,9 +1572,10 @@ impl TorrentEngine {
         EngineStats {
             name: self.torrent.info.name.clone(),
             info_hash: hex_lower(&self.torrent.info_hash),
-            complete_pieces: self.pm.complete_count(),
-            // Denominator is the *wanted* count so the progress bar fills
-            // to 100% on a selective download (== num_pieces by default).
+            // Numerator + denominator are both *wanted*-relative so the
+            // bar fills to exactly 100% on a selective download and never
+            // exceeds it after a resume marked unwanted pieces present.
+            complete_pieces: self.pm.wanted_complete_count(),
             total_pieces: self.pm.wanted_count(),
             downloaded_bytes: self.downloaded,
             uploaded_bytes: self.uploaded,
@@ -1641,7 +1642,7 @@ impl TorrentEngine {
 
     fn log_progress(&mut self) {
         self.last_progress = Instant::now();
-        let done = self.pm.complete_count();
+        let done = self.pm.wanted_complete_count();
         let total = self.pm.wanted_count();
         let pct = (done as f64) / (total as f64) * 100.0;
         let secs = self.start_time.elapsed().as_secs_f64().max(0.001);

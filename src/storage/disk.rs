@@ -211,8 +211,20 @@ pub async fn scan_resume(layout: &Layout, piece_hashes: &[[u8; 20]]) -> Result<V
             }
             off += count as usize;
         }
-        if ok && crate::piece::verify_piece(&buf, expected) {
-            out.push(index);
+        if ok {
+            // SHA-1 is CPU-bound; running it inline here would block the
+            // tokio reactor for the whole resume scan (a multi-second
+            // freeze on a large torrent at cold start). Offload the hash
+            // to the blocking pool — the buffer is owned so it moves in
+            // cleanly. (Reads above are already async.)
+            let expected = *expected;
+            let matched =
+                tokio::task::spawn_blocking(move || crate::piece::verify_piece(&buf, &expected))
+                    .await
+                    .unwrap_or(false);
+            if matched {
+                out.push(index);
+            }
         }
     }
     Ok(out)

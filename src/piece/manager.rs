@@ -140,6 +140,18 @@ impl PieceManager {
         self.local.count_ones()
     }
 
+    /// Completed pieces that are also *wanted* — the display numerator
+    /// for selective download. Equals `complete_count` when nothing is
+    /// deselected. Without this, a resume that marked unwanted on-disk
+    /// pieces complete would push the displayed progress past 100%
+    /// (`complete_count` counts every local piece, but the denominator
+    /// is `wanted_count`).
+    pub fn wanted_complete_count(&self) -> usize {
+        (0..self.num_pieces)
+            .filter(|&i| self.wanted[i] && self.local[i])
+            .count()
+    }
+
     /// Wanted pieces we don't yet have — the real remaining work.
     pub fn missing_count(&self) -> usize {
         (0..self.num_pieces)
@@ -355,6 +367,26 @@ mod tests {
             pm.is_complete(),
             "complete once all WANTED pieces are local"
         );
+    }
+
+    #[test]
+    fn wanted_complete_count_never_exceeds_wanted() {
+        // Resume-style: every piece marked complete on disk, but only
+        // piece 1 is wanted. complete_count counts all 3; the display
+        // count must be just the 1 wanted-and-complete (no >100%).
+        let mut pm = PieceManager::new(100, 300, 3);
+        pm.set_wanted(&[false, true, false]);
+        pm.mark_complete_verified(0);
+        pm.mark_complete_verified(1);
+        pm.mark_complete_verified(2);
+        assert_eq!(pm.complete_count(), 3, "all three are local");
+        assert_eq!(pm.wanted_count(), 1);
+        assert_eq!(
+            pm.wanted_complete_count(),
+            1,
+            "display numerator must be wanted-relative"
+        );
+        assert!(pm.wanted_complete_count() <= pm.wanted_count());
     }
 
     #[test]

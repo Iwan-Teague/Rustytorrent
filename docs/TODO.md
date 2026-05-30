@@ -75,13 +75,10 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 
 ## 3. Performance & speed
 
-- [ ] **P0 — `scan_resume` hashes every piece inline on the async
-  runtime.** [verified] `storage/disk.rs:214` calls `verify_piece`
-  synchronously inside an `async fn`, blocking the reactor during
-  cold-start for the whole torrent (100k-piece torrent = multi-second
-  freeze). Live-download verify is already `spawn_blocking`
-  (`engine.rs:1162` [verified]) — do the same here, ideally batched
-  across cores.
+- [x] **P0 — `scan_resume` hashes every piece inline on the async
+  runtime.** [DONE] `storage/disk.rs` now offloads each piece's SHA-1 to
+  `spawn_blocking` so the resume scan no longer freezes the reactor.
+  Further win available: pipeline reads + hashing across cores (still P2).
 - [ ] **P1 — `picker.pick_for` rebuilds + sorts a candidates `Vec` every
   call.** [verified] `piece/picker.rs` does O(n log n) per block request
   over all pieces. For large torrents this is a hot path. Maintain an
@@ -118,15 +115,11 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 
 ## 4. Correctness & robustness
 
-- [ ] **P0 — `complete_count()` can exceed `wanted_count()` under
-  `--select` after a resume.** [verified] `complete_count()` =
-  `local.count_ones()` counts ALL local pieces; `scan_resume` marks
-  every on-disk verified piece (including unwanted ones) local. With
-  selective download, `build_stats`/`log_progress` then show
-  `complete_pieces > total_pieces` → >100% progress. Fix: count only
-  `wanted & local` for the displayed numerator (add
-  `pm.wanted_complete_count()`), OR have `scan_resume` skip unwanted
-  pieces.
+- [x] **P0 — `complete_count()` can exceed `wanted_count()` under
+  `--select` after a resume.** [DONE] Added
+  `PieceManager::wanted_complete_count()` (counts `wanted & local`) and
+  switched `build_stats` + `log_progress` to it, so the displayed
+  progress is wanted-relative and can't exceed 100%. Unit-tested.
 - [ ] **P1 — daemon shutdown race / abort window.** [verified]
   `session.rs shutdown_all` sleeps 500 ms then `abort()`s — too short if
   a session is mid storage-flush / tracker-stopped. `remove()` spawns a
