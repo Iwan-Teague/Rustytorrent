@@ -1572,7 +1572,7 @@ impl TorrentEngine {
     ) -> EngineStats {
         EngineStats {
             name: self.torrent.info.name.clone(),
-            info_hash: hex_lower(&self.torrent.info_hash),
+            info_hash: crate::util::hex(&self.torrent.info_hash),
             // Numerator + denominator are both *wanted*-relative so the
             // bar fills to exactly 100% on a selective download and never
             // exceeds it after a resume marked unwanted pieces present.
@@ -1709,16 +1709,6 @@ fn fmt_duration(secs: u64) -> String {
     }
     out.push_str(&format!("{s}s"));
     out
-}
-
-/// Lowercase hex of a byte slice (for the info-hash in web stats).
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 /// Bind the inbound peer listener as a dual-stack socket so both IPv4

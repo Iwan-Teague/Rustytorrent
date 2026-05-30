@@ -70,7 +70,7 @@ impl SessionManager {
 
         let initial = EngineStats::placeholder(
             torrent.info.name.clone(),
-            hex_lower(&info_hash),
+            crate::util::hex(&info_hash),
             torrent.total_length(),
             torrent.num_pieces(),
         );
@@ -160,16 +160,6 @@ impl SessionManager {
             None => false,
         }
     }
-}
-
-/// Lowercase hex of a byte slice.
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 #[cfg(test)]

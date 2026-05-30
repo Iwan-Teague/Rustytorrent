@@ -220,9 +220,12 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 
 ## 8. Code quality / tech debt
 
-- [ ] **P1 — `hex` is defined 5 times.** [verified] `main.rs hex`,
-  `engine.rs hex_lower`, `session.rs hex_lower`, `web.rs hex_lower`,
-  `magnet.rs hex_nibble`. Extract one `util::hex` (and a `from_hex`).
+- [x] **P1 — `hex` duplication.** [DONE] New `src/util.rs` with
+  `hex(&[u8]) -> String` and `info_hash_from_hex(&str) -> Option<[u8;20]>`
+  (unit-tested). Replaced the encode copies in `main.rs`/`engine.rs`/
+  `session.rs`/`web.rs` and the web `parse_info_hash` decode. (`magnet.rs`
+  keeps its own nibble parser — it also handles base32 btih, so it's not
+  the same function.)
 - [ ] **P1 — CLI arg duplication between `download` and `magnet`** (~17
   identical flags, twice). [verified] Factor a `#[derive(Args)]
   SharedDownloadArgs` `#[command(flatten)]`'d into both, and a shared

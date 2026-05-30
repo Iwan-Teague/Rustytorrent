@@ -407,13 +407,7 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+use rustytorrent::util::hex;
 
 async fn cmd_info(path: PathBuf) -> Result<()> {
     let raw = tokio::fs::read(&path)

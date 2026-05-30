@@ -31,7 +31,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 
 use crate::engine::EngineControl;
-use crate::session::{InfoHash, SessionManager};
+use crate::session::SessionManager;
 
 /// Shared state for the web handlers: the latest stats (read) plus a
 /// control channel back into the engine (pause/resume).
@@ -363,7 +363,7 @@ async fn daemon_add(State(st): State<DaemonState>, body: String) -> impl IntoRes
         ..Default::default()
     };
     match st.mgr.add(torrent, st.peer_id, cfg).await {
-        Some(ih) => (StatusCode::OK, hex_lower(&ih)),
+        Some(ih) => (StatusCode::OK, crate::util::hex(&ih)),
         None => (StatusCode::CONFLICT, "already running".to_string()),
     }
 }
@@ -375,7 +375,7 @@ async fn daemon_resume(State(st): State<DaemonState>, Path(ih): Path<String>) ->
     daemon_ctl(&st.mgr, &ih, EngineControl::Resume).await
 }
 async fn daemon_remove(State(st): State<DaemonState>, Path(ih): Path<String>) -> impl IntoResponse {
-    let Some(h) = parse_info_hash(&ih) else {
+    let Some(h) = crate::util::info_hash_from_hex(&ih) else {
         return (StatusCode::BAD_REQUEST, "bad info_hash");
     };
     if st.mgr.remove(&h).await {
@@ -390,7 +390,7 @@ async fn daemon_ctl(
     ih: &str,
     cmd: EngineControl,
 ) -> (StatusCode, &'static str) {
-    let Some(h) = parse_info_hash(ih) else {
+    let Some(h) = crate::util::info_hash_from_hex(ih) else {
         return (StatusCode::BAD_REQUEST, "bad info_hash");
     };
     if mgr.control(&h, cmd).await {
@@ -398,28 +398,6 @@ async fn daemon_ctl(
     } else {
         (StatusCode::NOT_FOUND, "no such torrent")
     }
-}
-
-/// Lowercase hex of a byte slice.
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-/// Parse a 40-char lowercase-hex info-hash into 20 bytes.
-fn parse_info_hash(s: &str) -> Option<InfoHash> {
-    if s.len() != 40 {
-        return None;
-    }
-    let mut out = [0u8; 20];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
 }
 
 async fn daemon_index() -> Html<&'static str> {
