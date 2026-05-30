@@ -112,17 +112,26 @@ impl SessionManager {
     }
 
     /// Gracefully stop every session (tracker `stopped`, storage flush)
-    /// and clear the map. Used on daemon shutdown.
+    /// and clear the map. Used on daemon shutdown. Each engine is given
+    /// until a shared deadline to finish its teardown; only a straggler
+    /// past the deadline is force-aborted, so a slow storage flush isn't
+    /// cut off (the old fixed 500 ms could truncate it).
     pub async fn shutdown_all(&self) {
         let sessions: Vec<Session> = self.inner.lock().await.drain().map(|(_, s)| s).collect();
         for s in &sessions {
             let _ = s.ctl_tx.send(EngineControl::Shutdown).await;
         }
-        // Give the graceful teardowns a moment, then make sure the tasks
-        // are gone.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Shared deadline: total wait is bounded to ~GRACE regardless of
+        // session count (later sessions inherit the same absolute instant,
+        // and once it's passed sleep_until returns immediately).
+        const GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+        let deadline = tokio::time::Instant::now() + GRACE;
         for s in sessions {
-            s.task.abort();
+            let mut task = s.task;
+            tokio::select! {
+                _ = &mut task => {} // exited gracefully
+                _ = tokio::time::sleep_until(deadline) => { task.abort(); }
+            }
         }
     }
 

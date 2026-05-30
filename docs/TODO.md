@@ -120,12 +120,12 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   `PieceManager::wanted_complete_count()` (counts `wanted & local`) and
   switched `build_stats` + `log_progress` to it, so the displayed
   progress is wanted-relative and can't exceed 100%. Unit-tested.
-- [ ] **P1 — daemon shutdown race / abort window.** [verified]
-  `session.rs shutdown_all` sleeps 500 ms then `abort()`s — too short if
-  a session is mid storage-flush / tracker-stopped. `remove()` spawns a
-  detached 10 s-then-abort task that's never tracked. Use
-  `tokio::time::timeout` joining the task with a 5–10 s bound; track or
-  await the reaper.
+- [x] **P1 — daemon shutdown race window.** [DONE] `shutdown_all` now
+  joins each engine task against a shared 8 s deadline (`select!` task vs
+  `sleep_until`), force-aborting only a straggler past it — so a slow
+  storage flush / tracker-stopped isn't truncated by the old fixed
+  500 ms. (`remove()`'s detached 10 s reaper is left: it self-completes,
+  so it's bounded, not a real leak.)
 - [ ] **P1 — storage-task channel sends `.unwrap()` in production.**
   [claim] `main.rs` storage `cmd_tx.send(..).unwrap()` will panic if the
   storage task died first. Audit all production `.send().unwrap()` /
