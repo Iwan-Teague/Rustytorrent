@@ -15,6 +15,61 @@ use crate::socks5::ProxyConfig;
 pub const DEFAULT_MAX_PEERS: usize = 50;
 pub const PER_PEER_CMD_BUFFER: usize = 64;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A process-wide cap on total concurrent peer connections, shared across
+/// every session in the daemon. It bounds the aggregate connection count
+/// regardless of how many torrents are hosted — defense against a
+/// many-torrent daemon (or one very popular swarm) exhausting file
+/// descriptors / memory — and stacks on top of each session's per-torrent
+/// `max_peers`. Cheap to clone (an `Arc<AtomicUsize>` + the limit).
+#[derive(Clone)]
+pub struct GlobalPeerCap {
+    count: Arc<AtomicUsize>,
+    max: usize,
+}
+
+impl GlobalPeerCap {
+    pub fn new(max: usize) -> Self {
+        Self {
+            count: Arc::new(AtomicUsize::new(0)),
+            max,
+        }
+    }
+
+    /// Try to claim one global slot. Returns a guard that releases it on
+    /// drop, or `None` if the cap is already reached. Lock-free CAS so
+    /// concurrent sessions can't oversubscribe past `max`.
+    fn try_acquire(&self) -> Option<GlobalPeerGuard> {
+        let mut cur = self.count.load(Ordering::Relaxed);
+        loop {
+            if cur >= self.max {
+                return None;
+            }
+            match self.count.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(GlobalPeerGuard(self.count.clone())),
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+}
+
+/// RAII release of one global peer slot. Held inside the [`PeerSlot`], so
+/// the slot's removal from the map (disconnect, ban, drop) frees the
+/// global count automatically — no manual decrement to forget.
+struct GlobalPeerGuard(Arc<AtomicUsize>);
+
+impl Drop for GlobalPeerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Per-IP protocol-violation counter window. After this many
 /// violations within `VIOLATION_WINDOW` the IP is banned.
 pub const VIOLATION_BAN_THRESHOLD: u32 = 3;
@@ -53,11 +108,18 @@ pub struct PeerManager {
     /// `--anonymous`, an active SOCKS5 chain, or `--bind-iface`). When
     /// set, each outgoing dial races TCP and µTP.
     utp: Option<Arc<UtpSocket>>,
+    /// Optional process-wide connection cap (the daemon's shared cap).
+    /// `None` for a standalone single-torrent engine (only `max_peers`
+    /// applies then).
+    global_cap: Option<GlobalPeerCap>,
 }
 
 struct PeerSlot {
     handle: PeerHandle,
     task: JoinHandle<()>,
+    /// Holds this peer's global-cap reservation, if any. Dropped with the
+    /// slot, releasing the global slot on disconnect/ban/forget.
+    _global: Option<GlobalPeerGuard>,
 }
 
 impl PeerManager {
@@ -79,11 +141,29 @@ impl PeerManager {
             anonymous: false,
             violations: HashMap::new(),
             utp: None,
+            global_cap: None,
         }
     }
 
     pub fn set_utp(&mut self, utp: Option<Arc<UtpSocket>>) {
         self.utp = utp;
+    }
+
+    /// Install a process-wide connection cap (the daemon shares one across
+    /// all sessions). Standalone engines leave this unset.
+    pub fn set_global_cap(&mut self, cap: GlobalPeerCap) {
+        self.global_cap = Some(cap);
+    }
+
+    /// Claim a global-cap slot for a new peer. `Ok(None)` means no cap is
+    /// configured (always allowed); `Ok(Some(guard))` reserved a slot;
+    /// `Err(())` means the global cap is full and the peer must be
+    /// rejected.
+    fn acquire_global(&self) -> std::result::Result<Option<GlobalPeerGuard>, ()> {
+        match &self.global_cap {
+            None => Ok(None),
+            Some(cap) => cap.try_acquire().map(Some).ok_or(()),
+        }
     }
 
     pub fn set_max_peers(&mut self, n: usize) {
@@ -230,13 +310,25 @@ impl PeerManager {
             if self.banned.contains(&addr.ip()) {
                 continue;
             }
-            self.spawn_outgoing(addr);
+            // Stop if the process-wide cap is reached — no point scanning
+            // more addresses we can't dial.
+            if !self.spawn_outgoing(addr) {
+                break;
+            }
             started += 1;
         }
         started
     }
 
-    fn spawn_outgoing(&mut self, addr: SocketAddr) {
+    /// Returns false if the global cap blocked the dial (no slot spawned).
+    fn spawn_outgoing(&mut self, addr: SocketAddr) -> bool {
+        let global = match self.acquire_global() {
+            Ok(g) => g,
+            Err(()) => {
+                tracing::debug!(target: "peer", %addr, "global peer cap reached; not dialing");
+                return false;
+            }
+        };
         let (cmd_tx, cmd_rx) = mpsc::channel(PER_PEER_CMD_BUFFER);
         let info_hash = self.info_hash;
         let peer_id = self.our_peer_id;
@@ -267,13 +359,15 @@ impl PeerManager {
             PeerSlot {
                 handle: cmd_tx,
                 task,
+                _global: global,
             },
         );
+        true
     }
 
     /// Accept an inbound connection (TCP or µTP) from a peer and spawn
-    /// its task. Honors max-peer cap and ban list; returns false if
-    /// rejected.
+    /// its task. Honors max-peer cap, the global cap, and the ban list;
+    /// returns false if rejected.
     pub fn accept_incoming(&mut self, stream: Transport, addr: SocketAddr) -> bool {
         if self.peers.len() >= self.max_peers || self.peers.contains_key(&addr) {
             return false;
@@ -281,6 +375,10 @@ impl PeerManager {
         if self.banned.contains(&addr.ip()) {
             return false;
         }
+        let global = match self.acquire_global() {
+            Ok(g) => g,
+            Err(()) => return false,
+        };
         let (cmd_tx, cmd_rx) = mpsc::channel(PER_PEER_CMD_BUFFER);
         let info_hash = self.info_hash;
         let peer_id = self.our_peer_id;
@@ -300,13 +398,14 @@ impl PeerManager {
             PeerSlot {
                 handle: cmd_tx,
                 task,
+                _global: global,
             },
         );
         true
     }
 
     /// Accept a connection the shared acceptor already handshook (daemon
-    /// path). Honors the same max-peer cap and ban list as
+    /// path). Honors the same max-peer cap, global cap, and ban list as
     /// [`accept_incoming`](Self::accept_incoming); returns false if
     /// rejected. The acceptor verified the info_hash during the handshake,
     /// so by the time we get here the peer is known to be in our swarm.
@@ -318,6 +417,10 @@ impl PeerManager {
         if self.banned.contains(&addr.ip()) {
             return false;
         }
+        let global = match self.acquire_global() {
+            Ok(g) => g,
+            Err(()) => return false,
+        };
         let (cmd_tx, cmd_rx) = mpsc::channel(PER_PEER_CMD_BUFFER);
         let event_tx = self.event_tx.clone();
         let anonymous = self.anonymous;
@@ -333,6 +436,7 @@ impl PeerManager {
             PeerSlot {
                 handle: cmd_tx,
                 task,
+                _global: global,
             },
         );
         true
@@ -360,6 +464,34 @@ mod tests {
         m.ban(addr.ip());
         assert_eq!(m.connected_count(), 0);
         assert!(m.is_banned(&addr.ip()));
+    }
+
+    #[test]
+    fn global_cap_bounds_and_releases() {
+        let cap = GlobalPeerCap::new(2);
+        let g1 = cap.try_acquire().expect("first slot");
+        let _g2 = cap.try_acquire().expect("second slot");
+        assert!(cap.try_acquire().is_none(), "cap of 2 is full");
+        drop(g1);
+        assert!(cap.try_acquire().is_some(), "dropping a guard frees a slot");
+    }
+
+    #[tokio::test]
+    async fn global_cap_rejects_over_limit_and_frees_on_forget() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut m = PeerManager::new([0u8; 20], [0u8; 20], tx);
+        m.set_global_cap(GlobalPeerCap::new(1));
+        let a: SocketAddr = "10.0.0.1:6881".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:6881".parse().unwrap();
+        // First dial claims the only global slot; the second is rejected.
+        assert!(m.spawn_outgoing(a));
+        assert!(!m.spawn_outgoing(b), "global cap of 1 must reject the 2nd");
+        assert_eq!(m.connected_count(), 1);
+        // Forgetting the first drops its slot (and the global guard),
+        // freeing a slot for a new dial.
+        m.forget(&a);
+        assert!(m.spawn_outgoing(b), "slot freed after forget");
+        assert_eq!(m.connected_count(), 1);
     }
 
     #[tokio::test]

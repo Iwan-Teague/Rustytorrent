@@ -10,6 +10,7 @@ use rustytorrent::daemon_store::DaemonStore;
 use rustytorrent::engine::{bind_dual_stack_listener, EngineConfig};
 use rustytorrent::metainfo::TorrentFile;
 use rustytorrent::peer::handshake::{Handshake, HANDSHAKE_LEN};
+use rustytorrent::peer::manager::GlobalPeerCap;
 use rustytorrent::session::SessionManager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -71,7 +72,14 @@ async fn shared_listener_routes_inbound_by_info_hash() {
     let registry = acceptor::new_registry();
     let acceptor_task = acceptor::spawn(listener, None, registry.clone(), daemon_peer_id);
 
-    let mgr = SessionManager::with_shared(registry, None, port, acceptor_task, None);
+    let mgr = SessionManager::with_shared(
+        registry,
+        None,
+        port,
+        acceptor_task,
+        None,
+        GlobalPeerCap::new(50),
+    );
 
     let t = torrent("alpha", 0xA1);
     let ih = t.info_hash;
@@ -122,7 +130,14 @@ async fn add_persistent_saves_and_remove_forgets() {
     let registry = acceptor::new_registry();
     let acceptor_task = acceptor::spawn(listener, None, registry.clone(), daemon_peer_id);
     let store = DaemonStore::open(state_dir.clone()).unwrap();
-    let mgr = SessionManager::with_shared(registry, None, port, acceptor_task, Some(store));
+    let mgr = SessionManager::with_shared(
+        registry,
+        None,
+        port,
+        acceptor_task,
+        Some(store),
+        GlobalPeerCap::new(50),
+    );
 
     let raw = torrent_bytes("persisted", 0x42);
     let t = TorrentFile::from_bytes(&raw).unwrap();

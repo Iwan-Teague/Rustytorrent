@@ -227,6 +227,11 @@ pub struct TorrentEngine {
     /// `SessionManager` owns it plus the one process-wide persisted-state
     /// file). `None` → standalone behaviour (spawn an own DHT iff enabled).
     managed_dht: Option<crate::dht::Dht>,
+    /// **Daemon seam.** A process-wide peer-connection cap shared across
+    /// all sessions (set via [`Self::set_managed_global_cap`]). Bounds the
+    /// daemon's total concurrent peers on top of per-torrent `max_peers`.
+    /// `None` → standalone (only `max_peers` applies).
+    managed_global_cap: Option<crate::peer::manager::GlobalPeerCap>,
     /// Memoized per-file progress for the web UI, keyed on the count of
     /// locally-complete pieces. Completed pieces only ever increase, so if
     /// the count is unchanged since the last computation the per-file
@@ -296,6 +301,7 @@ impl TorrentEngine {
             managed_ctl_rx: None,
             managed_incoming_rx: None,
             managed_dht: None,
+            managed_global_cap: None,
             file_progress_cache: None,
             upload_cache: PieceCache::default(),
             download_bucket,
@@ -336,6 +342,13 @@ impl TorrentEngine {
     /// simply isn't given one. Call before [`Self::run`].
     pub fn set_managed_dht(&mut self, dht: crate::dht::Dht) {
         self.managed_dht = Some(dht);
+    }
+
+    /// **Daemon seam.** Share a process-wide peer-connection cap with this
+    /// engine, bounding the daemon's total concurrent peers across every
+    /// session. Call before [`Self::run`].
+    pub fn set_managed_global_cap(&mut self, cap: crate::peer::manager::GlobalPeerCap) {
+        self.managed_global_cap = Some(cap);
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -459,6 +472,9 @@ impl TorrentEngine {
         peers.set_proxies(self.cfg.proxies.clone());
         peers.set_bind_iface(self.cfg.bind_iface.clone());
         peers.set_anonymous(self.cfg.anonymous);
+        if let Some(cap) = self.managed_global_cap.take() {
+            peers.set_global_cap(cap);
+        }
 
         // Inbound connections funnel through one channel of `Inbound`
         // values so the accept path is uniform regardless of source.

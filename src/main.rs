@@ -266,6 +266,12 @@ enum Commands {
         /// operation (e.g. all torrents are private/BEP 27 anyway).
         #[arg(long, default_value_t = false)]
         no_dht: bool,
+        /// Process-wide cap on total concurrent peer connections across all
+        /// hosted torrents. Bounds file-descriptor / memory use regardless
+        /// of how many torrents run; stacks on top of each torrent's own
+        /// 50-peer limit.
+        #[arg(long, default_value_t = 500)]
+        max_peers_total: usize,
         /// Directory the runtime web `add` endpoint may load `.torrent`
         /// files from. Requests for paths outside it are refused, so a
         /// loopback foothold can't read arbitrary host files. Defaults to
@@ -395,8 +401,20 @@ async fn main() -> Result<()> {
             web,
             port,
             no_dht,
+            max_peers_total,
             torrent_dir,
-        } => cmd_daemon(torrents, output, web, port, no_dht, torrent_dir).await,
+        } => {
+            cmd_daemon(
+                torrents,
+                output,
+                web,
+                port,
+                no_dht,
+                max_peers_total,
+                torrent_dir,
+            )
+            .await
+        }
         Commands::Create {
             path,
             output,
@@ -730,12 +748,14 @@ fn resolve_passphrase(flag: Option<String>) -> Result<String> {
     )
 }
 
+#[allow(clippy::too_many_arguments)] // each is a distinct daemon knob
 async fn cmd_daemon(
     torrents: Vec<PathBuf>,
     output: PathBuf,
     web: u16,
     port: u16,
     no_dht: bool,
+    max_peers_total: usize,
     torrent_dir: PathBuf,
 ) -> Result<()> {
     use rustytorrent::session::SessionManager;
@@ -787,7 +807,8 @@ async fn cmd_daemon(
         }
     };
     let restore = store.as_ref().map(|s| s.load_all()).unwrap_or_default();
-    let mgr = SessionManager::with_shared(registry, dht, port, acceptor_task, store);
+    let global_cap = rustytorrent::peer::manager::GlobalPeerCap::new(max_peers_total);
+    let mgr = SessionManager::with_shared(registry, dht, port, acceptor_task, store, global_cap);
 
     // Restore persisted torrents first, so a CLI duplicate is a no-op.
     for entry in restore {
@@ -845,7 +866,7 @@ async fn cmd_daemon(
     }
 
     println!(
-        "Daemon:     {} torrent(s) on shared port {port}{}; UI at http://127.0.0.1:{web}/ (loopback)",
+        "Daemon:     {} torrent(s) on shared port {port}{}; ≤{max_peers_total} peers total; UI at http://127.0.0.1:{web}/ (loopback)",
         mgr.len().await,
         if no_dht { " (DHT off)" } else { " (shared DHT)" },
     );

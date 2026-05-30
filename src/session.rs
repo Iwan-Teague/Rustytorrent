@@ -60,6 +60,9 @@ struct Shared {
     /// erased on [`SessionManager::remove`]; deliberately *not* erased on
     /// daemon shutdown (that's exactly when we want the set to survive).
     store: Option<crate::daemon_store::DaemonStore>,
+    /// Process-wide peer-connection cap shared by every session, bounding
+    /// the daemon's total concurrent peers regardless of torrent count.
+    global_cap: crate::peer::manager::GlobalPeerCap,
 }
 
 /// Owns the running sessions. Cheap to clone (shared behind `Arc`s), so
@@ -79,12 +82,14 @@ impl SessionManager {
     /// (registry + listener task) and an optional shared DHT, all bound to
     /// `listen_port`. The caller (the `daemon` command) binds the listener,
     /// spawns the acceptor with `registry`, and optionally spawns the DHT.
+    #[allow(clippy::too_many_arguments)] // distinct daemon-wide resources
     pub fn with_shared(
         registry: crate::acceptor::Registry,
         dht: Option<crate::dht::Dht>,
         listen_port: u16,
         acceptor_task: JoinHandle<()>,
         store: Option<crate::daemon_store::DaemonStore>,
+        global_cap: crate::peer::manager::GlobalPeerCap,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
@@ -94,6 +99,7 @@ impl SessionManager {
                 listen_port,
                 acceptor_task,
                 store,
+                global_cap,
             })),
         }
     }
@@ -155,6 +161,9 @@ impl SessionManager {
         }
         if let Some(dht) = shared_dht {
             engine.set_managed_dht(dht);
+        }
+        if let Some(shared) = &self.shared {
+            engine.set_managed_global_cap(shared.global_cap.clone());
         }
         let task = tokio::spawn(async move {
             if let Err(e) = engine.run().await {

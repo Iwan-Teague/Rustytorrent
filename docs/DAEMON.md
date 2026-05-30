@@ -150,5 +150,7 @@ covered by the full test suite.
   flush, DHT state save is now shared so only saved on daemon exit).
 - **Port/firewall**: one listen port for the daemon — document that the
   user maps a single port, same as a normal client.
-- **Resource caps**: a daemon with many torrents needs a global peer cap,
-  not just per-torrent `max_peers`. Track as a follow-up.
+- **Resource caps**: [DONE] a daemon with many torrents now has a global
+  peer cap (`--max-peers-total`, default 500) shared across all sessions
+  via `peer::manager::GlobalPeerCap`, on top of per-torrent `max_peers`.
+  Each peer holds an RAII guard released on disconnect/ban/forget.
