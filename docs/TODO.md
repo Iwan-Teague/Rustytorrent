@@ -125,6 +125,13 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   `engine.rs:~1302` / `storage/memspool.rs` clone `Vec<u8>` per served
   block. Share read-only pieces as `Arc<[u8]>` / `Arc<Vec<u8>>` so the
   LRU cache and per-peer serves don't copy.
+  PARTIAL: `write_message` now has a specialized `Piece` path that builds
+  the wire buffer in one pass — `encode()` previously copied the block
+  *twice* (into a payload scratch, then again in `tag()`); now it's one
+  copy. The remaining copy is the cache-`Arc`→`Vec` slice in
+  `serve_request`; eliminating it needs `PeerCommand::Piece.data` /
+  `Message::Piece.data` to become a shareable `bytes::Bytes` slice of the
+  cached piece (a wider type change), still open.
 - [ ] **P2 — spool write pads/allocates per write.** `storage/spool.rs`
   `padded.resize()` allocates a full piece buffer each write; reuse a
   scratch buffer. `plaintext[..].to_vec()` on read clones — return a slice

@@ -270,6 +270,23 @@ pub async fn write_message<W>(writer: &mut W, msg: &Message) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    // Fast path for the upload-hot Piece message: `encode()` copies the
+    // (up to 16 KiB) block twice — once into its payload scratch and
+    // again inside `tag()`. Build the wire buffer in one pass instead:
+    // [len][id][index][begin][data]. Identical bytes, one copy of `data`.
+    if let Message::Piece { index, begin, data } = msg {
+        let body_len = 1 + 8 + data.len(); // id + index + begin + data
+        let mut buf = Vec::with_capacity(4 + body_len);
+        buf.extend_from_slice(&(body_len as u32).to_be_bytes());
+        buf.push(Message::ID_PIECE);
+        buf.extend_from_slice(&index.to_be_bytes());
+        buf.extend_from_slice(&begin.to_be_bytes());
+        buf.extend_from_slice(data);
+        return writer
+            .write_all(&buf)
+            .await
+            .map_err(|e| Error::Network(format!("frame write: {e}")));
+    }
     let encoded = msg.encode();
     // Message::encode includes the length prefix already.
     writer
@@ -502,6 +519,22 @@ mod tests {
         read_frame_into(&mut b, 1 << 20, &mut buf).await.unwrap();
         assert!(buf.is_empty());
         assert_eq!(Message::decode(&buf).unwrap(), Message::KeepAlive);
+    }
+
+    #[tokio::test]
+    async fn write_message_piece_matches_encode() {
+        // The specialized Piece write path must produce byte-identical
+        // output to the generic encode() (which the decoder round-trips).
+        let m = Message::Piece {
+            index: 3,
+            begin: 16384,
+            data: vec![0xCD; 16384],
+        };
+        let mut out = Vec::new();
+        write_message(&mut out, &m).await.unwrap();
+        assert_eq!(out, m.encode());
+        // And it decodes back to the same message (skip the 4-byte len).
+        assert_eq!(Message::decode(&out[4..]).unwrap(), m);
     }
 
     #[tokio::test]
