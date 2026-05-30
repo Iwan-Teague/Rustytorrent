@@ -21,7 +21,7 @@ RustyTorrent aims to be a fully-featured, production-quality peer-to-peer file t
 | 5 | Multi-file & Correctness | ✅ Done |
 | 6 | Hardening & Resume | ✅ Done |
 | 7 | Extensions | ✅ MSE/PE + DHT + BEP 9/10/11 + magnet + µTP (BEP 29, SACK + LEDBAT) |
-| 8 | Web UI | 🟡 Read-only monitoring landed (`--web`: status page + JSON + Prometheus); control plane (add/pause/remove) pending |
+| 8 | Web UI | 🟡 `--web`: status page (progress, sparkline, per-file, peers) + JSON + Prometheus + **pause/resume**; multi-torrent add/remove still needs a daemon |
 
 **Anonymity / security**:
 - Built-in SOCKS5 client (RFC 1928 + RFC 1929 auth) for outgoing peer
@@ -204,16 +204,17 @@ A browser-based interface for monitoring and controlling downloads.
 
 ### Goals
 - ✅ `axum`-based HTTP server (`--web PORT`, loopback-bound)
-- ✅ `GET /api/status` (JSON), `GET /metrics` (Prometheus), `GET /` (self-contained status page with live progress bar)
-- 🔲 Control endpoints: add torrent (file or magnet), remove, pause/resume — need a multi-torrent daemon (today's engine is one-torrent-per-process)
-- 🔲 Multi-torrent list view + speed graphs
+- ✅ `GET /api/status` + `/api/peers` + `/api/files` (JSON), `GET /metrics` (Prometheus), `GET /` (self-contained status page: progress bar, download-rate sparkline, instantaneous rates, per-file progress, peer list)
+- ✅ `POST /api/pause` / `/api/resume` — pause/resume the running download (button on the status page)
+- 🔲 add torrent (file or magnet) / remove — need a multi-torrent daemon (today's engine is one-torrent-per-process)
+- 🔲 multi-torrent list view
 
 ### Status
-The **read-only monitoring** slice has landed: a single running download
-serves its live stats over loopback HTTP. The control plane (add / pause /
-remove) is gated on refactoring the one-torrent-per-process engine into a
-multi-torrent daemon with a shared session manager — a larger change
-tracked separately.
+Monitoring + single-torrent control have landed: a running download
+serves rich live stats over loopback HTTP and can be paused/resumed. The
+remaining control plane — adding and removing torrents at runtime — is
+gated on refactoring the one-torrent-per-process engine into a
+multi-torrent daemon with a shared session manager, tracked separately.
 
 ---
 
