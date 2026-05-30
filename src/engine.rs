@@ -124,6 +124,11 @@ pub struct EngineConfig {
     /// the pieces overlapping them) are downloaded. Empty = download
     /// everything (the default).
     pub selected_files: Vec<String>,
+    /// **Sequential download.** Pick pieces in index order rather than
+    /// rarest-first — useful for streaming a media file while it
+    /// downloads. Off by default (rarest-first is healthier for the
+    /// swarm).
+    pub sequential: bool,
 }
 
 impl Default for EngineConfig {
@@ -152,6 +157,7 @@ impl Default for EngineConfig {
             utp_enabled: false,
             web_port: None,
             selected_files: Vec::new(),
+            sequential: false,
         }
     }
 }
@@ -484,6 +490,13 @@ impl TorrentEngine {
         };
 
         let layout = Layout::from_torrent(self.cfg.output_dir.clone(), &self.torrent);
+
+        // Sequential download (streaming): pick pieces in order.
+        if self.cfg.sequential {
+            self.picker.set_sequential(true);
+            tracing::info!(target: "engine", "sequential (in-order) piece selection");
+            println!("Sequential: on (in-order pieces for streaming)");
+        }
 
         // Selective download: narrow the piece manager's "wanted" set to
         // pieces overlapping the selected files. Empty selection → want

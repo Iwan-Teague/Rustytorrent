@@ -16,6 +16,10 @@ pub struct Picker {
     availability: Vec<u32>,
     /// Pieces a peer is currently assigned to fetch (sticky).
     assigned: HashMap<SocketAddr, usize>,
+    /// Sequential mode: pick the lowest-index needed piece instead of
+    /// the rarest. Trades swarm-health (rarest-first) for in-order
+    /// delivery — useful for streaming a media file while it downloads.
+    sequential: bool,
 }
 
 impl Picker {
@@ -25,7 +29,14 @@ impl Picker {
             peer_bitfields: HashMap::new(),
             availability: vec![0u32; num_pieces],
             assigned: HashMap::new(),
+            sequential: false,
         }
+    }
+
+    /// Enable in-order piece selection (for streaming). Off by default
+    /// (rarest-first), which is healthier for the swarm.
+    pub fn set_sequential(&mut self, on: bool) {
+        self.sequential = on;
     }
 
     pub fn set_peer_bitfield(&mut self, addr: SocketAddr, bf: BitVec<u8, Msb0>) {
@@ -132,15 +143,20 @@ impl Picker {
         if candidates.is_empty() {
             return None;
         }
-        candidates.sort_by_key(|i| self.availability[*i]);
-        // Shuffle within the lowest-availability group for fairness.
-        let min_av = self.availability[candidates[0]];
-        let tie_end = candidates
-            .iter()
-            .position(|i| self.availability[*i] != min_av)
-            .unwrap_or(candidates.len());
-        candidates[..tie_end].shuffle(&mut rand::thread_rng());
-        let chosen = candidates[0];
+        let chosen = if self.sequential {
+            // Lowest-index needed piece → in-order delivery for streaming.
+            *candidates.iter().min().expect("non-empty checked above")
+        } else {
+            candidates.sort_by_key(|i| self.availability[*i]);
+            // Shuffle within the lowest-availability group for fairness.
+            let min_av = self.availability[candidates[0]];
+            let tie_end = candidates
+                .iter()
+                .position(|i| self.availability[*i] != min_av)
+                .unwrap_or(candidates.len());
+            candidates[..tie_end].shuffle(&mut rand::thread_rng());
+            candidates[0]
+        };
         self.assigned.insert(*addr, chosen);
         Some(chosen)
     }
@@ -213,5 +229,22 @@ mod tests {
         p.set_peer_bitfield(c, mkbf(&[true, false, false]));
         // Picking for b → rarest piece b has is piece 1 (availability=1).
         assert_eq!(p.pick_for(&b, &pm, false), Some(1));
+    }
+
+    #[test]
+    fn sequential_picks_lowest_index_not_rarest() {
+        let pm = PieceManager::new(16384, 49152, 3);
+        let mut p = Picker::new(3);
+        p.set_sequential(true);
+        let a: SocketAddr = "1.1.1.1:1".parse().unwrap();
+        let b: SocketAddr = "2.2.2.2:2".parse().unwrap();
+        let c: SocketAddr = "3.3.3.3:3".parse().unwrap();
+        // Make piece 2 the rarest (only b has it), piece 0 the commonest.
+        p.set_peer_bitfield(a, mkbf(&[true, false, true]));
+        p.set_peer_bitfield(b, mkbf(&[true, true, true]));
+        p.set_peer_bitfield(c, mkbf(&[true, false, false]));
+        // Rarest-first would pick 1 or 2 for b; sequential must pick 0
+        // (lowest index b has and we need), for in-order delivery.
+        assert_eq!(p.pick_for(&b, &pm, false), Some(0));
     }
 }

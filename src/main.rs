@@ -138,6 +138,10 @@ enum Commands {
         /// everything.
         #[arg(long = "select", value_name = "SUBSTR")]
         select: Vec<String>,
+        /// Sequential download: fetch pieces in order (for streaming a
+        /// media file while it downloads) instead of rarest-first.
+        #[arg(long, default_value_t = false)]
+        sequential: bool,
     },
     /// Download from a magnet URI (BEP 9 + BEP 10 + BEP 53). Bootstraps a
     /// peer pool via DHT and the magnet's own trackers, fetches the info
@@ -208,6 +212,9 @@ enum Commands {
         /// substring (repeatable). Applies once magnet metadata arrives.
         #[arg(long = "select", value_name = "SUBSTR")]
         select: Vec<String>,
+        /// Sequential download (in-order pieces for streaming).
+        #[arg(long, default_value_t = false)]
+        sequential: bool,
     },
     /// Decrypt a `--paranoid` spool into the real file layout using the
     /// same passphrase that produced it. Pieces that don't hash-match
@@ -271,6 +278,7 @@ async fn main() -> Result<()> {
             utp,
             web,
             select,
+            sequential,
         } => {
             cmd_download(
                 file,
@@ -296,6 +304,7 @@ async fn main() -> Result<()> {
                 utp,
                 web,
                 select,
+                sequential,
             )
             .await
         }
@@ -328,6 +337,7 @@ async fn main() -> Result<()> {
             utp,
             web,
             select,
+            sequential,
         } => {
             cmd_magnet(
                 uri,
@@ -352,6 +362,7 @@ async fn main() -> Result<()> {
                 utp,
                 web,
                 select,
+                sequential,
             )
             .await
         }
@@ -478,6 +489,7 @@ async fn cmd_download(
     utp: bool,
     web: Option<u16>,
     select: Vec<String>,
+    sequential: bool,
 ) -> Result<()> {
     let raw = tokio::fs::read(&path)
         .await
@@ -569,6 +581,7 @@ async fn cmd_download(
         utp_enabled: utp,
         web_port: web,
         selected_files: select,
+        sequential,
         ..Default::default()
     };
     if let Some(p) = web {
@@ -764,6 +777,7 @@ async fn cmd_magnet(
     utp: bool,
     web: Option<u16>,
     select: Vec<String>,
+    sequential: bool,
 ) -> Result<()> {
     let magnet = rustytorrent::magnet::MagnetLink::parse(&uri)?;
     println!(
@@ -964,6 +978,7 @@ async fn cmd_magnet(
         utp_enabled: utp,
         web_port: web,
         selected_files: select,
+        sequential,
         ..Default::default()
     };
     if let Some(p) = web {
