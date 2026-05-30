@@ -24,13 +24,14 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   `fs::read`, so an out-of-tree path is never even stat'd. Startup
   positional torrents bypass the check (trusted CLI input). Unit-tested
   inside/escape/absolute/nonexistent cases.
-- [ ] **P2 — DH private-key wipe is best-effort.** [verified]
+- [x] **P2 — DH private-key wipe is best-effort.** [verified]
   `peer/mse/dh.rs` `Drop` overwrites the `BigUint` with `0` but doesn't
-  scrub the freed limb allocation; not constant-time. Acceptable (MSE is
-  obfuscation, keys are per-connection ephemeral), but either wrap in a
-  zeroizing type or downgrade the comment from "wipe" to "best-effort,
-  obfuscation-only" so the security claim isn't overstated. The derived
-  RC4 state IS properly `ZeroizeOnDrop` — good.
+  scrub the freed limb allocation; not constant-time. DONE: rewrote the
+  `Drop` comment to state plainly that this deallocates rather than
+  scrubs, that num-bigint has no safe in-place zeroing and the crate
+  forbids `unsafe`, and that it's acceptable because MSE is
+  obfuscation-only with ephemeral keys (the derived RC4 state IS
+  `ZeroizeOnDrop`). No longer overstates the guarantee.
 - [ ] **P2 — bencode `parse_bytes` defensive bound.** [verified]
   `metainfo/bencode.rs` guards `rest.len() < len` before `split_at(len)`,
   so it's safe today, but add an explicit pre-check comment / assert so a

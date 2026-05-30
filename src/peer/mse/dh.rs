@@ -56,9 +56,17 @@ impl Keypair {
 
 impl Drop for Keypair {
     fn drop(&mut self) {
-        // `BigUint` doesn't impl Zeroize directly, but we can wipe its
-        // underlying limb buffer by overwriting and then dropping.
-        // Best-effort: replace with zero so any cached pages are scrubbed.
+        // Best-effort only — NOT a true secret wipe. Assigning zero
+        // *deallocates* the old limb buffer rather than scrubbing it, so
+        // the private exponent's bytes may linger in freed heap until
+        // reused. num-bigint exposes no safe in-place limb-zeroing API,
+        // and this crate forbids `unsafe` outside the sandbox FFI, so we
+        // can't do better here without pulling in a different bignum.
+        //
+        // Acceptable because MSE/PE is wire *obfuscation*, not
+        // confidentiality: the DH keys are per-connection ephemeral and
+        // grant no lasting secret. The values that DO matter downstream —
+        // the derived RC4 keystream state — are properly `ZeroizeOnDrop`.
         self.private = BigUint::from(0u32);
         self.public = BigUint::from(0u32);
     }
