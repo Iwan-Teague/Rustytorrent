@@ -211,3 +211,97 @@ async fn multi_file_download_writes_correct_offsets() {
     seeder_task.abort();
     let _ = tokio::fs::remove_dir_all(&tmp).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selective_download_fetches_only_wanted_file() {
+    // Same 2-file torrent. Select only "a.bin": the leecher fetches the
+    // pieces overlapping a.bin (0 and the boundary piece 1), completes
+    // (wanted-relative), and writes a.bin in full — without fetching
+    // piece 2 (entirely inside b.bin).
+    let a: Vec<u8> = (0..25_000u32)
+        .map(|i| (i.wrapping_mul(40503) >> 7) as u8)
+        .collect();
+    let b: Vec<u8> = (0..15_000u32)
+        .map(|i| (i.wrapping_mul(2246822519) >> 11) as u8)
+        .collect();
+    let mut data = a.clone();
+    data.extend_from_slice(&b);
+
+    let dir = "pkg";
+    let piece_hashes: Vec<[u8; 20]> = data.chunks(PIECE_LEN as usize).map(sha1).collect();
+    let torrent = TorrentFile {
+        info_hash: sha1(&data),
+        announce: None,
+        announce_list: vec![],
+        info: Info {
+            name: dir.to_string(),
+            piece_length: PIECE_LEN,
+            piece_hashes,
+            files: TorrentFiles::Multi {
+                files: vec![
+                    FileEntry {
+                        length: a.len() as u64,
+                        path: "a.bin".into(),
+                    },
+                    FileEntry {
+                        length: b.len() as u64,
+                        path: "b.bin".into(),
+                    },
+                ],
+            },
+            private: false,
+        },
+    };
+
+    let tmp = std::env::temp_dir().join(format!("rt_e2e_sel_{}", std::process::id()));
+    let seed_dir = tmp.join("seed");
+    let leech_dir = tmp.join("leech");
+    tokio::fs::create_dir_all(seed_dir.join(dir)).await.unwrap();
+    tokio::fs::create_dir_all(&leech_dir).await.unwrap();
+    tokio::fs::write(seed_dir.join(dir).join("a.bin"), &a)
+        .await
+        .unwrap();
+    tokio::fs::write(seed_dir.join(dir).join("b.bin"), &b)
+        .await
+        .unwrap();
+
+    let port = free_port().await;
+    let seeder = TorrentEngine::new(
+        torrent.clone(),
+        [5u8; 20],
+        EngineConfig {
+            output_dir: seed_dir.clone(),
+            listen_port: port,
+            no_tracker: true,
+            ..Default::default()
+        },
+    );
+    let seeder_task = tokio::spawn(async move {
+        let _ = seeder.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let leecher = TorrentEngine::new(
+        torrent,
+        [6u8; 20],
+        EngineConfig {
+            output_dir: leech_dir.clone(),
+            listen_port: free_port().await,
+            no_tracker: true,
+            seed_peers: vec![format!("127.0.0.1:{port}").parse().unwrap()],
+            selected_files: vec!["a.bin".to_string()],
+            ..Default::default()
+        },
+    );
+    let result = tokio::time::timeout(Duration::from_secs(30), leecher.run()).await;
+    assert!(result.is_ok(), "selective leecher timed out");
+    assert!(result.unwrap().is_ok());
+
+    let got_a = tokio::fs::read(leech_dir.join(dir).join("a.bin"))
+        .await
+        .unwrap();
+    assert_eq!(got_a, a, "selected file a.bin must be complete");
+
+    seeder_task.abort();
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+}

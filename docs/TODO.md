@@ -206,8 +206,12 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 - [ ] **P1 — resume/restart test:** partial download persists and resumes
   correctly (scan_resume rebuilds the bitfield). (The e2e harness now
   makes this easy to add.)
-- [ ] **P1 — `--select` end-to-end engine test** (only the
-  `PieceManager` unit is covered today; reuse the e2e harness).
+- [x] **P1 — `--select` end-to-end engine test.** [DONE]
+  `selective_download_fetches_only_wanted_file` in `download_e2e.rs`:
+  selects one file of a 2-file torrent, asserts the leecher completes
+  (wanted-relative) and writes the selected file in full without fetching
+  the other file's exclusive piece. Validates the selective-download +
+  completion path end to end.
 - [ ] **P2 — choke scheduler under load** (many peers competing for the
   3+1 unchoke slots; fairness + anti-snubbing).
 - [ ] **P2 — property/fuzz the bencode + KRPC + message parsers** on
