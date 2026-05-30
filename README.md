@@ -30,7 +30,7 @@ Cross-platform: Linux, macOS (Intel + Apple Silicon), and Windows.
 | BEP 10 extension protocol + BEP 9 ut_metadata + magnet links | ✅ |
 | BEP 11 PEX — bidirectional: receive incoming peer lists + send delta updates every 60 s | ✅ |
 | Engine-wide bandwidth limiter (`--max-down`, `--max-up`) | ✅ |
-| µTP transport (BEP 29) — `--utp`: parallel TCP+µTP dial + inbound µTP | ✅ |
+| µTP transport (BEP 29) — `--utp`: TCP+µTP dial race, inbound µTP, SACK + LEDBAT | ✅ |
 | Private torrents (BEP 27) — DHT + PEX disabled when `private` is set | ✅ |
 | Web UI | ❌ — Phase 8 work |
 
