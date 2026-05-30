@@ -119,6 +119,8 @@ rustytorrent download <file> [OPTIONS]
                             --socks5 / --bind-iface (UDP can't ride SOCKS5)
   --web PORT                serve a read-only monitoring UI on 127.0.0.1:PORT
                             (status page + /api/status JSON + /metrics)
+  --select SUBSTR           selective download: only fetch files whose path
+                            contains SUBSTR (repeatable; multi-file torrents)
 
 rustytorrent decrypt <file> [OPTIONS]      # extract a --paranoid spool afterwards
 

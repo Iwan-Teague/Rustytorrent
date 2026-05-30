@@ -219,9 +219,9 @@ tracked separately.
 
 ## Stretch Goals (no timeline)
 
-- IPv6 support
-- Selective file download within multi-file torrents
-- i2p / Tor transport support
+- ✅ IPv6 support (dual-stack listener + IPv6 compact peers / PEX)
+- ✅ Selective file download within multi-file torrents (`--select SUBSTR`)
+- Tor transport supported via `--socks5` + `--anonymous`; native i2p not done
 - Plugin system for custom piece pickers
 
 ---
