@@ -41,10 +41,19 @@ pub enum EngineControl {
     Shutdown,
 }
 
-/// Outstanding block requests per unchoked peer.
+/// Outstanding block requests kept in flight per unchoked peer. Enough to
+/// keep the pipe full across one round-trip (so the peer always has a
+/// request queued and never stalls waiting for us) without over-committing
+/// memory or letting a slow peer hoard requests for blocks a faster peer
+/// could serve.
 pub const PIPELINE_DEPTH: usize = 5;
 
-/// Threshold of remaining pieces below which we enable endgame.
+/// Remaining-piece count below which the picker switches to *endgame*:
+/// the last few missing pieces may be requested from several peers at
+/// once (duplicating work) so a single slow/stalled peer can't hold up
+/// completion. Kept small (5) because the duplication is pure waste —
+/// we only accept it for the final stretch where one straggler otherwise
+/// dominates the finish time.
 pub const ENDGAME_REMAINING: usize = 5;
 
 pub struct EngineConfig {

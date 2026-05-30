@@ -49,10 +49,14 @@ pub const MAX_RTO: Duration = Duration::from_secs(15);
 /// Give up on a connection if a single packet's RTO has doubled
 /// past this. Catches stuck peers without leaking state forever.
 pub const HARD_TIMEOUT: Duration = Duration::from_secs(60);
-/// Maximum number of unacked DATA packets we'll have outstanding
-/// before pausing the application's send. A real implementation
-/// would dynamically size this from LEDBAT's delay estimate; we
-/// hold a fixed window.
+/// Initial congestion window, in unacked DATA packets, before LEDBAT
+/// has enough delay samples to size the window dynamically. 8 packets
+/// (~12 KB at `MAX_DATA_PAYLOAD`) is a common µTP/TCP initial-window
+/// choice: large enough to get throughput off the ground within the
+/// first RTT, small enough not to swamp a thin/buffered link before the
+/// delay-based controller can react. The LEDBAT controller grows or
+/// shrinks from here; this value is also the floor we fall back to if it
+/// has no estimate yet.
 pub const INITIAL_WINDOW_PACKETS: usize = 8;
 /// Maximum payload bytes per DATA packet. Sized to fit comfortably
 /// under the typical ~1400-byte Ethernet MTU minus IP/UDP/µTP

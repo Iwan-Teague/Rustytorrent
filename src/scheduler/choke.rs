@@ -4,10 +4,29 @@ use std::time::{Duration, Instant};
 
 use rand::seq::SliceRandom;
 
+/// How often the choker recomputes which peers to unchoke. The canonical
+/// BitTorrent value (BEP 3 / mainline): re-evaluating every 10 s damps
+/// "fibrillation" — peers being rapidly choked/unchoked — which would
+/// otherwise waste the slow-start of every reopened connection.
 pub const CHOKE_INTERVAL: Duration = Duration::from_secs(10);
+/// How often the optimistic-unchoke slot rotates to a new random peer.
+/// 30 s (3× `CHOKE_INTERVAL`, per mainline) gives a freshly-unchoked peer
+/// long enough to ramp up and prove its upload rate before the next
+/// regular-slot reshuffle judges it.
 pub const OPTIMISTIC_INTERVAL: Duration = Duration::from_secs(30);
+/// Sliding window over which peer up/down rates are averaged to rank them
+/// for the regular unchoke slots. 20 s smooths burstiness without lagging
+/// so far behind that a peer that just went idle keeps a slot.
 pub const RATE_WINDOW: Duration = Duration::from_secs(20);
+/// A peer we're interested in but that hasn't sent us a block for this
+/// long is treated as "snubbing" us and loses priority for our upload
+/// slots — the standard anti-leech heuristic.
 pub const SNUB_THRESHOLD: Duration = Duration::from_secs(60);
+/// Regular (rate-based) unchoke slots. Mainline uses 4 *total* unchoked
+/// peers = 3 regular + 1 optimistic; this is the 3. Small on purpose:
+/// concentrating upload bandwidth on a few peers gives each a useful rate
+/// (tit-for-tat works better than spreading thin), and the optimistic
+/// slot still explores new peers.
 pub const REGULAR_UNCHOKE_SLOTS: usize = 3;
 
 /// Standard BitTorrent choke algorithm: 3 regular unchoke slots + 1 optimistic.

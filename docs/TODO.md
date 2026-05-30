@@ -342,8 +342,13 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   control) to shrink the loop body.
 - [ ] **P2 — remove/justify `#[allow(dead_code)]`** in
   `metadata_fetch.rs` (×2), `dht/server.rs`, `storage/memspool.rs`.
-- [ ] **P2 — document magic constants** (`ENDGAME_REMAINING = 5`,
-  `INITIAL_WINDOW_PACKETS`, choke slot counts) with the rationale.
+- [x] **P2 — document magic constants** (`ENDGAME_REMAINING = 5`,
+  `INITIAL_WINDOW_PACKETS`, choke slot counts) with the rationale. DONE:
+  expanded the doc comments on `ENDGAME_REMAINING` + `PIPELINE_DEPTH`
+  (engine), `INITIAL_WINDOW_PACKETS` (µTP), and all five choke constants
+  (`CHOKE_INTERVAL`, `OPTIMISTIC_INTERVAL`, `RATE_WINDOW`,
+  `SNUB_THRESHOLD`, `REGULAR_UNCHOKE_SLOTS`) explaining the value chosen
+  and why.
 - [ ] **P2 — split large modules** (`peer/connection.rs` ~1k lines,
   `main.rs` ~1.1k) along natural seams.
 
