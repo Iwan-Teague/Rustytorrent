@@ -250,13 +250,20 @@ mod tests {
     use crate::metainfo::TorrentFile;
 
     fn scratch() -> PathBuf {
+        // A process-wide counter guarantees a distinct dir per call even when
+        // two parallel test threads read an identical `now()` (coarse clock
+        // resolution made `pid+nanos` alone collide, so colliding tests raced
+        // each other's writes / remove_dir_all — an intermittent failure).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "rt_create_{}_{}",
+            "rt_create_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
