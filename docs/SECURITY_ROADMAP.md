@@ -48,7 +48,7 @@ protection that A-tier doesn't touch.
 |---|------|------------------|------|
 | ~~C1~~ | ~~**Multi-hop proxy chaining**~~ — landed. `--socks5` is now repeatable; the chain runs nested SOCKS5 CONNECTs on a single TCP stream. Credentials and Tor stream isolation attach to the last hop. Tracker HTTP still rides the first hop only (reqwest limit). | done |
 | ~~C2 (Linux + macOS)~~ | ~~**OS-level sandboxing**~~ — Linux seccomp + macOS `sandbox_init` SBPL profile landed. Windows AppContainer remains open. | mostly done |
-| ~~C3~~ | ~~**µTP (BEP 29) over UDP**~~ — landed. Packet codec, state machine, UDP socket runtime, AsyncRead/AsyncWrite bridge, engine integration (`--utp`: parallel TCP+µTP dial race + inbound listener), selective-ack (emit + prune + fast retransmit), LEDBAT delay-based congestion control (with fixed-window fallback), and inbound-flood / spoof defenses. Gated off under anonymous/SOCKS5/bind-iface. Remaining polish only: 16-bit seq wraparound for >65k-packet connections, LEDBAT's full per-minute base-delay history. | done |
+| ~~C3~~ | ~~**µTP (BEP 29) over UDP**~~ — landed. Packet codec, state machine, UDP socket runtime, AsyncRead/AsyncWrite bridge, engine integration (`--utp`: parallel TCP+µTP dial race + inbound listener), selective-ack (emit + prune + fast retransmit), LEDBAT delay-based congestion control (with fixed-window fallback), and inbound-flood / spoof defenses. Gated off under anonymous/SOCKS5/bind-iface. **Polish now also landed (commit c63fc05): wrap-correct reorder buffer (16-bit seq wraparound), randomized receiver-seq accept token (blind-spoof resistance), LEDBAT per-minute base-delay history, and a shared-`Arc<[u8]>` send buffer (no per-chunk alloc).** | done |
 | C4 | **I2P transport** | Native anonymity overlay; tiny swarms but no Tor-style exit-node trust issues. Substantial work — different transport entirely. | ~1000+ lines |
 | ~~C5~~ | ~~**Anonymous-mode peer_id rotation**~~ — landed. At every reannounce in anonymous mode the engine regenerates the peer_id (libtorrent-style prefix); existing TCP connections keep their handshaken id but every new outgoing dial uses the fresh one. Defeats the "same client signature across unrelated swarms" correlation. | done |
 | ~~C6~~ | ~~**Tracker-frequency jitter**~~ — landed. Reannounce interval is jittered upward (+0-5% normal, +5-50% anonymous) so two clients on the same tracker don't share an identical cadence fingerprint. | done |
@@ -67,6 +67,13 @@ protection that A-tier doesn't touch.
 ---
 
 ## Status
+
+Last updated: 2026-06-01. **C3 µTP polish fully landed (commit c63fc05):
+randomized receiver-seq accept token (blind-spoof resistance), wrap-correct
+reorder buffer, LEDBAT per-minute base-delay history, shared-`Arc<[u8]>`
+send buffer. Alongside: proptest fuzz harness for the bencode/message/KRPC
+parsers, actionable error messages, and a CLI shared-args refactor — see
+docs/TODO.md.**
 
 Last updated: 2026-05-29. **Untrusted-input hardening pass + SOCKS5
 auth-downgrade fix landed (see "Hardening pass" below).**
@@ -238,9 +245,17 @@ _None — B2 landed alongside the multi-hop chain work._
   a 2-packet floor until a usable sample arrives, so it can't regress or
   stall. The math is unit-tested; the emergent dynamics still want
   validation against a real µTP peer on a latency'd link.
-- ⏳ Open (polish): randomized receiver seq_nr as an accept token (full
-  blind-spoof resistance); 16-bit seq wraparound for >65k-packet µTP
-  connections; LEDBAT's full per-minute base-delay history.
+- ✅ Polish landed (commit c63fc05): **randomized receiver seq_nr as an
+  accept token** — `new_receiver` draws the initial seq from the CSPRNG and
+  the driver only confirms the return path (and surfaces the conn to
+  `accept()`) when a non-SYN packet acks that token within a bounded window,
+  closing the residual blind SYN+DATA spoof; **16-bit seq wraparound** — the
+  reorder buffer is re-keyed to an absolute non-wrapping logical sequence so
+  ordering/draining/SACK stay correct past 65535→0; **LEDBAT per-minute
+  base-delay history** — a rolling ~13-slot minute-minima window lets the
+  base delay recover after a route change instead of pinning low. (Also
+  perf: outgoing payloads now share one `Arc<[u8]>` allocation instead of a
+  `Vec` per packet.)
 
 ### B2 — `--memory-only` storage
 - ✅ In-RAM piece store; nothing persisted to disk for the lifetime of

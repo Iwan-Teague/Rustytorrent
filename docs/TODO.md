@@ -60,12 +60,16 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   env, or shell history). Benefits both `download --paranoid` and
   `decrypt`. rpassword wraps the termios/Win32 `unsafe`, keeping our code
   unsafe-free.
-- [ ] **P2 — randomized µTP receiver seq as an accept token** to close
-  the residual blind-spoof (a forged SYN+DATA can still surface one
-  inbound connection). `utp/connection.rs new_receiver` uses a fixed
-  initial seq; randomize it and only surface to `accept()` once a packet
-  acks it. Low impact (the forged conn can't complete the BT handshake;
-  bounded by `MAX_CONNS` + handshake timeout) — hence P2.
+- [x] **P2 — randomized µTP receiver seq as an accept token.** DONE
+  (commit c63fc05): `new_receiver` now draws its initial seq_nr from the
+  CSPRNG (same source as the connection_ids) as an unguessable accept
+  token. The driver marks the return path confirmed — and only then
+  surfaces the connection to `accept()` — when an incoming non-SYN packet's
+  cumulative ack lands in a bounded window anchored at that token (a SYN
+  never confirms; a half-space `seq_le` would have accepted ~50% of random
+  forgeries, so the window is exact). Closes the residual blind SYN+DATA
+  spoof. Unit-tested (legit ack confirms; forged ack doesn't; seq is
+  randomized).
 
 ## 2. Privacy & anonymity
 
@@ -165,9 +169,13 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   during the write (slices are in file order, so a last-element check
   dedups) and flushes exactly those, dropping the redundant recompute.
   Verified by the multi-file disk test + the multi-file download e2e.
-- [ ] **P2 — µTP `Send` command allocates `Vec<u8>` per chunk.**
-  `utp/socket.rs` — a block split into N packets allocates N times;
-  consider `Arc<[u8]>` or a ring buffer.
+- [x] **P2 — µTP `Send` command allocates `Vec<u8>` per chunk.** DONE
+  (commit c63fc05): a new `Payload` type is a slice into a shared
+  `Arc<[u8]>`; outgoing data is buffered as whole `Arc<[u8]>` blocks and
+  sliced into packets that share one allocation, so a block split into N
+  packets allocates once, and a retransmit clone is just a refcount bump.
+  `Command::Send` carries `Arc<[u8]>`; the `AsyncWrite` impl still takes
+  `&[u8]`.
 - [x] **P2 — bitfield byte→bits expansion is a manual per-bit loop.**
   `message.rs bitfield_from_bytes` — DONE: replaced the per-bit
   shift/branch loop with a bulk `BitVec::<u8, Msb0>::from_slice(bytes)` +
@@ -195,16 +203,18 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   are all locally invariant-guarded with comments ("checked above",
   "guarded by `if`") — acceptable assertions, not input-panics. The "no
   panics in production paths" principle already holds.
-- [ ] **P2 — 16-bit µTP seq_nr wraparound.** [verified, documented]
-  `utp/connection.rs` `pending_in: BTreeMap<u16,...>` orders by raw u16,
-  which breaks across a 65535→0 wrap (a >65k-packet, ~80 MB single µTP
-  connection). `seq_le` is mod-2^16 but the BTreeMap isn't. Practical risk
-  low (hard timeout reaps long flows) but it's a real gap. Fix: key the
-  reorder buffer by a wrap-aware offset from `peer_seq_nr_acked`.
-- [ ] **P2 — LEDBAT base-delay uses a running min, not the 13-slot
-  per-minute history.** [verified, documented] Fails safe (over-
-  conservative) but can get stuck low after a route change. Add the
-  rolling-minute base-delay window per BEP 29 / libtorrent.
+- [x] **P2 — 16-bit µTP seq_nr wraparound.** DONE (commit c63fc05): the
+  reorder buffer is re-keyed from raw `u16` to an absolute non-wrapping
+  `u64` logical sequence (a `peer_logical_acked` counter), so ordering and
+  the next-expected drain stay monotonic across the 65535→0 wrap; the SACK
+  bit offsets derive from the logical distance too, so they're wrap-immune.
+  Unit-tested across the boundary (in-order drain + duplicate-before-frontier).
+- [x] **P2 — LEDBAT base-delay uses a running min, not the 13-slot
+  per-minute history.** DONE (commit c63fc05): added the rolling ~13-slot
+  one-minute-minima window; base = max(min-over-history, fixed floor) so it
+  recovers upward after a route change while keeping the fail-safe fixed
+  floor + 2-packet floor. Unit-tested (recovers after the window expires;
+  holds the min within a slot).
 - [x] **P2 — engine dropped-`ctl_tx` when `--web` is off** means the
   control select-arm is permanently inert by design — fine, but document
   it so it's not mistaken for a bug. DONE: added an explicit comment at
@@ -257,9 +267,14 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   Unit-tested match/empty cases. (Originally flagged [verified] —
   especially useful for magnet, where metadata arrives async, so the user
   sees `--select` took effect.)
-- [ ] **P2 — actionable error messages.** Audit `Error::Network`/`Tracker`
-  strings for "what do I do" guidance (e.g. tracker timeouts, MSE-only
-  swarms, bind failures).
+- [x] **P2 — actionable error messages.** DONE (commit 8d93997): every
+  `Error` Display string now carries remediation guidance derived from the
+  real construction sites — tracker (down/unreachable → check network/proxy;
+  DHT/PEX can still find peers), network (dial/timeout → connectivity,
+  `--socks5`, `--bind-iface`), handshake (incompatible / encryption-only
+  swarm), crypto (wrong/missing `--passphrase` or tampered spool), I/O
+  (path/space/perms), bencode (malformed/truncated). The `{0}`/`{index}`
+  detail is preserved; per-variant maintainer doc comments added.
 
 ## 6. Features (roadmap follow-ups)
 
@@ -325,9 +340,16 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   completion path end to end.
 - [ ] **P2 — choke scheduler under load** (many peers competing for the
   3+1 unchoke slots; fairness + anti-snubbing).
-- [ ] **P2 — property/fuzz the bencode + KRPC + message parsers** on
-  random/adversarial input (cargo-fuzz) — they're the untrusted-input
-  attack surface.
+- [x] **P2 — property/fuzz the bencode + KRPC + message parsers** on
+  random/adversarial input. DONE (commit 8323562): added `proptest`
+  (dev-dep) and `tests/parser_props.rs` — 9 property tests asserting the
+  three untrusted-input decoders never panic on arbitrary bytes and that
+  valid values round-trip (`decode∘encode == id`). bencode uses a recursive
+  depth-bounded value strategy; message covers all variants (stripping the
+  4-byte length prefix that `encode` adds but `decode` doesn't expect); krpc
+  is fuzzed on both arbitrary bytes and valid-bencode-but-invalid-krpc.
+  (cargo-fuzz continuous fuzzing remains a possible future add; proptest
+  covers the never-panic + roundtrip invariants in-suite.)
 
 ## 8. Code quality / tech debt
 
@@ -337,11 +359,15 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   `session.rs`/`web.rs` and the web `parse_info_hash` decode. (`magnet.rs`
   keeps its own nibble parser — it also handles base32 btih, so it's not
   the same function.)
-- [ ] **P1 — CLI arg duplication between `download` and `magnet`** (~17
-  identical flags, twice). [verified] Factor a `#[derive(Args)]
-  SharedDownloadArgs` `#[command(flatten)]`'d into both, and a shared
-  `EngineConfig` builder so `cmd_download`/`cmd_magnet` stop taking 20+
-  positional params (`#[allow(clippy::too_many_arguments)]`).
+- [x] **P1 — CLI arg duplication between `download` and `magnet`.** DONE
+  (commit 3b9c2ba): the 21 verbatim-shared flags are now a
+  `#[derive(clap::Args)] SharedDownloadArgs` `#[command(flatten)]`'d into
+  both variants (all `requires`/`conflicts_with` relations preserved).
+  Per-variant differences stay on the enum: `--dht` (default `false` for
+  download, `true` for magnet), `--no-tracker` (download only), and the
+  `file`/`uri` positionals. `cmd_download`/`cmd_magnet` now take the struct
+  (destructured at the call site so `EngineConfig` is still built in
+  `main.rs`); both `#[allow(clippy::too_many_arguments)]` were removed.
 - [ ] **P2 — `engine.rs run()` is ~500 lines of one `select!`.** Extract
   per-event handlers (tracker tick, choke tick, dht tick, peer event,
   control) to shrink the loop body.
