@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use rustytorrent::metainfo::TorrentFile;
 use rustytorrent::tracker;
@@ -35,121 +35,14 @@ enum Commands {
     /// Download a torrent
     Download {
         file: PathBuf,
-        #[arg(short, long, default_value = ".")]
-        output: PathBuf,
-        #[arg(long, default_value_t = 6881)]
-        port: u16,
-        /// Skip the tracker and dial these peers directly (host:port). Useful for local tests.
-        #[arg(long)]
-        peer: Vec<String>,
         /// Don't query the tracker. Implies --peer is the entire swarm.
         #[arg(long, default_value_t = false)]
         no_tracker: bool,
-        /// Skip the plain-BitTorrent attempt and dial every peer via MSE/PE directly.
-        /// Useful for testing the encrypted path against MSE-only peers.
-        #[arg(long, default_value_t = false)]
-        encrypt: bool,
         /// Enable the BEP 5 DHT for trackerless peer discovery.
         #[arg(long, default_value_t = false)]
         dht: bool,
-        /// SOCKS5 proxy address (host:port). Repeat to build a chain
-        /// `client → proxy1 → proxy2 → … → target` for multi-hop
-        /// anonymity (C1) — each hop runs nested SOCKS5 CONNECTs on a
-        /// single TCP stream. Use `127.0.0.1:9050` for Tor's local
-        /// SOCKS port, or your VPN's loopback SOCKS endpoint. First
-        /// `--socks5` is closest to us; last is closest to the
-        /// destination.
-        #[arg(long)]
-        socks5: Vec<String>,
-        /// Optional SOCKS5 username. Applied to the LAST hop only
-        /// (typically the Tor / VPN endpoint that actually validates
-        /// auth). Paired with --socks5-pass for RFC 1929 auth.
-        #[arg(long, requires = "socks5")]
-        socks5_user: Option<String>,
-        /// Optional SOCKS5 password. Required if --socks5-user is set.
-        #[arg(long, requires = "socks5_user")]
-        socks5_pass: Option<String>,
-        /// "Anonymous mode" bundle. Requires --socks5. Disables the inbound
-        /// TCP listener and the DHT (both leak the real IP), randomizes the
-        /// peer_id (no on-disk persistence), and zeroes the port in tracker
-        /// announces. With --socks5 alone you get IP-masking; with
-        /// --anonymous you also close the side-channels that would
-        /// otherwise undo it.
-        #[arg(long, default_value_t = false, requires = "socks5")]
-        anonymous: bool,
-        /// Bind every outgoing socket to this network interface (VPN kill
-        /// switch). If the interface goes away — VPN tunnel drops, Wi-Fi
-        /// reconnects — outbound dials fail closed instead of leaking via
-        /// the default route. Interface name on Unix (e.g. `utun0`,
-        /// `tun0`, `en0`), numeric interface index on Windows.
-        #[arg(long)]
-        bind_iface: Option<String>,
-        /// Tor stream isolation: every outgoing peer dial uses a randomly
-        /// generated SOCKS5 username so Tor routes it over its own circuit,
-        /// defeating correlation by a single exit node. Requires --socks5.
-        /// Harmless on non-Tor SOCKS5 proxies that ignore credentials;
-        /// avoid on commercial VPNs that require real auth.
-        #[arg(long, default_value_t = false, requires = "socks5")]
-        tor_isolation: bool,
-        /// Paranoid storage: write every piece into an AES-256-GCM encrypted
-        /// spool file under a passphrase-derived key. Plaintext never
-        /// touches disk during the session. Run `rustytorrent decrypt`
-        /// afterwards with the same passphrase to extract.
-        #[arg(long, default_value_t = false)]
-        paranoid: bool,
-        /// Memory-only storage: keep every piece in RAM, never write to
-        /// disk. Strongest "leave no trace" posture; pairs well with
-        /// --anonymous. Mutually exclusive with --paranoid. Unsupported
-        /// on Windows.
-        #[arg(long, default_value_t = false, conflicts_with = "paranoid")]
-        memory_only: bool,
-        /// Defense-in-depth: install an OS sandbox just before
-        /// entering the download loop. Linux x86_64 → seccomp BPF
-        /// whitelist; macOS → `sandbox_init` SBPL deny-default
-        /// profile. Either way an exploit in our address space
-        /// can't reach `ptrace`, `mount`, `process-exec`, kernel
-        /// module load, etc. Windows refused at startup.
-        #[arg(long, default_value_t = false)]
-        sandbox: bool,
-        /// Passphrase for paranoid mode. Required when --paranoid is set.
-        /// Prefer the `RUSTYTORRENT_PASSPHRASE` environment variable:
-        /// passing it here exposes it in the process list and shell
-        /// history.
-        #[arg(long)]
-        passphrase: Option<String>,
-        /// Override the spool file path. Defaults to
-        /// `<output>/<torrent-name>.rustytorrent-spool`.
-        #[arg(long)]
-        spool: Option<PathBuf>,
-        /// Cap download rate at this many KiB/s, engine-wide across
-        /// all peers. Unset = unthrottled. Gated at Request issuance.
-        #[arg(long)]
-        max_down: Option<u64>,
-        /// Cap upload rate at this many KiB/s. Unset = unthrottled.
-        /// Gated at `serve_request`; over-quota peer requests are
-        /// silently dropped (peer re-requests later).
-        #[arg(long)]
-        max_up: Option<u64>,
-        /// Enable µTP (BEP 29): bind a UDP socket on the listen port,
-        /// accept inbound µTP peers, and race TCP+µTP on every dial.
-        /// Auto-disabled under --anonymous / --socks5 (UDP can't ride a
-        /// SOCKS5 CONNECT). Works with --bind-iface — the µTP socket is
-        /// pinned to the same interface as TCP (VPN kill switch).
-        #[arg(long, default_value_t = false)]
-        utp: bool,
-        /// Serve a read-only web monitoring UI (status page + JSON +
-        /// Prometheus /metrics) on 127.0.0.1:PORT. Loopback only.
-        #[arg(long, value_name = "PORT")]
-        web: Option<u16>,
-        /// Selective download: only fetch files whose path contains this
-        /// substring (repeatable). Multi-file torrents only; omit to get
-        /// everything.
-        #[arg(long = "select", value_name = "SUBSTR")]
-        select: Vec<String>,
-        /// Sequential download: fetch pieces in order (for streaming a
-        /// media file while it downloads) instead of rarest-first.
-        #[arg(long, default_value_t = false)]
-        sequential: bool,
+        #[command(flatten)]
+        shared: SharedDownloadArgs,
     },
     /// Download from a magnet URI (BEP 9 + BEP 10 + BEP 53). Bootstraps a
     /// peer pool via DHT and the magnet's own trackers, fetches the info
@@ -158,71 +51,12 @@ enum Commands {
     Magnet {
         /// `magnet:?xt=urn:btih:…&tr=…` URI.
         uri: String,
-        #[arg(short, long, default_value = ".")]
-        output: PathBuf,
-        #[arg(long, default_value_t = 6881)]
-        port: u16,
-        /// Extra peer to dial directly (host:port). Useful when the
-        /// magnet's trackers are dead and DHT is slow to find peers.
-        #[arg(long)]
-        peer: Vec<String>,
-        /// Force MSE/PE on outgoing dials after the metadata is fetched.
-        /// The bootstrap itself currently only attempts plain.
-        #[arg(long, default_value_t = false)]
-        encrypt: bool,
         /// Enable DHT. Defaults to ON for magnets — without trackers in
         /// the URI and no DHT, there are no peers to bootstrap from.
         #[arg(long, default_value_t = true)]
         dht: bool,
-        #[arg(long)]
-        socks5: Vec<String>,
-        #[arg(long, requires = "socks5")]
-        socks5_user: Option<String>,
-        #[arg(long, requires = "socks5_user")]
-        socks5_pass: Option<String>,
-        /// Anonymous bundle. Requires --socks5. Magnet bootstrap then
-        /// relies on the magnet's `tr=` trackers (DHT is off in
-        /// anonymous mode); if there are none, bootstrap fails.
-        #[arg(long, default_value_t = false, requires = "socks5")]
-        anonymous: bool,
-        #[arg(long)]
-        bind_iface: Option<String>,
-        #[arg(long, default_value_t = false, requires = "socks5")]
-        tor_isolation: bool,
-        #[arg(long, default_value_t = false)]
-        paranoid: bool,
-        /// Memory-only storage. Same semantics as `download --memory-only`.
-        #[arg(long, default_value_t = false, conflicts_with = "paranoid")]
-        memory_only: bool,
-        /// seccomp sandbox. Same semantics as `download --sandbox`.
-        #[arg(long, default_value_t = false)]
-        sandbox: bool,
-        /// Passphrase for paranoid mode. Prefer `RUSTYTORRENT_PASSPHRASE`
-        /// — passing it here exposes it in the process list and shell
-        /// history.
-        #[arg(long)]
-        passphrase: Option<String>,
-        #[arg(long)]
-        spool: Option<PathBuf>,
-        /// Cap download rate, KiB/s. Same semantics as `download`.
-        #[arg(long)]
-        max_down: Option<u64>,
-        /// Cap upload rate, KiB/s.
-        #[arg(long)]
-        max_up: Option<u64>,
-        /// Enable µTP (BEP 29). Same semantics as `download --utp`.
-        #[arg(long, default_value_t = false)]
-        utp: bool,
-        /// Serve a read-only web monitoring UI on 127.0.0.1:PORT.
-        #[arg(long, value_name = "PORT")]
-        web: Option<u16>,
-        /// Selective download: only fetch files whose path contains this
-        /// substring (repeatable). Applies once magnet metadata arrives.
-        #[arg(long = "select", value_name = "SUBSTR")]
-        select: Vec<String>,
-        /// Sequential download (in-order pieces for streaming).
-        #[arg(long, default_value_t = false)]
-        sequential: bool,
+        #[command(flatten)]
+        shared: SharedDownloadArgs,
     },
     /// Decrypt a `--paranoid` spool into the real file layout using the
     /// same passphrase that produced it. Pieces that don't hash-match
@@ -309,6 +143,125 @@ enum Commands {
     },
 }
 
+/// Flags shared verbatim by `download` and `magnet`. Flattened into both
+/// variants with `#[command(flatten)]`, so each flag keeps the same name,
+/// default, help text, and `requires`/`conflicts_with` relationship in
+/// both subcommands. Flags that genuinely differ between the two (the
+/// `file`/`uri` positional, `--no-tracker`, and the `--dht` default) stay
+/// as per-variant fields on the enum.
+#[derive(Args)]
+struct SharedDownloadArgs {
+    #[arg(short, long, default_value = ".")]
+    output: PathBuf,
+    #[arg(long, default_value_t = 6881)]
+    port: u16,
+    /// Skip the tracker and dial these peers directly (host:port). Useful for local tests.
+    #[arg(long)]
+    peer: Vec<String>,
+    /// Skip the plain-BitTorrent attempt and dial every peer via MSE/PE directly.
+    /// Useful for testing the encrypted path against MSE-only peers.
+    #[arg(long, default_value_t = false)]
+    encrypt: bool,
+    /// SOCKS5 proxy address (host:port). Repeat to build a chain
+    /// `client → proxy1 → proxy2 → … → target` for multi-hop
+    /// anonymity (C1) — each hop runs nested SOCKS5 CONNECTs on a
+    /// single TCP stream. Use `127.0.0.1:9050` for Tor's local
+    /// SOCKS port, or your VPN's loopback SOCKS endpoint. First
+    /// `--socks5` is closest to us; last is closest to the
+    /// destination.
+    #[arg(long)]
+    socks5: Vec<String>,
+    /// Optional SOCKS5 username. Applied to the LAST hop only
+    /// (typically the Tor / VPN endpoint that actually validates
+    /// auth). Paired with --socks5-pass for RFC 1929 auth.
+    #[arg(long, requires = "socks5")]
+    socks5_user: Option<String>,
+    /// Optional SOCKS5 password. Required if --socks5-user is set.
+    #[arg(long, requires = "socks5_user")]
+    socks5_pass: Option<String>,
+    /// "Anonymous mode" bundle. Requires --socks5. Disables the inbound
+    /// TCP listener and the DHT (both leak the real IP), randomizes the
+    /// peer_id (no on-disk persistence), and zeroes the port in tracker
+    /// announces. With --socks5 alone you get IP-masking; with
+    /// --anonymous you also close the side-channels that would
+    /// otherwise undo it.
+    #[arg(long, default_value_t = false, requires = "socks5")]
+    anonymous: bool,
+    /// Bind every outgoing socket to this network interface (VPN kill
+    /// switch). If the interface goes away — VPN tunnel drops, Wi-Fi
+    /// reconnects — outbound dials fail closed instead of leaking via
+    /// the default route. Interface name on Unix (e.g. `utun0`,
+    /// `tun0`, `en0`), numeric interface index on Windows.
+    #[arg(long)]
+    bind_iface: Option<String>,
+    /// Tor stream isolation: every outgoing peer dial uses a randomly
+    /// generated SOCKS5 username so Tor routes it over its own circuit,
+    /// defeating correlation by a single exit node. Requires --socks5.
+    /// Harmless on non-Tor SOCKS5 proxies that ignore credentials;
+    /// avoid on commercial VPNs that require real auth.
+    #[arg(long, default_value_t = false, requires = "socks5")]
+    tor_isolation: bool,
+    /// Paranoid storage: write every piece into an AES-256-GCM encrypted
+    /// spool file under a passphrase-derived key. Plaintext never
+    /// touches disk during the session. Run `rustytorrent decrypt`
+    /// afterwards with the same passphrase to extract.
+    #[arg(long, default_value_t = false)]
+    paranoid: bool,
+    /// Memory-only storage: keep every piece in RAM, never write to
+    /// disk. Strongest "leave no trace" posture; pairs well with
+    /// --anonymous. Mutually exclusive with --paranoid. Unsupported
+    /// on Windows.
+    #[arg(long, default_value_t = false, conflicts_with = "paranoid")]
+    memory_only: bool,
+    /// Defense-in-depth: install an OS sandbox just before
+    /// entering the download loop. Linux x86_64 → seccomp BPF
+    /// whitelist; macOS → `sandbox_init` SBPL deny-default
+    /// profile. Either way an exploit in our address space
+    /// can't reach `ptrace`, `mount`, `process-exec`, kernel
+    /// module load, etc. Windows refused at startup.
+    #[arg(long, default_value_t = false)]
+    sandbox: bool,
+    /// Passphrase for paranoid mode. Required when --paranoid is set.
+    /// Prefer the `RUSTYTORRENT_PASSPHRASE` environment variable:
+    /// passing it here exposes it in the process list and shell
+    /// history.
+    #[arg(long)]
+    passphrase: Option<String>,
+    /// Override the spool file path. Defaults to
+    /// `<output>/<torrent-name>.rustytorrent-spool`.
+    #[arg(long)]
+    spool: Option<PathBuf>,
+    /// Cap download rate at this many KiB/s, engine-wide across
+    /// all peers. Unset = unthrottled. Gated at Request issuance.
+    #[arg(long)]
+    max_down: Option<u64>,
+    /// Cap upload rate at this many KiB/s. Unset = unthrottled.
+    /// Gated at `serve_request`; over-quota peer requests are
+    /// silently dropped (peer re-requests later).
+    #[arg(long)]
+    max_up: Option<u64>,
+    /// Enable µTP (BEP 29): bind a UDP socket on the listen port,
+    /// accept inbound µTP peers, and race TCP+µTP on every dial.
+    /// Auto-disabled under --anonymous / --socks5 (UDP can't ride a
+    /// SOCKS5 CONNECT). Works with --bind-iface — the µTP socket is
+    /// pinned to the same interface as TCP (VPN kill switch).
+    #[arg(long, default_value_t = false)]
+    utp: bool,
+    /// Serve a read-only web monitoring UI (status page + JSON +
+    /// Prometheus /metrics) on 127.0.0.1:PORT. Loopback only.
+    #[arg(long, value_name = "PORT")]
+    web: Option<u16>,
+    /// Selective download: only fetch files whose path contains this
+    /// substring (repeatable). Multi-file torrents only; omit to get
+    /// everything.
+    #[arg(long = "select", value_name = "SUBSTR")]
+    select: Vec<String>,
+    /// Sequential download: fetch pieces in order (for streaming a
+    /// media file while it downloads) instead of rarest-first.
+    #[arg(long, default_value_t = false)]
+    sequential: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -337,58 +290,10 @@ async fn main() -> Result<()> {
         } => cmd_peers(file, port, numwant).await,
         Commands::Download {
             file,
-            output,
-            port,
-            peer,
             no_tracker,
-            encrypt,
             dht,
-            socks5,
-            socks5_user,
-            socks5_pass,
-            anonymous,
-            bind_iface,
-            tor_isolation,
-            paranoid,
-            memory_only,
-            sandbox,
-            passphrase,
-            spool,
-            max_down,
-            max_up,
-            utp,
-            web,
-            select,
-            sequential,
-        } => {
-            cmd_download(
-                file,
-                output,
-                port,
-                peer,
-                no_tracker,
-                encrypt,
-                dht,
-                socks5,
-                socks5_user,
-                socks5_pass,
-                anonymous,
-                bind_iface,
-                tor_isolation,
-                paranoid,
-                memory_only,
-                sandbox,
-                passphrase,
-                spool,
-                max_down,
-                max_up,
-                utp,
-                web,
-                select,
-                sequential,
-            )
-            .await
-        }
+            shared,
+        } => cmd_download(file, no_tracker, dht, shared).await,
         Commands::Decrypt {
             file,
             output,
@@ -423,58 +328,7 @@ async fn main() -> Result<()> {
             name,
             private,
         } => cmd_create(path, output, trackers, piece_length, name, private).await,
-        Commands::Magnet {
-            uri,
-            output,
-            port,
-            peer,
-            encrypt,
-            dht,
-            socks5,
-            socks5_user,
-            socks5_pass,
-            anonymous,
-            bind_iface,
-            tor_isolation,
-            paranoid,
-            memory_only,
-            sandbox,
-            passphrase,
-            spool,
-            max_down,
-            max_up,
-            utp,
-            web,
-            select,
-            sequential,
-        } => {
-            cmd_magnet(
-                uri,
-                output,
-                port,
-                peer,
-                encrypt,
-                dht,
-                socks5,
-                socks5_user,
-                socks5_pass,
-                anonymous,
-                bind_iface,
-                tor_isolation,
-                paranoid,
-                memory_only,
-                sandbox,
-                passphrase,
-                spool,
-                max_down,
-                max_up,
-                utp,
-                web,
-                select,
-                sequential,
-            )
-            .await
-        }
+        Commands::Magnet { uri, dht, shared } => cmd_magnet(uri, dht, shared).await,
     }
 }
 
@@ -567,33 +421,38 @@ async fn cmd_peers(path: PathBuf, port: u16, numwant: i32) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // CLI flag plumbing — each arg is one user-facing knob
 async fn cmd_download(
     path: PathBuf,
-    output: PathBuf,
-    port: u16,
-    extra_peers: Vec<String>,
     no_tracker: bool,
-    encrypt: bool,
     dht: bool,
-    socks5: Vec<String>,
-    socks5_user: Option<String>,
-    socks5_pass: Option<String>,
-    anonymous: bool,
-    bind_iface: Option<String>,
-    tor_isolation: bool,
-    paranoid: bool,
-    memory_only: bool,
-    sandbox: bool,
-    passphrase: Option<String>,
-    spool: Option<PathBuf>,
-    max_down: Option<u64>,
-    max_up: Option<u64>,
-    utp: bool,
-    web: Option<u16>,
-    select: Vec<String>,
-    sequential: bool,
+    shared: SharedDownloadArgs,
 ) -> Result<()> {
+    // Expand the flattened CLI args here at the call site so the engine
+    // entry point (in another module) still receives a fully populated
+    // EngineConfig without main.rs reaching into it.
+    let SharedDownloadArgs {
+        output,
+        port,
+        peer: extra_peers,
+        encrypt,
+        socks5,
+        socks5_user,
+        socks5_pass,
+        anonymous,
+        bind_iface,
+        tor_isolation,
+        paranoid,
+        memory_only,
+        sandbox,
+        passphrase,
+        spool,
+        max_down,
+        max_up,
+        utp,
+        web,
+        select,
+        sequential,
+    } = shared;
     let raw = tokio::fs::read(&path)
         .await
         .with_context(|| format!("read {}", path.display()))?;
@@ -1060,32 +919,34 @@ async fn resolve_proxy_chain(
     Ok(chain)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn cmd_magnet(
-    uri: String,
-    output: PathBuf,
-    port: u16,
-    extra_peers: Vec<String>,
-    encrypt: bool,
-    dht: bool,
-    socks5: Vec<String>,
-    socks5_user: Option<String>,
-    socks5_pass: Option<String>,
-    anonymous: bool,
-    bind_iface: Option<String>,
-    tor_isolation: bool,
-    paranoid: bool,
-    memory_only: bool,
-    sandbox: bool,
-    passphrase: Option<String>,
-    spool: Option<PathBuf>,
-    max_down: Option<u64>,
-    max_up: Option<u64>,
-    utp: bool,
-    web: Option<u16>,
-    select: Vec<String>,
-    sequential: bool,
-) -> Result<()> {
+async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Result<()> {
+    // Expand the flattened CLI args at the call site (the engine
+    // constructor lives in another module). Magnet has no --no-tracker:
+    // its tracker set comes from the URI, so EngineConfig.no_tracker is
+    // hardcoded false below.
+    let SharedDownloadArgs {
+        output,
+        port,
+        peer: extra_peers,
+        encrypt,
+        socks5,
+        socks5_user,
+        socks5_pass,
+        anonymous,
+        bind_iface,
+        tor_isolation,
+        paranoid,
+        memory_only,
+        sandbox,
+        passphrase,
+        spool,
+        max_down,
+        max_up,
+        utp,
+        web,
+        select,
+        sequential,
+    } = shared;
     let magnet = rustytorrent::magnet::MagnetLink::parse(&uri)?;
     println!(
         "Magnet:     {} ({} trackers)",
