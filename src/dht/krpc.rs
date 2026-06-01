@@ -137,7 +137,7 @@ fn encode_into(v: &BencodeValue, out: &mut Vec<u8>) {
     }
 }
 
-fn nodes_to_bytes(nodes: &[Contact]) -> Vec<u8> {
+pub fn nodes_to_bytes(nodes: &[Contact]) -> Vec<u8> {
     let mut out = Vec::with_capacity(nodes.len() * 26);
     for c in nodes {
         if let SocketAddr::V4(v4) = c.addr {
@@ -150,7 +150,7 @@ fn nodes_to_bytes(nodes: &[Contact]) -> Vec<u8> {
     out
 }
 
-fn parse_nodes_bytes(buf: &[u8]) -> Result<Vec<Contact>> {
+pub fn parse_nodes_bytes(buf: &[u8]) -> Result<Vec<Contact>> {
     if !buf.len().is_multiple_of(26) {
         return Err(Error::Network(format!(
             "nodes length {} not multiple of 26",
@@ -187,7 +187,7 @@ fn values_to_list(values: &[SocketAddr]) -> BencodeValue {
     b_list(out)
 }
 
-fn parse_values_list(v: &BencodeValue) -> Result<Vec<SocketAddr>> {
+pub fn parse_values_list(v: &BencodeValue) -> Result<Vec<SocketAddr>> {
     let list = v.as_list()?;
     let mut out = Vec::with_capacity(list.len());
     for item in list {
