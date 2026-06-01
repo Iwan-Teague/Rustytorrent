@@ -319,8 +319,15 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   unsure. An e2e test asserts an unwanted, non-boundary file is never
   created on disk while the selected file downloads byte-complete.
 - [ ] **P2 — plugin system for custom piece pickers** (roadmap stretch).
-- [ ] **P2 — IPv6: confirm dual-stack dialing** (listener + compact-peer
-  parsing done; verify outbound IPv6 peer dials work end to end).
+- [x] **P2 — IPv6: confirm dual-stack dialing.** DONE (commit 73fa060):
+  added `tests/ipv6_dial.rs`, a seeder↔leecher loopback e2e conducted
+  entirely over `::1` (free port via binding `[::1]:0`; the dialed address
+  is asserted `is_ipv6() && is_loopback()` so a silent v4 downgrade fails
+  the test). Verified end to end with NO code change needed — the engine
+  already binds a dual-stack listener (`bind_dual_stack_listener`: a
+  `socket2` IPv6 socket with `set_only_v6(false)` on `[::]`) and the
+  outbound dial uses family-agnostic `TcpStream::connect`, so an IPv6
+  `SocketAddr` flows through the dial path untouched.
 
 ## 7. Testing
 
@@ -366,9 +373,18 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   covering the rest of the untrusted-input wire surface: peer handshake,
   UDP-tracker announce response, the BEP 10 extension / ut_metadata / ut_pex
   payloads, and the DHT compact node/peer decoders (never-panic + roundtrip
-  where an encoder exists). (cargo-fuzz continuous fuzzing remains a
-  possible future add; proptest covers the never-panic + roundtrip
-  invariants in-suite.)
+  where an encoder exists). Extended again (commit 56c449f) with
+  `tests/metainfo_props.rs` — 8 props on the *semantic* layer above bencode
+  (`TorrentFile::from_bytes`, `from_info_dict_bytes`, `MagnetLink::parse`)
+  fed arbitrary + structured-hostile input, proving the path-traversal
+  rejection and the `1..=1 GiB` piece_length bound can't be bypassed by any
+  crafted-but-valid bencode. And `tests/layout_props.rs` (commit f81c634)
+  property-tests the multi-file virtual offset map: across 2000 random
+  layouts (incl. 0-length files + short final pieces) `slices_for_piece`
+  exactly tiles every file `[0,len)` with no gaps/overlaps and correct
+  byte totals — the multi-file write-correctness invariant. Both held, no
+  bug found. (cargo-fuzz continuous fuzzing remains a possible future add;
+  proptest covers the never-panic + roundtrip invariants in-suite.)
 
 ## 8. Code quality / tech debt
 

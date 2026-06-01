@@ -219,7 +219,8 @@ docs/DAEMON.md for the daemon design and the remaining optimisations
 
 ## Stretch Goals (no timeline)
 
-- ✅ IPv6 support (dual-stack listener + IPv6 compact peers / PEX)
+- ✅ IPv6 support (dual-stack listener + IPv6 compact peers / PEX; outbound
+  `::1` dial verified end-to-end by `tests/ipv6_dial.rs`)
 - ✅ Selective file download within multi-file torrents (`--select SUBSTR`)
 - Tor transport supported via `--socks5` + `--anonymous`; native i2p not done
 - Plugin system for custom piece pickers
