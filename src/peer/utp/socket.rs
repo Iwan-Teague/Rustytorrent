@@ -96,8 +96,11 @@ enum Command {
         peer: SocketAddr,
         resp: oneshot::Sender<io::Result<UtpStream>>,
     },
-    /// Application bytes to send on `key`.
-    Send { key: ConnKey, data: Vec<u8> },
+    /// Application bytes to send on `key`. Carried as a shared
+    /// `Arc<[u8]>` block so the driver can hand it to the connection
+    /// without a copy, and so splitting it into N packets shares the one
+    /// allocation (see `Connection::enqueue_send_block`).
+    Send { key: ConnKey, data: Arc<[u8]> },
     /// Application requested a clean close of `key`.
     Close { key: ConnKey },
 }
@@ -113,12 +116,13 @@ struct Entry {
     /// half the stream will read from. `None` for inbound connections.
     pending: Option<PendingDial>,
     /// For an *inbound* connection: the stream + peer addr we'll hand to
-    /// `accept()` — but only once the peer sends a non-SYN packet,
-    /// proving it actually received our STATE (return-path validation).
-    /// Holding off until then means a spoofed-source SYN flood never
-    /// surfaces to `accept()` / occupies a peer slot; the half-open
-    /// entries just reap at `HARD_TIMEOUT`. `None` once surfaced (or for
-    /// outbound connections).
+    /// `accept()` — but only once the connection's `return_path_confirmed`
+    /// flips, i.e. the peer acked the randomized initial seq_nr (accept
+    /// token) we sent in our STATE, proving it actually received that
+    /// STATE on the real return path. Holding off until then means a
+    /// spoofed-source SYN(+DATA) flood never surfaces to `accept()` /
+    /// occupies a peer slot; the half-open entries just reap at
+    /// `HARD_TIMEOUT`. `None` once surfaced (or for outbound connections).
     pending_accept: Option<(UtpStream, SocketAddr)>,
     /// Most recent one-way delay measurement for this connection:
     /// `local_recv_micros - peer_timestamp_micros` on the last packet we
@@ -219,9 +223,12 @@ impl AsyncWrite for UtpStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let me = self.get_mut();
+        // One allocation per write: copy the caller's bytes into a shared
+        // `Arc<[u8]>` block. The connection then slices this block into N
+        // packet payloads that share it, instead of allocating per packet.
         match me.cmd.send(Command::Send {
             key: me.key,
-            data: buf.to_vec(),
+            data: Arc::from(buf),
         }) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(_) => Poll::Ready(Err(io::Error::new(
@@ -404,12 +411,21 @@ impl Driver {
                 }
             }
             self.collect_after(&key, now, &mut outgoing);
-            // Return-path validation: a non-SYN packet means the peer
-            // received our STATE, so this is a responsive (not blindly
-            // spoofed) source — surface the held inbound stream to
-            // accept() now. A duplicate SYN proves nothing, so it
-            // doesn't trigger this.
-            if pkt.packet_type != PacketType::Syn {
+            // Return-path validation: surface the held inbound stream to
+            // accept() only once the connection confirms the peer acked
+            // the randomized initial seq_nr (accept token) we sent in our
+            // STATE. A blind spoofer that forges SYN+DATA from a victim
+            // address never receives that token, so it can't make this
+            // true — its forged packets leave the connection unconfirmed
+            // and the half-open entry reaps at HARD_TIMEOUT. (Checking the
+            // token, not merely "any non-SYN packet", closes the residual
+            // where a forged DATA with a guessed/zero ack would otherwise
+            // surface a connection.)
+            if self
+                .conns
+                .get(&key)
+                .is_some_and(|e| e.conn.return_path_confirmed())
+            {
                 let surfaced = self
                     .conns
                     .get_mut(&key)
@@ -485,7 +501,8 @@ impl Driver {
             }
             Command::Send { key, data } => {
                 if let Some(entry) = self.conns.get_mut(&key) {
-                    entry.conn.enqueue_send(&data);
+                    // Hand over the shared block with no copy.
+                    entry.conn.enqueue_send_block(data);
                 }
                 let mut outgoing = Vec::new();
                 self.collect_after(&key, now, &mut outgoing);

@@ -30,6 +30,9 @@
 //! `next_ext == 0` terminates the chain. `len` must be a multiple of 4
 //! per BEP 29. The selective-ack extension uses type id 1.
 
+use std::ops::Deref;
+use std::sync::Arc;
+
 use crate::error::{Error, Result};
 
 /// Wire size of the fixed µTP header.
@@ -93,8 +96,102 @@ pub struct Extension {
     pub data: Vec<u8>,
 }
 
-/// A fully decoded µTP packet. Cheap to construct/move — payload
-/// is held by-value so the caller owns the bytes.
+/// A packet payload: a window `[start, start + len)` into a shared
+/// `Arc<[u8]>` backing buffer.
+///
+/// The send path packetizes one application block (a single `write`) by
+/// holding the whole block as one `Arc<[u8]>` and handing each DATA
+/// packet a `Payload` *slice* of it — so splitting a block into N packets
+/// shares ONE allocation instead of doing N independent `Vec` copies
+/// (the previous `drain(..).collect()` per chunk). Cloning a `Payload`
+/// (e.g. into the retransmit queue) is an `Arc` refcount bump, not a byte
+/// copy. On receive, `decode` allocates the payload once as before.
+///
+/// Derefs to `&[u8]`, so existing read-side code (`encode`, `extend`,
+/// `len`, iteration) is unchanged. Equality and hashing are by bytes, so
+/// two payloads with the same contents but different backing buffers
+/// compare equal — preserving the codec's roundtrip assertions.
+#[derive(Debug, Clone)]
+pub struct Payload {
+    buf: Arc<[u8]>,
+    start: usize,
+    len: usize,
+}
+
+impl Payload {
+    /// An empty payload (no allocation beyond the shared zero-length Arc).
+    pub fn empty() -> Self {
+        Self {
+            buf: empty_arc(),
+            start: 0,
+            len: 0,
+        }
+    }
+
+    /// A window `[start, start + len)` into `buf`. Shares `buf`'s
+    /// allocation — no copy. `start + len` must be `<= buf.len()`.
+    pub fn slice(buf: Arc<[u8]>, start: usize, len: usize) -> Self {
+        debug_assert!(start + len <= buf.len(), "payload slice out of bounds");
+        Self { buf, start, len }
+    }
+
+    /// The shared bytes as a slice.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[self.start..self.start + self.len]
+    }
+}
+
+impl Deref for Payload {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for Payload {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for Payload {}
+
+impl From<Vec<u8>> for Payload {
+    fn from(v: Vec<u8>) -> Self {
+        let len = v.len();
+        Self {
+            buf: Arc::from(v),
+            start: 0,
+            len,
+        }
+    }
+}
+
+impl From<&[u8]> for Payload {
+    fn from(s: &[u8]) -> Self {
+        Self {
+            buf: Arc::from(s),
+            start: 0,
+            len: s.len(),
+        }
+    }
+}
+
+impl From<Arc<[u8]>> for Payload {
+    fn from(buf: Arc<[u8]>) -> Self {
+        let len = buf.len();
+        Self { buf, start: 0, len }
+    }
+}
+
+/// A fully decoded µTP packet.
+///
+/// `payload` is a [`Payload`] (a slice of a shared `Arc<[u8]>`) rather
+/// than an owned `Vec<u8>`, so the send path can split one application
+/// block into N packets that share the block's single backing
+/// allocation, and cloning a packet for the retransmit queue is a
+/// refcount bump rather than a byte copy. Equality compares the payload
+/// bytes (and all other fields).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
     pub packet_type: PacketType,
@@ -105,7 +202,7 @@ pub struct Packet {
     pub seq_nr: u16,
     pub ack_nr: u16,
     pub extensions: Vec<Extension>,
-    pub payload: Vec<u8>,
+    pub payload: Payload,
 }
 
 impl Packet {
@@ -123,7 +220,7 @@ impl Packet {
             seq_nr,
             ack_nr,
             extensions: Vec::new(),
-            payload: Vec::new(),
+            payload: Payload::empty(),
         }
     }
 
@@ -211,7 +308,9 @@ impl Packet {
             // Loop continues with the new `next_ext` value taken
             // from this entry's first byte.
         }
-        let payload = buf[cursor..].to_vec();
+        // Decode allocates the payload once (the whole datagram body),
+        // exactly as before; the Arc just makes later clones cheap.
+        let payload: Payload = Arc::<[u8]>::from(&buf[cursor..]).into();
 
         Ok(Self {
             packet_type,
@@ -225,6 +324,13 @@ impl Packet {
             payload,
         })
     }
+}
+
+/// A zero-length shared backing buffer for empty payloads. Reused for
+/// the common no-payload packet types (SYN / STATE / FIN / RESET) so
+/// they don't each allocate.
+fn empty_arc() -> Arc<[u8]> {
+    Arc::from(Vec::new())
 }
 
 fn encode_extension_chain(extensions: &[Extension]) -> Vec<u8> {
@@ -259,7 +365,7 @@ mod tests {
             seq_nr: 0x1111,
             ack_nr: 0x2222,
             extensions: Vec::new(),
-            payload: Vec::new(),
+            payload: Payload::empty(),
         }
     }
 
@@ -276,7 +382,7 @@ mod tests {
     fn encode_data_packet_includes_payload() {
         let mut p = sample_state_packet();
         p.packet_type = PacketType::Data;
-        p.payload = b"hello, swarm".to_vec();
+        p.payload = Payload::from(b"hello, swarm".as_slice());
         let wire = p.encode();
         assert_eq!(wire.len(), HEADER_LEN + p.payload.len());
         let back = Packet::decode(&wire).unwrap();
