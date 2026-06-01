@@ -93,19 +93,19 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        // See `EncryptedStream::poll_write`: advance the keystream by exactly
+        // the bytes the inner writer accepts so a `Pending` or short write
+        // can't desync the peer. Encrypt with a clone; commit per the result.
+        let mut cipher = this.cipher.clone();
         let mut encrypted = buf.to_vec();
-        this.cipher.process(&mut encrypted);
+        cipher.process(&mut encrypted);
         match Pin::new(&mut this.inner).poll_write(cx, &encrypted) {
+            Poll::Ready(Ok(n)) if n == encrypted.len() => {
+                this.cipher = cipher;
+                Poll::Ready(Ok(n))
+            }
             Poll::Ready(Ok(n)) => {
-                // Same caveat as EncryptedStream::poll_write: callers must
-                // use `write_all` (which loops until all bytes are written)
-                // so a short write would desync the keystream. The peer
-                // task uses `write_all` exclusively.
-                debug_assert_eq!(
-                    n,
-                    encrypted.len(),
-                    "Rc4Writer relies on full-write semantics"
-                );
+                this.cipher.skip(n);
                 Poll::Ready(Ok(n))
             }
             other => other,
@@ -150,39 +150,26 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        // RC4 is a stream cipher; we must consume exactly the bytes we hand
-        // to the inner writer. Encrypt into a temporary buffer, then write
-        // some prefix of it.
+        // RC4 is forward-only, so the keystream must advance by exactly the
+        // number of bytes the inner writer actually accepts. Encrypt with a
+        // *clone* of the cipher and only commit the advance once the inner
+        // write reports how much it took: adopt the advanced clone on a full
+        // write, step the real cipher forward by `n` on a partial write, and
+        // leave it untouched on `Pending`/`Err`. Advancing the real cipher up
+        // front (the old behaviour) desynced the peer whenever the inner write
+        // came back `Pending` under backpressure — `write_all` then re-encrypts
+        // the same bytes from the already-advanced position.
+        let mut cipher = this.write_cipher.clone();
         let mut encrypted = buf.to_vec();
-        this.write_cipher.process(&mut encrypted);
+        cipher.process(&mut encrypted);
         match Pin::new(&mut this.inner).poll_write(cx, &encrypted) {
-            Poll::Ready(Ok(written)) => {
-                // Inner only consumed `written` bytes — but we've already
-                // advanced the keystream past `buf.len()`. We need to roll
-                // it back to the actual count by re-running the cipher
-                // forward from the *new* position next call. Since RC4 is
-                // forward-only, the simplest safe correction is to refuse
-                // partial writes: report only what we encrypted-and-sent and
-                // require callers to retry the remainder.
-                //
-                // Tokio's `TcpStream` may legitimately return short writes
-                // under load, so we resync the keystream by stepping it
-                // backward — but RC4 has no inverse. Instead, restart the
-                // cipher state? Also impossible without re-keying.
-                //
-                // In practice short writes on tokio TcpStreams happen at
-                // the socket buffer boundary and Tokio's higher-level
-                // helpers (`write_all`) already loop. The peer task uses
-                // `write_all` exclusively, which calls `poll_write` until
-                // all bytes are consumed; mismatched keystream advance is
-                // therefore impossible in our use, but the property is
-                // subtle. Document and assert:
-                debug_assert_eq!(
-                    written,
-                    encrypted.len(),
-                    "EncryptedStream relies on full-write semantics"
-                );
-                Poll::Ready(Ok(written))
+            Poll::Ready(Ok(n)) if n == encrypted.len() => {
+                this.write_cipher = cipher;
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Ok(n)) => {
+                this.write_cipher.skip(n);
+                Poll::Ready(Ok(n))
             }
             other => other,
         }
@@ -225,5 +212,69 @@ mod tests {
         let mut got = vec![0u8; reply.len()];
         alice.read_exact(&mut got).await.unwrap();
         assert_eq!(got, reply);
+    }
+
+    /// An `AsyncWrite` that returns `Pending` (self-waking) on every other
+    /// poll and never accepts more than one byte at a time — exactly the
+    /// `Pending` / short-write conditions a real `TcpStream` produces under
+    /// backpressure. Before the per-`n` keystream-advance fix, the writer
+    /// advanced the cipher by the full buffer up front, so a `Pending` made
+    /// `write_all` re-encrypt the same bytes from an advanced position and
+    /// desync the peer.
+    struct ChokeWriter<W> {
+        inner: W,
+        pend_next: bool,
+    }
+
+    impl<W: AsyncWrite + Unpin> AsyncWrite for ChokeWriter<W> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if this.pend_next {
+                this.pend_next = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            this.pend_next = true;
+            let n = buf.len().min(1);
+            Pin::new(&mut this.inner).poll_write(cx, &buf[..n])
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn keystream_survives_pending_and_partial_writes() {
+        let (a, b) = tokio::io::duplex(8192);
+        let key = b"shared-handshake-derived-key";
+        let mut writer = EncryptedStream::new(
+            ChokeWriter {
+                inner: a,
+                pend_next: true,
+            },
+            Rc4::new(key),
+            Rc4::new(key),
+        );
+        let mut reader = EncryptedStream::new(b, Rc4::new(key), Rc4::new(key));
+
+        let payload: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
+        let to_send = payload.clone();
+        let w = tokio::spawn(async move {
+            writer.write_all(&to_send).await.unwrap();
+            writer.flush().await.unwrap();
+        });
+        let mut got = vec![0u8; payload.len()];
+        reader.read_exact(&mut got).await.unwrap();
+        w.await.unwrap();
+        assert_eq!(got, payload);
     }
 }
