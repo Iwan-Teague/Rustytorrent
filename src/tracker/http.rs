@@ -156,6 +156,14 @@ async fn announce_inner(
     parse_response(&bytes)
 }
 
+/// Clamp tracker-supplied announce intervals to a sane ceiling (24 h). A
+/// hostile or MITM'd `http://` tracker can otherwise return an enormous
+/// `interval` (up to `i64::MAX`), which both parks reannounces effectively
+/// forever and overflows the `Duration` arithmetic in the engine's jitter
+/// step (`base * pct`) — a remote panic. The lower bound is enforced
+/// separately by `reannounce_min`.
+const MAX_INTERVAL_SECS: u64 = 86_400;
+
 pub fn parse_response(body: &[u8]) -> Result<AnnounceResponse> {
     let v = BencodeValue::parse_all(body).map_err(|e| Error::Tracker(format!("bencode: {e}")))?;
     let d = v
@@ -173,7 +181,7 @@ pub fn parse_response(body: &[u8]) -> Result<AnnounceResponse> {
     let min_interval = d
         .get(&b"min interval".to_vec())
         .and_then(|v| v.as_int().ok())
-        .map(|n| Duration::from_secs(n.max(0) as u64));
+        .map(|n| Duration::from_secs((n.max(0) as u64).min(MAX_INTERVAL_SECS)));
     let seeders = d
         .get(&b"complete".to_vec())
         .and_then(|v| v.as_int().ok())
@@ -218,7 +226,7 @@ pub fn parse_response(body: &[u8]) -> Result<AnnounceResponse> {
     }
 
     Ok(AnnounceResponse {
-        interval: Duration::from_secs(interval.max(0) as u64),
+        interval: Duration::from_secs((interval.max(0) as u64).min(MAX_INTERVAL_SECS)),
         min_interval,
         seeders,
         leechers,
@@ -353,6 +361,16 @@ mod tests {
     fn parse_response_failure_reason() {
         let body = b"d14:failure reason13:not authorizede";
         assert!(parse_response(body).is_err());
+    }
+
+    #[test]
+    fn parse_response_clamps_hostile_interval() {
+        // A hostile tracker returning i64::MAX must not yield an unbounded
+        // Duration (which would later overflow the jitter math and panic).
+        let body = b"d8:intervali9223372036854775807e12:min intervali9223372036854775807ee";
+        let r = parse_response(body).unwrap();
+        assert_eq!(r.interval, Duration::from_secs(MAX_INTERVAL_SECS));
+        assert_eq!(r.min_interval, Some(Duration::from_secs(MAX_INTERVAL_SECS)));
     }
 
     #[test]

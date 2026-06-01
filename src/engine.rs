@@ -1473,6 +1473,14 @@ impl TorrentEngine {
         if !self.pm.local_bitfield()[index as usize] {
             return;
         }
+        // Validate the requested window against the piece length BEFORE
+        // charging upload accounting/tokens below: otherwise a peer can
+        // inflate `uploaded` and drain upload tokens with a valid `length`
+        // but an out-of-range `begin` that ships zero bytes. The cache/disk
+        // paths also bounds-check the slice; this keeps the accounting honest.
+        if (begin as u64).saturating_add(length as u64) > self.pm.piece_size(index as usize) {
+            return;
+        }
 
         let Some(peer_handle) = peers.handle(&addr).cloned() else {
             return;
@@ -2022,7 +2030,10 @@ fn jittered_interval(base: Duration, anonymous: bool) -> Duration {
     } else {
         rng.gen_range(0..=5)
     };
-    base + base * pct / 100
+    // Saturating arithmetic so a pathologically large `base` (e.g. a hostile
+    // tracker `interval` that slipped past clamping) can never overflow
+    // `Duration` and panic the engine task.
+    base.saturating_add(base.saturating_mul(pct) / 100)
 }
 
 #[cfg(test)]
@@ -2036,6 +2047,16 @@ mod tests {
             assert!(jittered_interval(base, false) >= base);
             assert!(jittered_interval(base, true) >= base);
         }
+    }
+
+    #[test]
+    fn jitter_saturates_instead_of_overflowing() {
+        // A hostile tracker `interval` that produced a near-MAX base must
+        // saturate, not panic the engine task (Duration * pct would overflow).
+        let _ = jittered_interval(Duration::MAX, false);
+        let _ = jittered_interval(Duration::MAX, true);
+        let big = Duration::from_secs(u64::MAX / 10);
+        assert!(jittered_interval(big, true) >= big);
     }
 
     #[test]

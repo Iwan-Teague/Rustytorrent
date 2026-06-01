@@ -132,6 +132,12 @@ struct SharedState {
 
 struct PendingQuery {
     reply: oneshot::Sender<KrpcReply>,
+    /// The exact address we sent this query to. A reply is accepted only
+    /// from this address: the transaction id is just 16 bits and therefore
+    /// guessable, so binding to the source defeats off-path forged replies
+    /// (which could otherwise inject bogus peers into a lookup or evict the
+    /// in-flight query).
+    target: SocketAddr,
 }
 
 struct TokenState {
@@ -420,9 +426,15 @@ async fn handle_datagram(state: &SharedState, sock: &UdpSocket, from: SocketAddr
                 let mut rt = state.routing.lock().await;
                 rt.insert(Contact::new(id, from));
             }
-            let waiting = state.pending.lock().await.remove(&transaction_id);
-            if let Some(p) = waiting {
-                let _ = p.reply.send(KrpcReply::Response(response));
+            // Accept the reply only from the address we actually queried (see
+            // PendingQuery::target). A mismatched packet is dropped with the
+            // pending entry left intact, so a forged reply can neither inject
+            // a response into the lookup nor evict the genuine one.
+            let mut pending = state.pending.lock().await;
+            if pending.get(&transaction_id).map(|p| p.target) == Some(from) {
+                if let Some(p) = pending.remove(&transaction_id) {
+                    let _ = p.reply.send(KrpcReply::Response(response));
+                }
             }
         }
         Message::Error {
@@ -430,9 +442,11 @@ async fn handle_datagram(state: &SharedState, sock: &UdpSocket, from: SocketAddr
             code,
             message,
         } => {
-            let waiting = state.pending.lock().await.remove(&transaction_id);
-            if let Some(p) = waiting {
-                let _ = p.reply.send(KrpcReply::Error(code, message));
+            let mut pending = state.pending.lock().await;
+            if pending.get(&transaction_id).map(|p| p.target) == Some(from) {
+                if let Some(p) = pending.remove(&transaction_id) {
+                    let _ = p.reply.send(KrpcReply::Error(code, message));
+                }
             }
         }
     }
@@ -556,11 +570,13 @@ async fn send_query(
         query,
     };
     let (tx, rx) = oneshot::channel();
-    state
-        .pending
-        .lock()
-        .await
-        .insert(txid.clone(), PendingQuery { reply: tx });
+    state.pending.lock().await.insert(
+        txid.clone(),
+        PendingQuery {
+            reply: tx,
+            target: addr,
+        },
+    );
     if sock.send_to(&msg.encode(), addr).await.is_err() {
         state.pending.lock().await.remove(&txid);
         return None;

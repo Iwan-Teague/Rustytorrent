@@ -243,20 +243,21 @@ fn piece_size(layout: &Layout, index: usize) -> u64 {
 /// On-startup resume scan: SHA1-verify every piece against expected hashes
 /// and return the indices of complete pieces.
 pub async fn scan_resume(layout: &Layout, piece_hashes: &[[u8; 20]]) -> Result<Vec<usize>> {
-    let mut files: Vec<File> = Vec::with_capacity(layout.files.len());
-    let mut any_missing = false;
+    // Open every output file, tolerating ones that don't exist. A selective
+    // (`--select`) download deliberately never creates fully-unwanted files,
+    // and a partially-downloaded multi-file torrent may not have created
+    // every file yet. A missing file is not fatal to the whole scan — we
+    // simply can't verify the pieces that read from it, so we skip those and
+    // still resume every piece whose files are all present. (Previously a
+    // single missing file abandoned the entire resume, so `--select` resumed
+    // nothing and re-verified/re-downloaded completed files on every restart.)
+    let mut files: Vec<Option<File>> = Vec::with_capacity(layout.files.len());
     for span in &layout.files {
         match File::open(&span.path).await {
-            Ok(f) => files.push(f),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                any_missing = true;
-                break;
-            }
+            Ok(f) => files.push(Some(f)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => files.push(None),
             Err(e) => return Err(Error::Io(e)),
         }
-    }
-    if any_missing {
-        return Ok(Vec::new());
     }
     let mut out = Vec::new();
     for (index, expected) in piece_hashes.iter().enumerate().take(layout.num_pieces) {
@@ -266,7 +267,12 @@ pub async fn scan_resume(layout: &Layout, piece_hashes: &[[u8; 20]]) -> Result<V
         let mut off = 0usize;
         let mut ok = true;
         for (file_idx, file_off, count) in slices {
-            let f = &mut files[file_idx];
+            // A slice into a file that isn't on disk (selective-skipped or
+            // not yet created) can't be verified → this piece isn't resumable.
+            let Some(f) = files[file_idx].as_mut() else {
+                ok = false;
+                break;
+            };
             if f.seek(SeekFrom::Start(file_off)).await.is_err() {
                 ok = false;
                 break;
@@ -385,15 +391,56 @@ mod tests {
     }
 
     fn tempdir() -> PathBuf {
+        // pid + nanos + a process-wide counter so parallel test threads can't
+        // collide on the same dir when the clock resolution is coarse.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "rustytorrent-test-{}",
+            "rustytorrent-test-{}-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[tokio::test]
+    async fn scan_resume_tolerates_missing_file() {
+        use sha1::{Digest, Sha1};
+        let tmp = tempdir();
+        // Three 100-byte files at piece_length 100 → one piece per file.
+        let t = make_torrent_multi(100, vec![(100, "a.txt"), (100, "b.txt"), (100, "c.txt")]);
+        let layout = Layout::from_torrent(tmp.clone(), &t);
+        let data: Vec<Vec<u8>> = (0u8..3).map(|i| vec![i + 1; 100]).collect();
+        // Real per-piece hashes (piece i == file i, file-aligned).
+        let hashes: Vec<[u8; 20]> = data
+            .iter()
+            .map(|d| {
+                let mut h = [0u8; 20];
+                h.copy_from_slice(&Sha1::digest(d));
+                h
+            })
+            .collect();
+        // Write files 0 and 2; file 1 (b.txt) is intentionally absent, as a
+        // selective-skipped (or not-yet-created) file would be on resume.
+        tokio::fs::create_dir_all(layout.files[0].path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&layout.files[0].path, &data[0])
+            .await
+            .unwrap();
+        tokio::fs::write(&layout.files[2].path, &data[2])
+            .await
+            .unwrap();
+        let resumed = scan_resume(&layout, &hashes).await.unwrap();
+        // Pieces 0 and 2 resume; piece 1 (missing file) is skipped. The scan
+        // must NOT bail to empty just because one file is absent.
+        assert_eq!(resumed, vec![0, 2]);
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

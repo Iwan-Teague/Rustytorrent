@@ -12,6 +12,80 @@ Priorities: **P0** = correctness/security bug or real user pain ·
 
 ---
 
+## Correctness & security audit (2026-06-02)
+
+An adversarial read-only audit of the IO/stream layer, the download path,
+storage, and DHT/tracker/peer-manager (prompted by the MSE keystream-desync
+bug fixed in commit `181c175`). Fixed:
+
+- [x] **P1 — hostile HTTP tracker `interval` → engine panic.** A malicious or
+  MITM'd `http://` tracker returning a huge `interval` (up to `i64::MAX`)
+  overflowed `Duration` in the announce-jitter step (`base * pct`) → panic
+  (the whole process in standalone mode; one session in the daemon), even on
+  the first announce. Fixed: clamp the parsed `interval`/`min interval` to
+  24 h in `tracker/http.rs::parse_response`, and made `jittered_interval` use
+  saturating `Duration` math. Both tested.
+- [x] **P2 — `--select` resumed nothing on restart.** Regression from the
+  selective-allocation skip: `scan_resume` bailed to empty on the first
+  missing file, but selective downloads deliberately never create unwanted
+  files. Fixed: `scan_resume` now tolerates missing files
+  (`Vec<Option<File>>`), skipping only the pieces that read from an absent
+  file, so it resumes every fully-present piece. Also improves normal
+  multi-file partial resume. Regression-tested.
+- [x] **P2 — DHT replies correlated by txid only.** A 16-bit transaction id is
+  guessable, so an off-path attacker could inject (or evict) an in-flight
+  lookup's reply. Fixed: bind each `PendingQuery` to the queried `SocketAddr`
+  and accept a reply only from that exact address (peek-then-remove, so a
+  forged packet can't evict the genuine pending entry either).
+- [x] **P2 — `serve_request` upload accounting before bounds check.** A peer
+  could inflate our `uploaded` counter / drain upload tokens with a valid
+  `length` but an out-of-range `begin` that ships zero bytes. Fixed: validate
+  the window against the piece length before charging accounting.
+
+Deferred (real, but larger or lower-value — left for a focused pass):
+
+- [ ] **P1 — hash-fail bans the *completing* peer, not the *poisoning* one;
+  unsolicited blocks are accepted.** `received_block` stores any well-formed
+  block regardless of whether we requested it from that peer, with no
+  per-block source tracking, so on a SHA-1 failure the engine bans whoever
+  delivered the *last* block (often an honest peer, permanently by IP) while a
+  peer that injected an earlier bad block stays connected and re-poisons. Fix
+  needs per-block source attribution and/or rejecting blocks not currently
+  outstanding to the sending peer (requires per-peer outstanding-request
+  tracking).
+- [ ] **P1 — an idle (non-choking, non-disconnecting) peer parks its assigned
+  piece indefinitely.** No per-request timeout / stale-inflight reaper exists;
+  a peer that accepts a `Request` then goes silent holds its `inflight` slots
+  and the piece's `requested` bits until endgame (`missing < 5`) finally
+  re-requests it — below endgame the torrent can stall. Fix: a request-deadline
+  reaper that releases inflight + the sticky assignment.
+- [ ] **P2 — µTP `UtpStream::poll_write` has no backpressure.** It hands every
+  write to the driver over an unbounded channel and always reports the whole
+  buffer accepted, so an app writing faster than the LEDBAT window drains
+  grows driver-side memory unbounded. Low severity (the upload path is
+  rate-limited and bounded by peer-count × pipeline depth in practice). Bound
+  the in-flight send buffer and return `Pending` when full.
+- [ ] **P2 — `num_pieces` vs `total_length` never reconciled.** A malformed /
+  hostile `.torrent` whose piece-hash count disagrees with
+  `ceil(total/piece_length)` parses fine but then hangs the download silently
+  (pieces past real file coverage produce empty write slices and never verify)
+  — no corruption, just no diagnostic. Add a parse-time check (deferred:
+  several synthetic-torrent tests build inconsistent counts and would need
+  updating first).
+- [ ] **P3 — `decrypt_all_pieces` silently creates an empty spool** if pointed
+  at a missing/wrong path (no `try_exists` guard, unlike `scan_spool_resume`),
+  reporting "Recovered 0 pieces". Cleanliness.
+
+Audit also verified clean (no bug): the multi-file virtual offset map, the
+selective-skip `None`-slot path (errors, never panics/corrupts), AES-256-GCM
+nonce uniqueness + auth-tag verification, the reused spool scratch buffer,
+`scan_resume` mis-verification resistance, upload-cache coherency, the
+global/per-session connection cap + RAII slot release, the permanent ban set,
+DHT reflection / store-pollution defenses + token handling, the k-bucket /
+XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
+
+---
+
 ## 1. Security & hardening
 
 - [x] **P1 — Daemon `POST /api/add` path read is unconstrained.** [verified]
