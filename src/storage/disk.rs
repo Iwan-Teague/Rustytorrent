@@ -29,13 +29,38 @@ pub enum StorageEvent {
     Error { index: Option<u32>, msg: String },
 }
 
+/// Spawn the plain-disk storage task, preallocating every file in the layout.
+///
+/// This is the unconditional entry point used by callers that always want the
+/// full layout on disk (e.g. the `decrypt` subcommand). For selective
+/// download, see [`spawn_storage_task_selective`].
 pub fn spawn_storage_task(
     layout: Layout,
     cmd_rx: mpsc::Receiver<StorageCommand>,
     event_tx: mpsc::Sender<StorageEvent>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_storage_task_selective(layout, None, cmd_rx, event_tx)
+}
+
+/// Spawn the plain-disk storage task with an optional selective-allocation
+/// mask.
+///
+/// `wanted_files`, when `Some`, is a mask parallel to `layout.files`: a
+/// `false` entry means that file receives **zero** bytes from any wanted
+/// piece (selective download), so it is never created or preallocated on
+/// disk. `None` preserves the original behaviour (allocate every file). The
+/// write path never targets a skipped file — it is guaranteed unreferenced
+/// because `wanted_files` is derived from the same piece→file span mapping
+/// `write_piece` uses, so a skipped file cannot appear in any wanted piece's
+/// slices.
+pub fn spawn_storage_task_selective(
+    layout: Layout,
+    wanted_files: Option<Vec<bool>>,
+    cmd_rx: mpsc::Receiver<StorageCommand>,
+    event_tx: mpsc::Sender<StorageEvent>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run_storage(layout, cmd_rx, event_tx.clone()).await {
+        if let Err(e) = run_storage(layout, wanted_files, cmd_rx, event_tx.clone()).await {
             let _ = event_tx
                 .send(StorageEvent::Error {
                     index: None,
@@ -48,12 +73,27 @@ pub fn spawn_storage_task(
 
 async fn run_storage(
     layout: Layout,
+    wanted_files: Option<Vec<bool>>,
     mut cmd_rx: mpsc::Receiver<StorageCommand>,
     event_tx: mpsc::Sender<StorageEvent>,
 ) -> Result<()> {
-    // Pre-allocate every file in the layout.
-    let mut files: Vec<File> = Vec::with_capacity(layout.files.len());
-    for span in &layout.files {
+    // Pre-allocate every file in the layout — except files that receive no
+    // bytes from any wanted piece under selective download, which we skip
+    // entirely (no create, no set_len). A skipped file is represented by a
+    // `None` slot: the write/read paths must never index it, which holds
+    // because `wanted_files` and the slice mapping share the same span data.
+    let mut files: Vec<Option<File>> = Vec::with_capacity(layout.files.len());
+    for (i, span) in layout.files.iter().enumerate() {
+        // Skip only when a mask is present AND this file is marked unwanted.
+        // Absence of a mask (the default, non-selective path) allocates all.
+        let skip = wanted_files
+            .as_ref()
+            .map(|w| !w.get(i).copied().unwrap_or(true))
+            .unwrap_or(false);
+        if skip {
+            files.push(None);
+            continue;
+        }
         if let Some(parent) = span.path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -69,7 +109,7 @@ async fn run_storage(
         if cur < span.length {
             f.set_len(span.length).await?;
         }
-        files.push(f);
+        files.push(Some(f));
     }
 
     while let Some(cmd) = cmd_rx.recv().await {
@@ -101,7 +141,29 @@ async fn run_storage(
     Ok(())
 }
 
-async fn write_piece(layout: &Layout, files: &mut [File], index: usize, data: &[u8]) -> Result<()> {
+/// Borrow the open `File` at `file_idx`, or error if it was skipped
+/// (selective download left it unallocated). A wanted piece never references
+/// a skipped file — both sides come from the same span mapping — so this
+/// error is a defensive guard, not an expected path, kept instead of an
+/// `unwrap` to honour the no-panic rule.
+fn file_at(files: &mut [Option<File>], file_idx: usize) -> Result<&mut File> {
+    files
+        .get_mut(file_idx)
+        .and_then(|slot| slot.as_mut())
+        .ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("storage: file {file_idx} skipped (selective download) but a piece referenced it"),
+            ))
+        })
+}
+
+async fn write_piece(
+    layout: &Layout,
+    files: &mut [Option<File>],
+    index: usize,
+    data: &[u8],
+) -> Result<()> {
     let piece_size = piece_size(layout, index);
     if data.len() as u64 != piece_size {
         return Err(Error::Io(std::io::Error::new(
@@ -120,7 +182,7 @@ async fn write_piece(layout: &Layout, files: &mut [File], index: usize, data: &[
     // the slice mapping a second time.
     let mut touched: Vec<usize> = Vec::new();
     for (file_idx, file_off, count) in slices {
-        let f = &mut files[file_idx];
+        let f = file_at(files, file_idx)?;
         f.seek(SeekFrom::Start(file_off)).await?;
         f.write_all(&data[data_off..data_off + count as usize])
             .await?;
@@ -131,14 +193,14 @@ async fn write_piece(layout: &Layout, files: &mut [File], index: usize, data: &[
     }
     // Flush after every piece — safer than buffering and losing on crash.
     for file_idx in touched {
-        files[file_idx].flush().await?;
+        file_at(files, file_idx)?.flush().await?;
     }
     Ok(())
 }
 
 async fn read_range(
     layout: &Layout,
-    files: &mut [File],
+    files: &mut [Option<File>],
     index: u32,
     begin: u32,
     length: u32,
@@ -156,7 +218,7 @@ async fn read_range(
     let mut out = vec![0u8; length as usize];
     let mut out_off: usize = 0;
     for (file_idx, file_off, count) in slices {
-        let f = &mut files[file_idx];
+        let f = file_at(files, file_idx)?;
         f.seek(SeekFrom::Start(file_off)).await?;
         f.read_exact(&mut out[out_off..out_off + count as usize])
             .await?;

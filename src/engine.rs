@@ -18,9 +18,9 @@ use crate::peer_id::PeerId;
 use crate::piece::{verify_piece, BlockOutcome, Picker, PieceManager};
 use crate::ratelimit::TokenBucket;
 use crate::scheduler::ChokeScheduler;
+use crate::storage::disk::spawn_storage_task_selective;
 use crate::storage::{
-    spawn_encrypted_storage_task, spawn_storage_task, Layout, PieceCache, StorageCommand,
-    StorageEvent,
+    spawn_encrypted_storage_task, Layout, PieceCache, StorageCommand, StorageEvent,
 };
 use crate::tracker::{self, AnnounceRequest, Event};
 use crate::web::EngineStats;
@@ -664,6 +664,20 @@ impl TorrentEngine {
 
         let layout = Layout::from_torrent(self.cfg.output_dir.clone(), &self.torrent);
 
+        // Which files the plain-disk backend should preallocate. With no
+        // selection this is `None` (allocate the full layout, unchanged
+        // default). With `--select`, compute the set of files that hold at
+        // least one byte of a wanted piece — this deliberately includes
+        // boundary files that a straddling wanted piece spills into, so they
+        // exist on disk for write-back. Files no wanted piece touches are
+        // skipped (no zero-filled allocation). Only the plain-disk backend
+        // honours this; memory-only / paranoid never write the real layout.
+        let disk_wanted_files: Option<Vec<bool>> = if self.cfg.selected_files.is_empty() {
+            None
+        } else {
+            Some(layout.wanted_files(&self.cfg.selected_files))
+        };
+
         // Sequential download (streaming): pick pieces in order.
         if self.cfg.sequential {
             self.picker.set_sequential(true);
@@ -750,7 +764,12 @@ impl TorrentEngine {
                 storage_event_tx,
             )
         } else {
-            spawn_storage_task(layout.clone(), storage_cmd_rx, storage_event_tx)
+            spawn_storage_task_selective(
+                layout.clone(),
+                disk_wanted_files,
+                storage_cmd_rx,
+                storage_event_tx,
+            )
         };
 
         // Resume scan: hash-verify existing pieces (on-disk plaintext for

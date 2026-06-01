@@ -371,3 +371,120 @@ async fn selective_download_fetches_only_wanted_file() {
     seeder_task.abort();
     let _ = tokio::fs::remove_dir_all(&tmp).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selective_download_skips_preallocating_unwanted_file() {
+    // Three files sized to exactly one piece each, so every file boundary
+    // lands on a piece boundary (no straddle): a.bin = piece 0, b.bin =
+    // piece 1, c.bin = piece 2. Selecting only a.bin makes piece 0 the sole
+    // wanted piece; b.bin and c.bin are fully unwanted *and* non-boundary,
+    // so the disk backend must NOT create or preallocate them — while a.bin
+    // still downloads byte-complete.
+    let mk = |seed: u32, n: u32| -> Vec<u8> {
+        (0..n).map(|i| (i.wrapping_mul(seed) >> 9) as u8).collect()
+    };
+    let a = mk(40503, PIECE_LEN as u32);
+    let b = mk(2246822519, PIECE_LEN as u32);
+    let c = mk(2654435761, PIECE_LEN as u32);
+    let mut data = a.clone();
+    data.extend_from_slice(&b);
+    data.extend_from_slice(&c);
+
+    let dir = "pkg";
+    let piece_hashes: Vec<[u8; 20]> = data.chunks(PIECE_LEN as usize).map(sha1).collect();
+    // Sanity: exactly 3 full pieces, one per file.
+    assert_eq!(piece_hashes.len(), 3);
+    let torrent = TorrentFile {
+        info_hash: sha1(&data),
+        announce: None,
+        announce_list: vec![],
+        info: Info {
+            name: dir.to_string(),
+            piece_length: PIECE_LEN,
+            piece_hashes,
+            files: TorrentFiles::Multi {
+                files: vec![
+                    FileEntry {
+                        length: a.len() as u64,
+                        path: "a.bin".into(),
+                    },
+                    FileEntry {
+                        length: b.len() as u64,
+                        path: "b.bin".into(),
+                    },
+                    FileEntry {
+                        length: c.len() as u64,
+                        path: "c.bin".into(),
+                    },
+                ],
+            },
+            private: false,
+        },
+    };
+
+    let tmp = std::env::temp_dir().join(format!("rt_e2e_skip_{}", std::process::id()));
+    let seed_dir = tmp.join("seed");
+    let leech_dir = tmp.join("leech");
+    tokio::fs::create_dir_all(seed_dir.join(dir)).await.unwrap();
+    tokio::fs::create_dir_all(&leech_dir).await.unwrap();
+    tokio::fs::write(seed_dir.join(dir).join("a.bin"), &a)
+        .await
+        .unwrap();
+    tokio::fs::write(seed_dir.join(dir).join("b.bin"), &b)
+        .await
+        .unwrap();
+    tokio::fs::write(seed_dir.join(dir).join("c.bin"), &c)
+        .await
+        .unwrap();
+
+    let port = free_port().await;
+    let seeder = TorrentEngine::new(
+        torrent.clone(),
+        [9u8; 20],
+        EngineConfig {
+            output_dir: seed_dir.clone(),
+            listen_port: port,
+            no_tracker: true,
+            ..Default::default()
+        },
+    );
+    let seeder_task = tokio::spawn(async move {
+        let _ = seeder.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let leecher = TorrentEngine::new(
+        torrent,
+        [10u8; 20],
+        EngineConfig {
+            output_dir: leech_dir.clone(),
+            listen_port: free_port().await,
+            no_tracker: true,
+            seed_peers: vec![format!("127.0.0.1:{port}").parse().unwrap()],
+            selected_files: vec!["a.bin".to_string()],
+            ..Default::default()
+        },
+    );
+    let result = tokio::time::timeout(Duration::from_secs(30), leecher.run()).await;
+    assert!(result.is_ok(), "selective leecher timed out");
+    assert!(result.unwrap().is_ok());
+
+    // The selected file is complete and byte-identical.
+    let got_a = tokio::fs::read(leech_dir.join(dir).join("a.bin"))
+        .await
+        .unwrap();
+    assert_eq!(got_a, a, "selected file a.bin must be complete");
+
+    // The fully-unwanted, non-boundary files were never created/preallocated.
+    assert!(
+        !leech_dir.join(dir).join("b.bin").exists(),
+        "b.bin is fully unwanted + non-boundary; it must not be allocated"
+    );
+    assert!(
+        !leech_dir.join(dir).join("c.bin").exists(),
+        "c.bin is fully unwanted + non-boundary; it must not be allocated"
+    );
+
+    seeder_task.abort();
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+}

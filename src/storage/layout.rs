@@ -145,6 +145,61 @@ impl Layout {
         }
         wanted
     }
+
+    /// Compute the set of files that must be allocated on disk for a given
+    /// selection — i.e. every file that holds at least one byte belonging to
+    /// a *wanted* piece. The result is a `Vec<bool>` parallel to
+    /// [`Layout::files`] (index `i` true ⇒ file `i` must exist on disk).
+    ///
+    /// This is intentionally derived from the **same** piece→file span
+    /// mapping the write path uses ([`slices_for_piece`]): a file is marked
+    /// wanted-for-allocation exactly when some wanted piece's byte range
+    /// overlaps it. That makes it correct for boundary/straddle pieces by
+    /// construction — a piece that spans a wanted file and an otherwise
+    /// unwanted neighbour writes spillover bytes into that neighbour, so the
+    /// neighbour appears in the piece's slices and is (correctly) allocated.
+    /// Skipping it would break write-back of the straddling wanted piece.
+    ///
+    /// Empty `selectors` ⇒ every piece is wanted ⇒ every file is wanted,
+    /// byte-for-byte the same as the pre-feature default (full preallocation).
+    /// Fail-safe: any file we cannot prove receives zero wanted bytes stays
+    /// allocated, because it would only be skipped if NO wanted piece's
+    /// slices reference it.
+    pub fn wanted_files(&self, selectors: &[String]) -> Vec<bool> {
+        // Empty selection: short-circuit to "all files wanted" so the disk
+        // backend behaves identically to before this feature existed.
+        if selectors.is_empty() {
+            return vec![true; self.files.len()];
+        }
+        let wanted_pieces = self.wanted_pieces(selectors);
+        let mut wanted_files = vec![false; self.files.len()];
+        for (idx, &piece_wanted) in wanted_pieces.iter().enumerate() {
+            if !piece_wanted {
+                continue;
+            }
+            let piece_size = self.piece_size(idx);
+            for (file_idx, _off, _count) in self.slices_for_piece(idx, piece_size) {
+                wanted_files[file_idx] = true;
+            }
+        }
+        wanted_files
+    }
+
+    /// Length in bytes of piece `index` (the last piece may be short).
+    /// Mirrors the disk backend's `piece_size`; kept here so [`wanted_files`]
+    /// can ask the span mapping for a piece's true byte range.
+    fn piece_size(&self, index: usize) -> u64 {
+        if index + 1 == self.num_pieces {
+            let r = self.total_length % self.piece_length;
+            if r == 0 {
+                self.piece_length
+            } else {
+                r
+            }
+        } else {
+            self.piece_length
+        }
+    }
 }
 
 #[cfg(test)]
@@ -278,5 +333,70 @@ mod tests {
         assert!(one[0].to_string_lossy().ends_with("b.txt"));
         // No match → empty (the loud-warning trigger in the engine).
         assert!(l.selected_paths(&["nonexistent".into()]).is_empty());
+    }
+
+    #[test]
+    fn wanted_files_empty_selectors_wants_all_files() {
+        let l = Layout::from_torrent("/tmp/dl".into(), &torrent_multi());
+        // Default (no --select): every file allocated, unchanged behaviour.
+        assert_eq!(l.wanted_files(&[]), vec![true; l.files.len()]);
+    }
+
+    #[test]
+    fn wanted_files_skips_fully_unwanted_non_boundary_file() {
+        // Files: a.txt [0..150], b.txt [150..250], c.txt [250..300];
+        // piece_length 100 → pieces [0..100],[100..200],[200..300].
+        let l = Layout::from_torrent("/tmp/dl".into(), &torrent_multi());
+        // Select a.txt [0..150]: wanted pieces are 0 ([0..100]) and 1
+        // ([100..200]). Piece 1 straddles a.txt and b.txt, so b.txt is
+        // allocated despite holding no *selected* content. c.txt [250..300]
+        // is touched only by piece 2 (unwanted) → NOT allocated.
+        assert_eq!(l.wanted_files(&["a.txt".into()]), vec![true, true, false]);
+    }
+
+    #[test]
+    fn wanted_files_boundary_neighbour_is_allocated() {
+        // Critical straddle case: select ONLY c.txt [250..300]. The single
+        // wanted piece is 2 ([200..300]), which overlaps b.txt [150..250]
+        // (bytes 200..250) as well as c.txt. So b.txt MUST be allocated — a
+        // wanted piece writes spillover into it — even though no selector
+        // matched b.txt. a.txt is touched by no wanted piece → skipped.
+        let l = Layout::from_torrent("/tmp/dl".into(), &torrent_multi());
+        assert_eq!(l.wanted_files(&["c.txt".into()]), vec![false, true, true]);
+    }
+
+    #[test]
+    fn wanted_files_unmatched_selector_allocates_nothing() {
+        // Selector matches no file → no wanted pieces → no file allocated.
+        let l = Layout::from_torrent("/tmp/dl".into(), &torrent_multi());
+        assert_eq!(
+            l.wanted_files(&["nonexistent".into()]),
+            vec![false, false, false]
+        );
+    }
+
+    #[test]
+    fn wanted_files_superset_of_selected_content_files() {
+        // Invariant: every file that any wanted piece overlaps is allocated.
+        // For every selector, the allocated set must cover all files whose
+        // byte range intersects a wanted piece — i.e. allocating a file is
+        // never skipped while a wanted piece references it.
+        let l = Layout::from_torrent("/tmp/dl".into(), &torrent_multi());
+        for sel in [vec!["a.txt".to_string()], vec!["b.txt".to_string()]] {
+            let pieces = l.wanted_pieces(&sel);
+            let files = l.wanted_files(&sel);
+            for (idx, &pw) in pieces.iter().enumerate() {
+                if !pw {
+                    continue;
+                }
+                let psz = l.piece_size(idx);
+                for (file_idx, _, _) in l.slices_for_piece(idx, psz) {
+                    assert!(
+                        files[file_idx],
+                        "file {file_idx} overlapped by wanted piece {idx} but not allocated"
+                    );
+                }
+            }
+        }
     }
 }
