@@ -308,9 +308,16 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   via `assemble_torrent_bytes`, which splices the info dict verbatim).
   Unit + integration tested (info-hash preservation, save/forget,
   shutdown-keeps-set).
-- [ ] **P2 — selective download: skip allocating unwanted files** (today
-  the full layout is created; boundary pieces still write into unwanted
-  files — acceptable, but a `--no-pad` could trim).
+- [x] **P2 — selective download: skip allocating unwanted files.** DONE
+  (commit 0638591): `Layout::wanted_files(selectors)` computes the set of
+  files holding ≥1 byte of a wanted piece — boundary/straddle files stay
+  wanted-for-allocation because they receive spillover writes — and the
+  plain-disk backend skips `create`/`set_len` for files outside that set
+  (kept as `None` slots, with a defensive error, not a panic, if a skipped
+  slot is ever referenced). The engine passes the mask only to the disk
+  backend; memory-only/paranoid are unaffected. Fail-safe: allocate when
+  unsure. An e2e test asserts an unwanted, non-boundary file is never
+  created on disk while the selected file downloads byte-complete.
 - [ ] **P2 — plugin system for custom piece pickers** (roadmap stretch).
 - [ ] **P2 — IPv6: confirm dual-stack dialing** (listener + compact-peer
   parsing done; verify outbound IPv6 peer dials work end to end).
@@ -338,8 +345,15 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   (wanted-relative) and writes the selected file in full without fetching
   the other file's exclusive piece. Validates the selective-download +
   completion path end to end.
-- [ ] **P2 — choke scheduler under load** (many peers competing for the
-  3+1 unchoke slots; fairness + anti-snubbing).
+- [x] **P2 — choke scheduler under load.** DONE (commit 830b0b2): 7 tests
+  drive `ChokeScheduler` with many competing peers — regular slots go to
+  the top-3 by rate (`REGULAR_UNCHOKE_SLOTS`), the optimistic slot lands
+  outside that set, seeding mode ranks by upload rate (the snub filter is
+  bypassed when seeding), and the edge cases hold (empty / fewer-than-slots
+  candidates, `forget`, no tick-to-tick fibrillation). The time-gated
+  behavior (60 s snub threshold, 30 s optimistic rotation) reads
+  `Instant::now()` with no injection seam, so it's left untested rather than
+  adding a production-only time seam — noted as a limitation.
 - [x] **P2 — property/fuzz the bencode + KRPC + message parsers** on
   random/adversarial input. DONE (commit 8323562): added `proptest`
   (dev-dep) and `tests/parser_props.rs` — 9 property tests asserting the
@@ -348,8 +362,13 @@ Priorities: **P0** = correctness/security bug or real user pain ·
   depth-bounded value strategy; message covers all variants (stripping the
   4-byte length prefix that `encode` adds but `decode` doesn't expect); krpc
   is fuzzed on both arbitrary bytes and valid-bencode-but-invalid-krpc.
-  (cargo-fuzz continuous fuzzing remains a possible future add; proptest
-  covers the never-panic + roundtrip invariants in-suite.)
+  Extended (commit c7aed6f) with `tests/wire_props.rs` — 23 more props
+  covering the rest of the untrusted-input wire surface: peer handshake,
+  UDP-tracker announce response, the BEP 10 extension / ut_metadata / ut_pex
+  payloads, and the DHT compact node/peer decoders (never-panic + roundtrip
+  where an encoder exists). (cargo-fuzz continuous fuzzing remains a
+  possible future add; proptest covers the never-panic + roundtrip
+  invariants in-suite.)
 
 ## 8. Code quality / tech debt
 
