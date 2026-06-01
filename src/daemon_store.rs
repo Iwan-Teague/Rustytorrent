@@ -160,13 +160,21 @@ mod tests {
     use super::*;
 
     fn scratch() -> PathBuf {
+        // A process-wide counter guarantees a distinct dir per call. pid+nanos
+        // alone collided when two parallel test threads read an identical
+        // `now()` (coarse clock resolution), so colliding tests saw each
+        // other's files — e.g. `skips_entry_without_sidecar` would observe the
+        // sidecar'd entry written by `save_load_forget_roundtrip` and fail.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "rt_dstore_{}_{}",
+            "rt_dstore_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&p).unwrap();
         p

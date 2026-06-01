@@ -480,13 +480,21 @@ mod tests {
     use super::*;
 
     fn tempdir() -> PathBuf {
+        // A process-wide counter guarantees a distinct dir per call. The five
+        // tests here shared a nanos-only name, so two parallel threads reading
+        // an identical `now()` (coarse clock resolution) would collide and race
+        // each other's spool files. pid + counter make every call unique.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "rustytorrent-spool-test-{}",
+            "rustytorrent-spool-test-{}-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
