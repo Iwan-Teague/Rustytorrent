@@ -56,6 +56,14 @@ pub const PIPELINE_DEPTH: usize = 5;
 /// dominates the finish time.
 pub const ENDGAME_REMAINING: usize = 5;
 
+/// How long we wait for a requested block before treating the request as
+/// stale and releasing it so another peer can fill it. A peer that accepted
+/// a Request and then went silent can otherwise park a piece until endgame
+/// kicks in (< 5 pieces remaining), causing a multi-piece stall mid-download.
+/// 30 s is generous — a fast local peer serves a 16 KiB block in < 1 ms;
+/// even a slow WAN peer at 50 KB/s would deliver it in < 1 s.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct EngineConfig {
     pub output_dir: PathBuf,
     pub listen_port: u16,
@@ -202,6 +210,20 @@ pub struct TorrentEngine {
     inflight: HashMap<SocketAddr, usize>,
     /// For endgame: which peers have an outstanding request for (piece, block).
     endgame_requests: HashMap<(u32, u32), Vec<SocketAddr>>,
+    /// Per-block request attribution for the normal (non-endgame) path:
+    /// `(piece_index, begin) → (peer, when_sent)`.
+    ///
+    /// Serves two purposes:
+    /// 1. **Anti-poisoning**: only blocks that we actually requested from a
+    ///    peer are passed to the piece manager. A peer pushing unsolicited
+    ///    (possibly corrupt) blocks can no longer trigger a SHA-1 failure
+    ///    that bans an innocent completing peer.
+    /// 2. **Stale-request reaping**: the choke tick sweeps this map for
+    ///    entries older than `REQUEST_TIMEOUT`. An idle peer that accepted a
+    ///    `Request` and then went silent can no longer park a piece until
+    ///    endgame; the stale request is released so another peer can pick it
+    ///    up.
+    outstanding_requests: HashMap<(u32, u32), (SocketAddr, Instant)>,
     uploaded: u64,
     downloaded: u64,
     start_time: Instant,
@@ -300,6 +322,7 @@ impl TorrentEngine {
             we_unchoked: HashMap::new(),
             inflight: HashMap::new(),
             endgame_requests: HashMap::new(),
+            outstanding_requests: HashMap::new(),
             uploaded: 0,
             downloaded: 0,
             start_time: Instant::now(),
@@ -1055,6 +1078,34 @@ impl TorrentEngine {
                             }
                         }
                     }
+                    // Stale-request reaper: find outstanding requests older than
+                    // REQUEST_TIMEOUT and release them so other peers can fill them.
+                    // A peer that accepts a Request and then goes silent (without
+                    // choking or disconnecting) would otherwise park the piece
+                    // until endgame, stalling downloads with many pieces remaining.
+                    let now = Instant::now();
+                    let stale: Vec<((u32, u32), SocketAddr)> = self
+                        .outstanding_requests
+                        .iter()
+                        .filter(|(_, (_, sent_at))| {
+                            now.duration_since(*sent_at) > REQUEST_TIMEOUT
+                        })
+                        .map(|(key, (addr, _))| (*key, *addr))
+                        .collect();
+                    for ((piece, begin), addr) in stale {
+                        tracing::debug!(
+                            target: "engine", %addr, piece, begin,
+                            "stale block request — releasing for re-request"
+                        );
+                        self.outstanding_requests.remove(&(piece, begin));
+                        self.pm.release_block(piece as usize, begin);
+                        if let Some(c) = self.inflight.get_mut(&addr) {
+                            *c = c.saturating_sub(1);
+                        }
+                        // Kick the peer's request pump so it picks up other work
+                        // (or this block from a different piece assignment).
+                        self.maybe_request_blocks(addr, &peers);
+                    }
                 }
                 _ = progress_timer.tick() => {
                     // Instantaneous rates over the interval since the last
@@ -1283,6 +1334,7 @@ impl TorrentEngine {
                     self.pm.release_piece_inflight(idx);
                     self.picker.release_assignment(&addr);
                 }
+                self.release_outstanding_for(&addr);
             }
             PeerEvent::Unchoke { addr } => {
                 self.peer_choking_us.insert(addr, false);
@@ -1314,6 +1366,35 @@ impl TorrentEngine {
                 if let Some(c) = self.inflight.get_mut(&addr) {
                     *c = c.saturating_sub(1);
                 }
+
+                // Solicitation check: only accept blocks we actually requested from
+                // this peer. An unsolicited block (either sent spontaneously or
+                // injected by a malicious peer) is dropped silently. Without this
+                // check a malicious peer could push a corrupt block for a piece,
+                // survive the SHA-1 failure (which previously banned the innocent
+                // last-block sender), and cycle through banning every honest peer.
+                //
+                // In endgame the same block is requested from multiple peers, so
+                // we check `endgame_requests` too.
+                let in_endgame = self
+                    .endgame_requests
+                    .get(&(index, begin))
+                    .is_some_and(|v| v.contains(&addr));
+                let in_normal = self
+                    .outstanding_requests
+                    .get(&(index, begin))
+                    .is_some_and(|(a, _)| a == &addr);
+                if !in_normal && !in_endgame {
+                    tracing::debug!(
+                        target: "engine", %addr, index, begin,
+                        "dropping unsolicited block"
+                    );
+                    self.maybe_request_blocks(addr, peers);
+                    return Ok(());
+                }
+                // Remove the normal-path outstanding entry (endgame is removed by
+                // the Cancel fanout further below).
+                self.outstanding_requests.remove(&(index, begin));
 
                 let outcome = match self.pm.received_block(index as usize, begin, &data) {
                     Ok(o) => o,
@@ -1606,6 +1687,21 @@ impl TorrentEngine {
         }
     }
 
+    /// Release every `outstanding_requests` entry belonging to `addr` and
+    /// un-mark those blocks as requested so another peer can pick them up.
+    fn release_outstanding_for(&mut self, addr: &SocketAddr) {
+        let to_release: Vec<(u32, u32)> = self
+            .outstanding_requests
+            .iter()
+            .filter(|(_, (a, _))| a == addr)
+            .map(|(key, _)| *key)
+            .collect();
+        for (piece, begin) in to_release {
+            self.outstanding_requests.remove(&(piece, begin));
+            self.pm.release_block(piece as usize, begin);
+        }
+    }
+
     fn cleanup_disconnected_peer(&mut self, addr: SocketAddr) {
         self.peer_choking_us.remove(&addr);
         self.am_interested.remove(&addr);
@@ -1615,6 +1711,7 @@ impl TorrentEngine {
             self.picker.release_assignment(&addr);
             self.pm.release_piece_inflight(idx);
         }
+        self.release_outstanding_for(&addr);
         self.picker.forget_peer(&addr);
         self.choker.forget(&addr);
         // BEP 11 — drop PEX bookkeeping for the departing peer so the
@@ -1749,6 +1846,9 @@ impl TorrentEngine {
                             .entry((piece_idx as u32, block.0))
                             .or_default()
                             .push(addr);
+                    } else {
+                        self.outstanding_requests
+                            .insert((piece_idx as u32, block.0), (addr, Instant::now()));
                     }
                 } else {
                     if !endgame {

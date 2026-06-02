@@ -44,21 +44,26 @@ bug fixed in commit `181c175`). Fixed:
 
 Deferred (real, but larger or lower-value — left for a focused pass):
 
-- [ ] **P1 — hash-fail bans the *completing* peer, not the *poisoning* one;
-  unsolicited blocks are accepted.** `received_block` stores any well-formed
-  block regardless of whether we requested it from that peer, with no
-  per-block source tracking, so on a SHA-1 failure the engine bans whoever
-  delivered the *last* block (often an honest peer, permanently by IP) while a
-  peer that injected an earlier bad block stays connected and re-poisons. Fix
-  needs per-block source attribution and/or rejecting blocks not currently
-  outstanding to the sending peer (requires per-peer outstanding-request
-  tracking).
-- [ ] **P1 — an idle (non-choking, non-disconnecting) peer parks its assigned
-  piece indefinitely.** No per-request timeout / stale-inflight reaper exists;
-  a peer that accepts a `Request` then goes silent holds its `inflight` slots
-  and the piece's `requested` bits until endgame (`missing < 5`) finally
-  re-requests it — below endgame the torrent can stall. Fix: a request-deadline
-  reaper that releases inflight + the sticky assignment.
+- [x] **P1 — unsolicited-block injection: bans innocent peers, lets poisoner
+  survive.** A malicious peer pushing an unsolicited (wrong) block for a piece
+  triggered a SHA-1 failure that permanently banned whoever delivered the
+  *final* block — often an honest peer. FIXED: added
+  `outstanding_requests: HashMap<(u32,u32),(SocketAddr,Instant)>` to the
+  engine. Blocks are recorded at request time (non-endgame) or via the
+  existing `endgame_requests` (endgame). The `Block` handler now checks both
+  maps before calling `received_block` — unsolicited blocks are dropped
+  silently (inflight slot still freed). Cleaned up on `Choke` and
+  `cleanup_disconnected_peer` via `release_outstanding_for`. All blocks that
+  reach `received_block` are now guaranteed to be from a peer we solicited,
+  so SHA-1 failures ban the correct peer.
+- [x] **P1 — idle peer parks assigned piece indefinitely (stall).** A peer
+  that accepted a `Request` then went silent held the piece's `requested` bits
+  and the sticky assignment until endgame (`missing < 5`), stalling the
+  download for all pieces above the endgame threshold. FIXED: the choke tick
+  (every 10 s) now sweeps `outstanding_requests` for entries older than
+  `REQUEST_TIMEOUT = 30 s`. For each stale entry: `release_block` un-marks
+  the block so another peer can reserve it, `inflight` is decremented, and the
+  idle peer's request pump is kicked so it can pick up other work.
 - [ ] **P2 — µTP `UtpStream::poll_write` has no backpressure.** It hands every
   write to the driver over an unbounded channel and always reports the whole
   buffer accepted, so an app writing faster than the LEDBAT window drains
