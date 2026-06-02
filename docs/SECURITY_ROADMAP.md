@@ -159,9 +159,13 @@ UDP source, constant-time hash compares).
   subcommand extracts the spool into the real file layout afterwards.
 - ✅ B3: per-peer token-bucket rate limit on inbound `Request` messages
   (default 200 req/s, burst 50) — caps a single peer's disk-read pressure.
-- ✅ B5: handshake reserved-bytes fingerprint reduction — set the DHT bit
-  (BEP 5, byte 7 = 0x01) when DHT is enabled instead of always emitting
-  the all-zero "I support nothing" pattern.
+- ✅ B5 (complete, commit 28c7d23): handshake reserved-bytes fingerprint
+  reduction — fully closed by implementing BEP 6 (fast extensions). We now
+  set byte 7 = 0x04 (BEP 6) alongside byte 7 = 0x01 (DHT, when enabled) and
+  byte 5 = 0x10 (BEP 10). Under `--anonymous` with DHT off, our reserved
+  pattern is byte 5 = 0x10 + byte 7 = 0x04, which exactly matches libtorrent
+  2.0.9 (the identity we impersonate). Previously byte 7 = 0x00 was a
+  fingerprinting gap.
 
 ### B-tier remaining
 _None — B2 landed alongside the multi-hop chain work._

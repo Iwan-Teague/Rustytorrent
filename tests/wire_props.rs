@@ -26,6 +26,9 @@
 //!                                  parse_metadata_response, parse_pex}`
 //!   4. dht compact node/peer   — `dht::krpc::{parse_nodes_bytes,
 //!                                  parse_values_list}`
+//!   5. BEP 6 fast-extension messages — `peer::message::Message::decode`
+//!      for ids 13–17 (SuggestPiece, HaveAll, HaveNone, RejectRequest,
+//!      AllowedFast): never-panic + roundtrip.
 //!
 //! NOTE: the krpc top-level `Message::decode` is already fuzzed in
 //! `parser_props.rs`; here we target the *compact contact-info* sub-parsers
@@ -443,6 +446,77 @@ proptest! {
         let list = BencodeValue::List(items);
         let out = parse_values_list(&list).expect("a bencode list must parse");
         prop_assert_eq!(out.len(), good.len());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BEP 6 fast-extension message codec (ids 13–17)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// Arbitrary bytes with a BEP 6 message-id prefix must not panic.
+    /// Before BEP 6 was implemented, ids 13–17 returned an error — now they
+    /// must decode silently as valid BEP 6 messages or return Err, never panic.
+    #[test]
+    fn bep6_messages_never_panic(
+        id in 13u8..=17u8,
+        payload in vec(any::<u8>(), 0..256),
+    ) {
+        use rustytorrent::peer::message::Message;
+        let mut frame = vec![id];
+        frame.extend_from_slice(&payload);
+        // Just must not panic.
+        let _ = Message::decode(&frame);
+    }
+
+    /// Well-formed BEP 6 messages (correct payload sizes) parse and roundtrip.
+    #[test]
+    fn bep6_zero_payload_messages_roundtrip(
+        id in prop_oneof![Just(14u8), Just(15u8)], // HaveAll / HaveNone
+    ) {
+        use rustytorrent::peer::message::Message;
+        let frame = vec![id]; // payload-only (no length prefix for decode)
+        let msg = Message::decode(&frame).expect("HaveAll/HaveNone with empty payload must parse");
+        let encoded = msg.encode();
+        // encoded includes the 4-byte length prefix; decode expects payload-only
+        // encode() layout: [len: 4 bytes][id: 1 byte][payload: rest]
+        // decode() expects:               [id: 1 byte][payload: rest]
+        let payload_only = &encoded[4..];
+        let roundtrip = Message::decode(payload_only).expect("roundtrip must parse");
+        // strip the 4-byte length + 1-byte id prefix for round-trip comparison
+        assert_eq!(msg, roundtrip);
+    }
+
+    /// RejectRequest roundtrip (same wire layout as Request/Cancel, id 16).
+    #[test]
+    fn bep6_reject_request_roundtrip(
+        index in any::<u32>(),
+        begin in any::<u32>(),
+        length in any::<u32>(),
+    ) {
+        use rustytorrent::peer::message::Message;
+        let msg = Message::RejectRequest { index, begin, length };
+        let encoded = msg.encode();
+        // encode() = [len:4][id:1][payload…]; decode() expects [id:1][payload…]
+        let payload_only = &encoded[4..];
+        let roundtrip = Message::decode(payload_only).expect("RejectRequest must parse");
+        assert_eq!(msg, roundtrip);
+    }
+
+    /// AllowedFast (id 17) and SuggestPiece (id 13) roundtrip.
+    #[test]
+    fn bep6_piece_index_messages_roundtrip(
+        piece in any::<u32>(),
+        id in prop_oneof![Just(17u8), Just(13u8)],
+    ) {
+        use rustytorrent::peer::message::Message;
+        let mut frame = vec![id];
+        frame.extend_from_slice(&piece.to_be_bytes());
+        let msg = Message::decode(&frame).expect("AllowedFast/SuggestPiece must parse");
+        let encoded = msg.encode();
+        let payload_only = &encoded[4..]; // [len:4][id:1][payload…] → decode needs [id:1][payload…]
+        let roundtrip = Message::decode(payload_only).expect("roundtrip must parse");
+        assert_eq!(msg, roundtrip);
     }
 }
 

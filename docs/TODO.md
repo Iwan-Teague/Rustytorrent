@@ -70,16 +70,18 @@ Deferred (real, but larger or lower-value — left for a focused pass):
   grows driver-side memory unbounded. Low severity (the upload path is
   rate-limited and bounded by peer-count × pipeline depth in practice). Bound
   the in-flight send buffer and return `Pending` when full.
-- [ ] **P2 — `num_pieces` vs `total_length` never reconciled.** A malformed /
-  hostile `.torrent` whose piece-hash count disagrees with
-  `ceil(total/piece_length)` parses fine but then hangs the download silently
-  (pieces past real file coverage produce empty write slices and never verify)
-  — no corruption, just no diagnostic. Add a parse-time check (deferred:
-  several synthetic-torrent tests build inconsistent counts and would need
-  updating first).
-- [ ] **P3 — `decrypt_all_pieces` silently creates an empty spool** if pointed
-  at a missing/wrong path (no `try_exists` guard, unlike `scan_spool_resume`),
-  reporting "Recovered 0 pieces". Cleanliness.
+- [x] **P2 — `num_pieces` vs `total_length` never reconciled.** DONE
+  (commit fa79720): `Info::from_value` now validates that
+  `piece_hashes.len() == ceil(total_length / piece_length)` and rejects
+  `total_length == 0`. The existing proptest was updated to derive `nhashes`
+  deterministically from `length + piece_length` so all generated cases pass.
+  Two new unit tests added. Synthetic torrents in the test suite were already
+  consistent, so no test breakage.
+- [x] **P3 — `decrypt_all_pieces` silently creates an empty spool** if pointed
+  at a missing/wrong path. DONE (commit fca1046): added a `try_exists` guard
+  at the top of `decrypt_all_pieces` matching the pattern in
+  `scan_spool_resume`; returns a clear `NotFound` error instead of silently
+  creating an empty spool.
 
 Audit also verified clean (no bug): the multi-file virtual offset map, the
 selective-skip `None`-slot path (errors, never panics/corrupts), AES-256-GCM
@@ -180,9 +182,12 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
   limitation) — documented residual of `--bind-iface`. Investigate a
   reqwest connector that binds to the interface, or route the tracker
   through the SOCKS5 path uniformly.
-- [ ] **P2 — MSE reserved-byte fingerprint** (roadmap B5 partially done):
-  audit the exact reserved-bytes pattern vs libtorrent to minimize the
-  DPI fingerprint surface under `--anonymous`.
+- [x] **P2 — MSE reserved-byte fingerprint** (roadmap B5 remaining gap).
+  DONE (commit 28c7d23, BEP 6): the last fingerprinting gap was byte 7.
+  Libtorrent 2.x sets byte 7 = 0x04 (BEP 6 fast extensions); we emitted
+  0x00. Closed by implementing BEP 6 and setting byte 7 bit 0x04 alongside
+  the BEP 10 bit. Our byte pattern under `--anonymous` now matches libtorrent
+  2.0.9: byte 5 = 0x10 (BEP 10), byte 7 = 0x04 (BEP 6), others = 0.
 - [ ] **P2 — i2p transport** (roadmap C4) — native anonymity overlay; big.
 
 ## 3. Performance & speed
