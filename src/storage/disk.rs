@@ -259,8 +259,38 @@ pub async fn scan_resume(layout: &Layout, piece_hashes: &[[u8; 20]]) -> Result<V
             Err(e) => return Err(Error::Io(e)),
         }
     }
+    // Pipelined scan: read each piece serially (file-cursor order), but spawn
+    // SHA-1 on a blocking thread *without immediately awaiting* it — the hash
+    // for piece N runs while we read piece N+1 from disk, overlapping CPU and
+    // I/O. A sliding window caps the number of in-flight piece buffers so peak
+    // memory stays bounded even on torrents with thousands of pieces.
+    const MAX_IN_FLIGHT: usize = 32;
+    // `(piece_index, JoinHandle<bool>)` — ordered by insertion so the final
+    // drain preserves piece order.
+    let mut in_flight: std::collections::VecDeque<(usize, tokio::task::JoinHandle<bool>)> =
+        std::collections::VecDeque::with_capacity(MAX_IN_FLIGHT);
     let mut out = Vec::new();
+
+    /// Drain one finished hash from the front of `in_flight` and record it.
+    async fn drain_one(
+        in_flight: &mut std::collections::VecDeque<(usize, tokio::task::JoinHandle<bool>)>,
+        out: &mut Vec<usize>,
+    ) {
+        if let Some((idx, handle)) = in_flight.pop_front() {
+            if handle.await.unwrap_or(false) {
+                out.push(idx);
+            }
+        }
+    }
+
     for (index, expected) in piece_hashes.iter().enumerate().take(layout.num_pieces) {
+        // Drain the oldest in-flight hash before reading the next piece
+        // once the window is full — bounds peak memory to
+        // MAX_IN_FLIGHT × max_piece_size.
+        if in_flight.len() >= MAX_IN_FLIGHT {
+            drain_one(&mut in_flight, &mut out).await;
+        }
+
         let psz = piece_size(layout, index);
         let slices = layout.slices_for_piece(index, psz);
         let mut buf = vec![0u8; psz as usize];
@@ -287,21 +317,27 @@ pub async fn scan_resume(layout: &Layout, piece_hashes: &[[u8; 20]]) -> Result<V
             off += count as usize;
         }
         if ok {
-            // SHA-1 is CPU-bound; running it inline here would block the
-            // tokio reactor for the whole resume scan (a multi-second
-            // freeze on a large torrent at cold start). Offload the hash
-            // to the blocking pool — the buffer is owned so it moves in
-            // cleanly. (Reads above are already async.)
+            // Spawn the hash without awaiting — it runs on a blocking thread
+            // while the next piece is being read from disk, overlapping
+            // CPU-bound SHA-1 with async I/O. (Reads already don't block the
+            // reactor; moving the await out of the loop is the key change.)
             let expected = *expected;
-            let matched =
-                tokio::task::spawn_blocking(move || crate::piece::verify_piece(&buf, &expected))
-                    .await
-                    .unwrap_or(false);
-            if matched {
-                out.push(index);
-            }
+            let handle =
+                tokio::task::spawn_blocking(move || crate::piece::verify_piece(&buf, &expected));
+            in_flight.push_back((index, handle));
         }
     }
+
+    // Drain all remaining in-flight hashes.
+    while !in_flight.is_empty() {
+        drain_one(&mut in_flight, &mut out).await;
+    }
+
+    // Results are in piece-index order because we drain oldest-first and
+    // push to `out` in drain order. The engine relies on the returned indices
+    // being valid piece indices but not on them being sorted; sort anyway for
+    // determinism and to match the old behaviour.
+    out.sort_unstable();
     Ok(out)
 }
 

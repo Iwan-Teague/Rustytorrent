@@ -195,7 +195,10 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 - [x] **P0 — `scan_resume` hashes every piece inline on the async
   runtime.** [DONE] `storage/disk.rs` now offloads each piece's SHA-1 to
   `spawn_blocking` so the resume scan no longer freezes the reactor.
-  Further win available: pipeline reads + hashing across cores (still P2).
+  Pipelining also done: `scan_resume` now uses a 32-entry sliding window of
+  spawn_blocking hash tasks — SHA-1 for piece N runs concurrently with the
+  disk read for piece N+1, overlapping CPU and I/O across all cores. Memory
+  bounded to MAX_IN_FLIGHT × max_piece_size.
 - [x] **P1 — `picker.pick_for` rebuilds + sorts a candidates `Vec` every
   call.** [verified] `piece/picker.rs` did O(n log n) per block request.
   DONE (partial — the low-risk half): replaced the `collect + sort_by_key`
