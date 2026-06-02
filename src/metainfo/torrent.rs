@@ -252,6 +252,35 @@ impl Info {
             TorrentFiles::Single { length }
         };
 
+        // Cross-check: the number of piece hashes must equal
+        // ceil(total_length / piece_length).  A mismatch means the
+        // .torrent is malformed; letting it through causes pieces beyond
+        // real file coverage to produce empty write slices that never
+        // verify, silently hanging the download.
+        let total_length: u64 = match &files {
+            TorrentFiles::Single { length } => *length,
+            TorrentFiles::Multi { files } => files.iter().map(|f| f.length).sum(),
+        };
+        // A zero-length torrent has no content to download; no existing
+        // code path handles it, so reject it clearly rather than let it
+        // silently fail later.
+        if total_length == 0 {
+            return Err(Error::Bencode(
+                "torrent total length is zero (nothing to download)".into(),
+            ));
+        }
+        let expected_pieces = total_length.div_ceil(piece_length);
+        if piece_hashes.len() as u64 != expected_pieces {
+            return Err(Error::Bencode(format!(
+                "piece hash count mismatch: torrent has {} piece hashes but \
+                 total_length={} / piece_length={} requires exactly {} pieces",
+                piece_hashes.len(),
+                total_length,
+                piece_length,
+                expected_pieces,
+            )));
+        }
+
         Ok(Info {
             name,
             piece_length,
@@ -488,6 +517,49 @@ mod tests {
         out.extend_from_slice(b"7:privatei1eee");
         let t = TorrentFile::from_bytes(&out).unwrap();
         assert!(t.info.private, "private=1 must parse as true");
+    }
+
+    /// A torrent whose piece-hash count disagrees with
+    /// ceil(total_length / piece_length) must be rejected at parse time.
+    #[test]
+    fn rejects_mismatched_piece_hash_count() {
+        // length=12345, piece_length=16384 → 1 piece required.
+        // Supply 2 hashes → mismatch.
+        let mut out = Vec::new();
+        out.extend_from_slice(
+            b"d4:infod6:lengthi12345e4:name8:test.bin12:piece lengthi16384e6:pieces40:",
+        );
+        out.extend_from_slice(&[0xAAu8; 40]); // 2 hashes
+        out.extend_from_slice(b"ee");
+        let err = TorrentFile::from_bytes(&out).unwrap_err().to_string();
+        assert!(
+            err.contains("piece hash count mismatch"),
+            "error must mention mismatch, got: {err}"
+        );
+        assert!(
+            err.contains('2'),
+            "error must include actual count (2), got: {err}"
+        );
+        assert!(
+            err.contains('1'),
+            "error must include expected count (1), got: {err}"
+        );
+    }
+
+    /// A torrent whose piece-hash count matches ceil(total/piece_length)
+    /// must parse successfully.
+    #[test]
+    fn accepts_consistent_piece_hash_count() {
+        // length=32769, piece_length=16384 → ceil=3 pieces.
+        let mut out = Vec::new();
+        out.extend_from_slice(
+            b"d4:infod6:lengthi32769e4:name8:test.bin12:piece lengthi16384e6:pieces60:",
+        );
+        out.extend_from_slice(&[0xCCu8; 60]); // 3 hashes
+        out.extend_from_slice(b"ee");
+        let t = TorrentFile::from_bytes(&out).unwrap();
+        assert_eq!(t.info.piece_hashes.len(), 3);
+        assert_eq!(t.total_length(), 32769);
     }
 
     /// piece length of 0 is degenerate and must be rejected.

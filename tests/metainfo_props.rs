@@ -326,16 +326,22 @@ proptest! {
     /// in-range piece length must be **accepted** — guarding against the
     /// validators being so strict they reject everything (which would make
     /// the bound-checks above vacuously pass).
+    ///
+    /// `nhashes` is derived from `length` and `plen` (= ceil(length/plen))
+    /// so every generated combination is structurally valid and the check
+    /// added in `Info::from_value` always passes here.
     #[test]
     fn safe_torrent_is_accepted(
         name in "[a-z][a-z0-9_.-]{0,12}",
         plen in prop_oneof![Just(16_384i64), Just(262_144i64), Just(MAX_PIECE_LENGTH as i64)],
-        nhashes in 0usize..4,
-        length in 0i64..1_000_000,
+        length in 1i64..1_000_000,
     ) {
         // `name` regex still admits a bare "." run; skip those so the
         // positive control only feeds genuinely safe names.
         prop_assume!(name != "." && name != "..");
+        // Derive nhashes so the piece-hash count always equals
+        // ceil(length / piece_length) — the parser validates this invariant.
+        let nhashes = (length as u64).div_ceil(plen as u64) as usize;
         let pieces = vec![0u8; nhashes * 20];
         let info = bdict(vec![
             (b"length", bint(length)),
