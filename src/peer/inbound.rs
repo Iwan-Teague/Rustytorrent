@@ -47,6 +47,10 @@ pub struct HandshakenPeer {
     pub peer_id: PeerId,
     /// Whether the peer set the BEP 10 extension-protocol reserved bit.
     pub supports_ext: bool,
+    /// Full 8-byte reserved field from the peer's BT handshake. The engine
+    /// uses this to decide which capability-specific messages to send (e.g.
+    /// BEP 6 `HaveAll`/`HaveNone` instead of `Bitfield`).
+    pub peer_reserved: [u8; 8],
     pub reader: BoxedReader,
     pub writer: BoxedWriter,
 }

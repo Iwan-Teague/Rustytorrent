@@ -187,6 +187,7 @@ async fn route_plain(
         addr,
         peer_id: theirs.peer_id,
         supports_ext,
+        peer_reserved: theirs.reserved,
         reader: Box::new(reader),
         writer: Box::new(writer),
     };
@@ -247,6 +248,7 @@ async fn route_mse(
         addr,
         peer_id: theirs.peer_id,
         supports_ext,
+        peer_reserved: theirs.reserved,
         reader: Box::new(reader),
         writer: Box::new(writer),
     };

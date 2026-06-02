@@ -1289,13 +1289,26 @@ impl TorrentEngine {
         storage_cmd_tx: &mpsc::Sender<StorageCommand>,
     ) -> Result<()> {
         match ev {
-            PeerEvent::Connected { addr, peer_id: _ } => {
+            PeerEvent::Connected {
+                addr,
+                peer_id: _,
+                peer_reserved,
+            } => {
                 self.peer_choking_us.insert(addr, true);
                 self.am_interested.insert(addr, false);
                 self.we_unchoked.insert(addr, false);
                 self.inflight.insert(addr, 0);
-                if self.pm.complete_count() > 0 {
-                    if let Some(h) = peers.handle(&addr) {
+                // BEP 6 (fast extensions): if the peer advertises the fast
+                // bit, send HaveAll/HaveNone instead of Bitfield for the two
+                // boundary cases (seeder / new-leecher). The spec requires
+                // this substitution when both sides support BEP 6.
+                let peer_fast = crate::peer::handshake::supports_fast_extensions(&peer_reserved);
+                if let Some(h) = peers.handle(&addr) {
+                    if peer_fast && self.pm.is_complete() {
+                        let _ = h.try_send(PeerCommand::HaveAll);
+                    } else if peer_fast && self.pm.complete_count() == 0 {
+                        let _ = h.try_send(PeerCommand::HaveNone);
+                    } else if self.pm.complete_count() > 0 {
                         let bf = bitfield_to_bytes(self.pm.local_bitfield());
                         let _ = h.try_send(PeerCommand::Bitfield(bf));
                     }
@@ -1315,6 +1328,22 @@ impl TorrentEngine {
                 }
                 self.cleanup_disconnected_peer(addr);
                 peers.forget(&addr);
+            }
+            // BEP 6: peer has all pieces — treat as a full Bitfield.
+            PeerEvent::HaveAll { addr } => {
+                let full = bitvec::prelude::BitVec::repeat(true, self.pm.num_pieces());
+                self.picker.set_peer_bitfield(addr, full);
+                self.maybe_express_interest(addr, peers);
+            }
+            // BEP 6: peer rejected our Request — release the block for
+            // re-request from another peer.
+            PeerEvent::RejectRequest { addr, index, begin } => {
+                if let Some(c) = self.inflight.get_mut(&addr) {
+                    *c = c.saturating_sub(1);
+                }
+                self.outstanding_requests.remove(&(index, begin));
+                self.pm.release_block(index as usize, begin);
+                self.maybe_request_blocks(addr, peers);
             }
             PeerEvent::Bitfield { addr, bits } => {
                 self.picker.set_peer_bitfield(addr, bits);

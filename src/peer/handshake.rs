@@ -29,6 +29,13 @@ const RESERVED_BIT_DHT: u8 = 0x01;
 /// value `0x10`. Setting this opts us into receiving `Extended` (id 20)
 /// messages and into the magnet-link / ut_metadata flow.
 const RESERVED_BIT_EXTENSION: u8 = 0x10;
+/// BEP 6 (fast extensions) advertises support via byte 7 bit 2 — value
+/// `0x04`. Enables `HaveAll`, `HaveNone`, `RejectRequest`, `AllowedFast`,
+/// and `SuggestPiece` messages. We set this whenever we send the BEP 10
+/// extension bit (the two are enabled together in practice). Libtorrent
+/// 2.x always sets this bit, so under `--anonymous` (libtorrent 2.0.9
+/// peer_id impersonation) emitting it closes a fingerprinting gap.
+const RESERVED_BIT_FAST: u8 = 0x04;
 
 /// Install the reserved-bytes pattern for the rest of the process. Idempotent
 /// (first call wins); the engine calls this once during `run()`. Subsequent
@@ -52,8 +59,17 @@ pub fn extension_bytes_from(dht_enabled: bool, extension_protocol: bool) -> [u8;
     }
     if extension_protocol {
         r[5] |= RESERVED_BIT_EXTENSION;
+        // BEP 6 fast extensions advertised alongside BEP 10 (both are now
+        // implemented). Libtorrent always sets this, so setting it also
+        // closes the byte-7 fingerprint gap under `--anonymous`.
+        r[7] |= RESERVED_BIT_FAST;
     }
     r
+}
+
+/// True iff the peer advertised BEP 6 (fast extensions) in its handshake.
+pub fn supports_fast_extensions(reserved: &[u8; 8]) -> bool {
+    reserved[7] & RESERVED_BIT_FAST != 0
 }
 
 /// True iff the peer advertised the BEP 10 extension-protocol reserved bit.
@@ -214,7 +230,10 @@ mod tests {
     fn extension_bytes_extension_protocol_sets_byte_5_bit_4() {
         let bytes = extension_bytes_from(false, true);
         assert_eq!(bytes[5] & 0x10, 0x10, "BEP 10 bit (byte 5, value 0x10)");
-        assert_eq!(bytes[7], 0);
+        // BEP 6 fast bit is now also set alongside BEP 10 (we support it).
+        assert_eq!(bytes[7] & 0x04, 0x04, "BEP 6 fast bit (byte 7, value 0x04)");
+        // DHT bit should NOT be set when dht_enabled = false.
+        assert_eq!(bytes[7] & 0x01, 0, "DHT bit must not be set");
     }
 
     #[test]
@@ -223,6 +242,14 @@ mod tests {
         let no = extension_bytes_from(false, false);
         assert!(supports_extension_protocol(&yes));
         assert!(!supports_extension_protocol(&no));
+    }
+
+    #[test]
+    fn supports_fast_extensions_detects_the_bit() {
+        let yes = extension_bytes_from(false, true); // BEP 10 + BEP 6 together
+        let no = extension_bytes_from(false, false); // neither
+        assert!(supports_fast_extensions(&yes));
+        assert!(!supports_fast_extensions(&no));
     }
 
     #[test]

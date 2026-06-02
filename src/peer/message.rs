@@ -37,6 +37,26 @@ pub enum Message {
         ext_id: u8,
         payload: Vec<u8>,
     },
+    /// BEP 6 (fast extensions) — peer has every piece (seeder shorthand for
+    /// a full Bitfield). Only sent when both sides advertise fast extensions.
+    HaveAll,
+    /// BEP 6 — peer has no pieces (new-leecher shorthand for an empty
+    /// Bitfield). Only sent when both sides advertise fast extensions.
+    HaveNone,
+    /// BEP 6 — peer rejects our `Request` (e.g. they've decided to choke
+    /// us, or left the upload queue). We must release the block for
+    /// re-request from another peer.
+    RejectRequest {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    /// BEP 6 — peer allows downloading `piece` even while choked.
+    /// We record this as a hint but do not currently act on it.
+    AllowedFast(u32),
+    /// BEP 6 — peer suggests we download `piece` next.
+    /// We receive and decode this but ignore the hint.
+    SuggestPiece(u32),
 }
 
 impl Message {
@@ -51,6 +71,12 @@ impl Message {
     pub const ID_CANCEL: u8 = 8;
     /// BEP 10 — extension protocol envelope.
     pub const ID_EXTENDED: u8 = 20;
+    /// BEP 6 fast-extension IDs.
+    pub const ID_SUGGEST: u8 = 13;
+    pub const ID_HAVE_ALL: u8 = 14;
+    pub const ID_HAVE_NONE: u8 = 15;
+    pub const ID_REJECT: u8 = 16;
+    pub const ID_ALLOWED_FAST: u8 = 17;
 
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -96,6 +122,22 @@ impl Message {
                 p.extend_from_slice(payload);
                 Self::tag(Self::ID_EXTENDED, &p)
             }
+            // BEP 6 fast-extension messages.
+            Message::HaveAll => Self::tag(Self::ID_HAVE_ALL, &[]),
+            Message::HaveNone => Self::tag(Self::ID_HAVE_NONE, &[]),
+            Message::RejectRequest {
+                index,
+                begin,
+                length,
+            } => {
+                let mut p = Vec::with_capacity(12);
+                p.extend_from_slice(&index.to_be_bytes());
+                p.extend_from_slice(&begin.to_be_bytes());
+                p.extend_from_slice(&length.to_be_bytes());
+                Self::tag(Self::ID_REJECT, &p)
+            }
+            Message::AllowedFast(i) => Self::tag(Self::ID_ALLOWED_FAST, &i.to_be_bytes()),
+            Message::SuggestPiece(i) => Self::tag(Self::ID_SUGGEST, &i.to_be_bytes()),
         }
     }
 
@@ -148,6 +190,38 @@ impl Message {
                     ext_id: p[0],
                     payload: p[1..].to_vec(),
                 })
+            }
+            // BEP 6 fast-extension messages. Decoded silently so connections
+            // with BEP 6 peers don't error on these IDs.
+            Self::ID_HAVE_ALL => ensure_empty(p).map(|_| Message::HaveAll),
+            Self::ID_HAVE_NONE => ensure_empty(p).map(|_| Message::HaveNone),
+            Self::ID_REJECT => {
+                // Same wire layout as Request/Cancel.
+                if p.len() != 12 {
+                    return Err(Error::Network(format!("reject payload {} != 12", p.len())));
+                }
+                let index = u32::from_be_bytes([p[0], p[1], p[2], p[3]]);
+                let begin = u32::from_be_bytes([p[4], p[5], p[6], p[7]]);
+                let length = u32::from_be_bytes([p[8], p[9], p[10], p[11]]);
+                Ok(Message::RejectRequest {
+                    index,
+                    begin,
+                    length,
+                })
+            }
+            Self::ID_ALLOWED_FAST | Self::ID_SUGGEST => {
+                if p.len() != 4 {
+                    return Err(Error::Network(format!(
+                        "fast extension piece index payload {} != 4",
+                        p.len()
+                    )));
+                }
+                let piece = u32::from_be_bytes([p[0], p[1], p[2], p[3]]);
+                if id == Self::ID_ALLOWED_FAST {
+                    Ok(Message::AllowedFast(piece))
+                } else {
+                    Ok(Message::SuggestPiece(piece))
+                }
             }
             other => Err(Error::Network(format!("unknown message id {other}"))),
         }

@@ -41,6 +41,10 @@ pub enum PeerEvent {
     Connected {
         addr: SocketAddr,
         peer_id: PeerId,
+        /// Full 8-byte reserved field from the peer's BT handshake. The
+        /// engine uses this to decide which capability-specific initial
+        /// messages to send (e.g. BEP 6 `HaveAll`/`HaveNone`).
+        peer_reserved: [u8; 8],
     },
     Disconnected {
         addr: SocketAddr,
@@ -105,6 +109,18 @@ pub enum PeerEvent {
         addr: SocketAddr,
         their_ut_pex_id: Option<u8>,
     },
+    /// BEP 6 fast extensions — peer has every piece (seeder). The engine
+    /// should treat this the same as a full `Bitfield`.
+    HaveAll {
+        addr: SocketAddr,
+    },
+    /// BEP 6 fast extensions — peer rejected our `Request` (e.g. they
+    /// chopped the upload queue). We release the block for re-request.
+    RejectRequest {
+        addr: SocketAddr,
+        index: u32,
+        begin: u32,
+    },
 }
 
 /// Commands the engine sends to a single peer task.
@@ -138,6 +154,12 @@ pub enum PeerCommand {
         ext_id: u8,
         payload: Vec<u8>,
     },
+    /// BEP 6 — send `HaveAll` to a peer that supports fast extensions
+    /// instead of a full Bitfield (seeder shorthand).
+    HaveAll,
+    /// BEP 6 — send `HaveNone` to a peer that supports fast extensions
+    /// instead of an empty Bitfield (new-leecher shorthand).
+    HaveNone,
 }
 
 /// Outbound side of a peer task — the engine keeps one of these per peer.
@@ -220,6 +242,7 @@ where
         .send(PeerEvent::Connected {
             addr,
             peer_id: theirs.peer_id,
+            peer_reserved: theirs.reserved,
         })
         .await;
     post_handshake_loop(
@@ -586,11 +609,18 @@ pub async fn run_handshaken(
         addr,
         peer_id,
         supports_ext,
+        peer_reserved,
         reader,
         writer,
         ..
     } = peer;
-    let _ = event_tx.send(PeerEvent::Connected { addr, peer_id }).await;
+    let _ = event_tx
+        .send(PeerEvent::Connected {
+            addr,
+            peer_id,
+            peer_reserved,
+        })
+        .await;
     let outcome = post_handshake_loop(
         reader,
         writer,
@@ -642,6 +672,7 @@ async fn run_plain_on_stream(
         .send(PeerEvent::Connected {
             addr,
             peer_id: theirs.peer_id,
+            peer_reserved: theirs.reserved,
         })
         .await;
     let (reader, writer) = split(stream);
@@ -730,6 +761,7 @@ async fn run_mse_on_stream(
         .send(PeerEvent::Connected {
             addr,
             peer_id: theirs.peer_id,
+            peer_reserved: theirs.reserved,
         })
         .await;
 
@@ -909,6 +941,9 @@ where
                                 PeerCommand::Bitfield(b) => Message::Bitfield(b).encode(),
                                 PeerCommand::Extension { ext_id, payload } =>
                                     Message::Extended { ext_id, payload }.encode(),
+                                // BEP 6 fast-extension shorthands.
+                                PeerCommand::HaveAll => Message::HaveAll.encode(),
+                                PeerCommand::HaveNone => Message::HaveNone.encode(),
                             };
                             writer.write_all(&bytes).await
                                 .map_err(|e| Error::Network(format!("write: {e}")))?;
@@ -992,6 +1027,17 @@ fn msg_to_event(addr: SocketAddr, msg: Message) -> Option<PeerEvent> {
         // by sending them. BEP 10 spec explicitly permits ignoring
         // extension messages we don't understand.
         Message::Extended { .. } => None,
+        // BEP 6 fast-extension messages.
+        Message::HaveAll => Some(PeerEvent::HaveAll { addr }),
+        // HaveNone = peer has no pieces; same as an empty Bitfield — no action.
+        Message::HaveNone => None,
+        Message::RejectRequest { index, begin, .. } => {
+            Some(PeerEvent::RejectRequest { addr, index, begin })
+        }
+        // AllowedFast and SuggestPiece are advisory hints we don't currently act
+        // on (we don't track an allow-fast set or re-prioritize on suggestions).
+        // Decode silently so connections with BEP 6 peers stay open.
+        Message::AllowedFast(_) | Message::SuggestPiece(_) => None,
     }
 }
 
