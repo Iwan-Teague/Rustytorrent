@@ -444,6 +444,17 @@ pub async fn decrypt_all_pieces(
     layout: &Layout,
     piece_hashes: &[[u8; 20]],
 ) -> Result<Vec<(u32, Vec<u8>)>> {
+    // Guard: unlike the storage task (which legitimately creates the spool on
+    // first run), `decrypt` is a read-only extraction command. If the path
+    // doesn't exist the user almost certainly gave a wrong path; silently
+    // creating an empty spool here would yield "Recovered 0 pieces" with no
+    // useful signal. Fail loudly instead, mirroring scan_spool_resume.
+    if !tokio::fs::try_exists(spool_path).await.unwrap_or(false) {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("spool not found at {}", spool_path.display()),
+        )));
+    }
     let mut spool = EncryptedSpool::open_or_create(
         spool_path,
         passphrase,
