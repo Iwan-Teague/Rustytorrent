@@ -105,6 +105,14 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P2 — `--max-down 0` / `--max-up 0` stalled all transfers
+  (doc-vs-code divergence).** Both flags' help text promised "Unset or
+  0 = unthrottled", but Some(0) flowed straight into a rate-0 token
+  bucket: one floored block admitted, then zero refill forever — a
+  silent permanent stall exactly contrary to the documented semantics.
+  DONE: parse_rate_kib() treats 0 as unlimited (None), saturating_mul
+  for huge values, used by both the download and magnet EngineConfig
+  build sites. Unit-tested incl. u64::MAX/2 overflow path.
 - [x] **P2 — B4 inbound connect-flood limiter had no wiring test.** The
   accept-loop per-IP token bucket (burst 10, refill 1/s) was untested
   end to end; deleting the drop branch would pass everything. New
