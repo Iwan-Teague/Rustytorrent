@@ -292,6 +292,14 @@ pub struct TorrentEngine {
     peer_pex_snapshot: HashMap<SocketAddr, std::collections::HashSet<SocketAddr>>,
 }
 
+/// Whether this session may run the DHT. DHT is raw UDP — it cannot ride a
+/// SOCKS5 CONNECT, so any of: disabled by config, anonymous mode, a proxy
+/// chain (real IP would leak and become linkable with the proxied
+/// tracker/peer identity per info-hash), or a private torrent forbids it.
+fn dht_wanted(enable_dht: bool, anonymous: bool, proxied: bool, private: bool) -> bool {
+    enable_dht && !anonymous && !proxied && !private
+}
+
 impl TorrentEngine {
     pub fn new(torrent: TorrentFile, peer_id: PeerId, cfg: EngineConfig) -> Self {
         let pm = PieceManager::new(
@@ -885,10 +893,24 @@ impl TorrentEngine {
         // configured routers; failures are non-fatal — DHT is supplemental.
         // DHT cannot ride through SOCKS5 CONNECT (it's UDP), and announcing
         // ourselves onto the DHT leaks the real IP. Anonymous mode forces
-        // it off regardless of `enable_dht`.
-        let dht_wanted = self.cfg.enable_dht && !self.cfg.anonymous && !private;
+        // it off regardless of `enable_dht`. Same for a proxy chain without
+        // --anonymous: peers/trackers would go via SOCKS5 while DHT still
+        // exposes the real IP over UDP, making the two identities linkable
+        // per info-hash — so a proxied session is DHT-ineligible too,
+        // mirroring the uTP socket gate.
+        let dht_wanted = dht_wanted(
+            self.cfg.enable_dht,
+            self.cfg.anonymous,
+            !self.cfg.proxies.is_empty(),
+            private,
+        );
         if self.cfg.enable_dht && self.cfg.anonymous {
             tracing::info!(target: "engine", "anonymous mode: ignoring --dht request");
+        } else if self.cfg.enable_dht && !self.cfg.proxies.is_empty() {
+            tracing::info!(
+                target: "engine",
+                "proxy configured: DHT disabled (UDP cannot ride SOCKS5; direct DHT would leak the real IP)"
+            );
         }
         // Prefer an injected shared DHT (daemon). We do NOT own it, so we
         // must not shut it down on exit — `owns_dht` tracks that. Per-torrent
@@ -2171,6 +2193,20 @@ fn jittered_interval(base: Duration, anonymous: bool) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dht_wanted_truth_table() {
+        // Plain clearnet session: DHT allowed.
+        assert!(dht_wanted(true, false, false, false));
+        // Each disqualifier on its own.
+        assert!(!dht_wanted(false, false, false, false), "disabled by config");
+        assert!(!dht_wanted(true, true, false, false), "anonymous forbids DHT");
+        assert!(
+            !dht_wanted(true, false, true, false),
+            "proxied session forbids direct-UDP DHT (real-IP leak, linkable identity)"
+        );
+        assert!(!dht_wanted(true, false, false, true), "private forbids DHT");
+    }
 
     #[test]
     fn jitter_is_always_at_least_base() {
