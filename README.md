@@ -27,6 +27,7 @@ Cross-platform: Linux, macOS (Intel + Apple Silicon), and Windows.
 | LRU upload-cache (32 pieces) to keep popular pieces in RAM | ✅ |
 | SOCKS5 outgoing proxy (RFC 1928 + RFC 1929 auth); repeatable for multi-hop chains | ✅ |
 | `--anonymous` bundle: DHT off, listener off, ephemeral peer_id, `port=0` | ✅ |
+| Mixed-mode hardening: bare `--socks5` also forces DHT off, listener off, `port=0` (no clearnet side-channel) | ✅ |
 | BEP 10 extension protocol + BEP 9 ut_metadata + magnet links | ✅ |
 | BEP 11 PEX — bidirectional: receive incoming peer lists + send delta updates every 60 s | ✅ |
 | Engine-wide bandwidth limiter (`--max-down`, `--max-up`) | ✅ |

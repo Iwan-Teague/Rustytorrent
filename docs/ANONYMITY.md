@@ -25,11 +25,11 @@ every peer from your real IP.
 | Adversary | Without anon flags | With `--socks5` | With `--socks5 --anonymous` |
 |---|---|---|---|
 | Other peers in the swarm seeing your IP | ❌ exposed | ✅ they see the proxy IP | ✅ they see the proxy IP |
-| Tracker logging announcing IPs | ❌ exposed (tracker sees source IP) | ✅ tracker sees proxy IP | ✅ tracker sees proxy IP; and we send `port=0` so you can't be back-connected |
+| Tracker logging announcing IPs | ❌ exposed (tracker sees source IP) | ✅ tracker sees proxy IP; and we send `port=0` so you can't be back-connected | ✅ tracker sees proxy IP; and we send `port=0` so you can't be back-connected |
 | Passive ISP observer / DPI | ❌ sees BT traffic to clearnet peers | 🟡 sees BT traffic to proxy IP only | 🟡 sees BT traffic to proxy IP only |
 | MSE/PE-aware DPI (looks at byte patterns) | ❌ plain BT is trivially fingerprinted | 🟡 still fingerprintable inside the proxy tunnel if peer chose plain | ✅ if proxy is Tor or commercial VPN, transport encryption hides BT shape; `--encrypt` forces MSE outbound for additional cover |
-| Active DHT scraper enumerating swarms | ❌ your IP is in the DHT for everyone to scrape | 🟡 still exposed: DHT runs UDP, can't ride SOCKS5 CONNECT, but we leave it on unless `--anonymous` | ✅ DHT is forcibly **off** |
-| Port-scan of your IP from the peer listen port | ❌ exposed by listener bind | ❌ still bound on your real IP | ✅ listener is **not bound** |
+| Active DHT scraper enumerating swarms | ❌ your IP is in the DHT for everyone to scrape | ✅ DHT is forcibly **off** (UDP can't ride SOCKS5 CONNECT; leaving it on would announce your real IP on the same info-hash you download through the proxy) | ✅ DHT is forcibly **off** |
+| Port-scan of your IP from the peer listen port | ❌ exposed by listener bind | ✅ listener is **not bound** (direct inbound would bypass the proxy and expose your real IP) | ✅ listener is **not bound** |
 | Cross-session correlation by stable `peer_id` | ❌ same `-RT0100-…` prefix + 12 stable random bytes every run | ❌ peer_id still persisted | ✅ peer_id is freshly generated every run with a libtorrent-style `-LT2090-` prefix; rotated at every reannounce |
 | Client-name fingerprint in BEP 10 extension handshake | ❌ `v = "rustytorrent <ver>"` and `reqq = 0` distinguish us | ❌ same | ✅ both keys omitted under `--anonymous`; only `m` dict emitted |
 | Tracker User-Agent fingerprint | ❌ `rustytorrent/<ver>` | ❌ same | ✅ libtorrent-style UA sent per-announce |
@@ -73,6 +73,14 @@ A bundle flag that:
    citizenship, worse anonymity.
 5. **Sets `port=0` in tracker announces.** We don't run a public listener, so
    advertising a port is both a lie and a unique-fingerprint risk.
+
+Items 2, 3, and 5 are not exclusive to `--anonymous`: the same gating is
+applied whenever **any** proxy chain is configured (a proxied session must
+not keep UDP/DHT, direct-inbound, or real-port advertisements on the
+clearnet side — that would re-link the proxy IP with your real one).
+What stays `--anonymous`-only: the ephemeral peer_id, the libtorrent-style
+tracker User-Agent, omission of `v`/`reqq` from the extension handshake,
+and the cleartext-`http://` tracker refusal.
 
 ### `--encrypt`
 
