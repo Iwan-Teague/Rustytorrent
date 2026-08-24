@@ -325,6 +325,24 @@ fn advertised_port(anonymous: bool, proxied: bool, listen_port: u16) -> u16 {
     }
 }
 
+/// Split a batch of untrusted peer addresses (tracker response, DHT
+/// values) into dialable ones and the number of refused martians, so the
+/// caller can log how many a hostile source tried to sneak past. See
+/// [`crate::util::is_dialable_peer_addr`] for the policy.
+fn filter_dialable_peers(
+    addrs: &[std::net::SocketAddr],
+    strict: bool,
+) -> (Vec<std::net::SocketAddr>, usize) {
+    let before = addrs.len();
+    let out: Vec<std::net::SocketAddr> = addrs
+        .iter()
+        .copied()
+        .filter(|a| crate::util::is_dialable_peer_addr(a, strict))
+        .collect();
+    let dropped = before - out.len();
+    (out, dropped)
+}
+
 impl TorrentEngine {
     pub fn new(torrent: TorrentFile, peer_id: PeerId, cfg: EngineConfig) -> Self {
         let pm = PieceManager::new(
@@ -907,7 +925,17 @@ impl TorrentEngine {
                         peers = resp.peers.len(),
                         "first announce"
                     );
-                    peers.try_connect_many(resp.peers.clone());
+                    let strict = self.cfg.anonymous || !self.cfg.proxies.is_empty();
+                    let (dialable, dropped) =
+                        filter_dialable_peers(&resp.peers, strict);
+                    if dropped > 0 {
+                        tracing::debug!(
+                            target: "engine",
+                            dropped,
+                            "dropped unroutable peer addresses from announce"
+                        );
+                    }
+                    peers.try_connect_many(dialable);
                     resp.interval
                 }
                 Err(e) => {
@@ -1122,7 +1150,17 @@ impl TorrentEngine {
                                 self.cfg.anonymous,
                             ));
                             tracker_timer.tick().await;
-                            let started = peers.try_connect_many(resp.peers);
+                            let strict = self.cfg.anonymous || !self.cfg.proxies.is_empty();
+                            let (dialable, dropped) =
+                                filter_dialable_peers(&resp.peers, strict);
+                            if dropped > 0 {
+                                tracing::debug!(
+                                    target: "engine",
+                                    dropped,
+                                    "dropped unroutable peer addresses from reannounce"
+                                );
+                            }
+                            let started = peers.try_connect_many(dialable);
                             if started > 0 {
                                 tracing::debug!(target: "engine", started, "added peers from reannounce");
                             }
@@ -1263,7 +1301,21 @@ impl TorrentEngine {
                         tracing::debug!(target: "engine", routing, connected, "running DHT get_peers");
                         let new_peers = dht.get_peers(info_hash).await;
                         if !new_peers.is_empty() {
-                            let started = peers.try_connect_many(new_peers.iter().copied());
+                            // DHT values are attacker-influenced too; the
+                            // martian half of the filter applies even though
+                            // strict mode never reaches here (DHT is off
+                            // under anonymous/proxied sessions).
+                            let strict = self.cfg.anonymous || !self.cfg.proxies.is_empty();
+                            let (dialable, dropped) =
+                                filter_dialable_peers(&new_peers, strict);
+                            if dropped > 0 {
+                                tracing::debug!(
+                                    target: "engine",
+                                    dropped,
+                                    "dropped unroutable peer addresses from DHT"
+                                );
+                            }
+                            let started = peers.try_connect_many(dialable);
                             tracing::info!(
                                 target: "engine",
                                 discovered = new_peers.len(),
