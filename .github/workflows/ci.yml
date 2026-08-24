@@ -48,3 +48,15 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Supply chain — enforces deny.toml (RustSec advisories, banned/duplicate
+  # crates, license allow-list, crate source restrictions) on every push
+  # and PR. deny.toml passing locally means nothing if CI never checks it.
+  supply-chain:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
