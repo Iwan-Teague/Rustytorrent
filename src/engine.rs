@@ -1468,14 +1468,42 @@ impl TorrentEngine {
                 self.maybe_express_interest(addr, peers);
             }
             // BEP 6: peer rejected our Request — release the block for
-            // re-request from another peer.
+            // re-request from another peer. Two guards before acting:
+            //
+            //  - RANGE: `index` comes straight off the wire; a forged
+            //    out-of-range value must not reach PieceManager's
+            //    `states[index]` (unchecked indexing = remote panic).
+            //
+            //  - OWNERSHIP: a rejection may only clear request state for
+            //    a request WE SENT TO THIS PEER. Unconditional removal
+            //    would let any connected peer erase another peer's
+            //    outstanding entry, causing that peer's honest Block to
+            //    fail the solicitation check and be dropped — a cheap
+            //    cross-peer stall attack. (The Block handler validates
+            //    the sender the same way; this closes the symmetric
+            //    hole on the reject path.)
             PeerEvent::RejectRequest { addr, index, begin } => {
                 if let Some(c) = self.inflight.get_mut(&addr) {
                     *c = c.saturating_sub(1);
                 }
-                self.outstanding_requests.remove(&(index, begin));
-                self.pm.release_block(index as usize, begin);
-                self.maybe_request_blocks(addr, peers);
+                let owned = matches!(
+                    self.outstanding_requests.get(&(index, begin)),
+                    Some((a, _)) if *a == addr
+                );
+                let in_range = (index as usize) < self.pm.num_pieces();
+                if owned && in_range {
+                    self.outstanding_requests.remove(&(index, begin));
+                    self.pm.release_block(index as usize, begin);
+                    self.maybe_request_blocks(addr, peers);
+                } else {
+                    tracing::debug!(
+                        target: "engine",
+                        %addr,
+                        index,
+                        begin,
+                        "ignoring forged or out-of-range REJECT_REQUEST"
+                    );
+                }
             }
             PeerEvent::Bitfield { addr, bits } => {
                 self.picker.set_peer_bitfield(addr, bits);
