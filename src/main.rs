@@ -1071,6 +1071,7 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
         pool,
         proxies.clone(),
         anonymous,
+        bind_iface.clone(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("magnet bootstrap: {e}"))?;

@@ -514,6 +514,7 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
             pool,
             Vec::new(),
             false,
+            None,
         )
         .await
         {
