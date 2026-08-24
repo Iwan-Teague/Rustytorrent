@@ -424,6 +424,16 @@ async fn connect_transport(
     bind_iface: Option<&str>,
     anonymous: bool,
 ) -> Result<Transport> {
+    // Belt-and-braces martian screen for EVERY outgoing transport —
+    // placed here (not per-transport) so a third transport can't be
+    // added without walking past it. Ingestion filters per-source; this
+    // is the last line at the syscall boundary.
+    let martian_strict = crate::engine::dht_martian_strict(anonymous, !proxies.is_empty());
+    if !crate::util::is_safe_dial_target(&addr, martian_strict) {
+        return Err(Error::Network(format!(
+            "refusing martian dial target {addr} (strict={martian_strict})"
+        )));
+    }
     let use_utp = should_use_utp(proxies.is_empty(), bind_iface.is_some(), anonymous);
     let transport = match (use_utp, utp) {
         (true, Some(utp)) => race_tcp_utp(addr, utp, proxies, bind_iface, anonymous).await?,
@@ -1330,6 +1340,32 @@ mod tests {
         assert!(
             !msg2.contains("refusing martian dial target"),
             "clearnet session must not apply strict screening: {msg2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_transport_screen_covers_the_utp_leg() {
+        // The TCP screen inside dial_tcp never runs when the uTP leg
+        // wins the race; the chokepoint screen in connect_transport must
+        // refuse a martian target regardless of transport.
+        let addr: SocketAddr = "169.254.169.254:80".parse().unwrap();
+        let utp_sock = Arc::new(
+            UtpSocket::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_transport(addr, Some(&utp_sock), &[], None, false),
+        )
+        .await
+        .expect("must fail fast, not ride dial timeouts")
+        .err()
+        .expect("metadata endpoint must be refused on every transport");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refusing martian dial target"),
+            "expected chokepoint martian refusal, got: {msg}"
         );
     }
 

@@ -122,6 +122,12 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
   exemption proven both by dedicated asserts and by every existing
   loopback e2e staying green. Mutation-checked: removing the screen
   makes the metadata test fail on a 10 s timeout instead of refusal.
+  FOLLOW-UP: the uTP race leg bypassed dial_tcp entirely — the screen is
+  now hoisted to connect_transport (the single transport chokepoint, so
+  any future transport walks past it too) while dial_tcp keeps its own
+  belt. New test proves a martian target is refused on the uTP-racing
+  path without riding dial timeouts; mutation-checked by severing the
+  chokepoint check.
 - [x] **P1 — DHT/web martian filters hardcoded strict=false (implicit
   coupling with anonymity gating).** [review finding] Safe only while
   `dht_wanted()` forbids DHT under anon/proxy; if that gating ever
