@@ -35,6 +35,28 @@ pub const DEFAULT_BOOTSTRAP_NODES: &[&str] = &[
     "dht.libtorrent.org:25401",
 ];
 
+/// Screen contacts restored from the persist file through the same martian
+/// filter applied to live wire input (`util::is_dialable_peer_addr`): a
+/// tampered or stale state file must not be able to aim our startup DHT
+/// probes at loopback, link-local or NAT64 targets. Site-local ranges stay
+/// allowed (`strict = false`) because the DHT only ever runs on the clearnet.
+fn dialable_warm_contacts(contacts: Vec<routing::Contact>) -> Vec<routing::Contact> {
+    let before = contacts.len();
+    let kept: Vec<routing::Contact> = contacts
+        .into_iter()
+        .filter(|c| crate::util::is_dialable_peer_addr(&c.addr, false))
+        .collect();
+    let dropped = before - kept.len();
+    if dropped > 0 {
+        tracing::warn!(
+            target: "dht",
+            dropped,
+            "dropped martian contacts from persisted dht state"
+        );
+    }
+    kept
+}
+
 #[derive(Debug)]
 pub(crate) enum DhtCommand {
     GetPeers {
@@ -81,12 +103,13 @@ impl Dht {
         // Try loading previously-persisted state. Failure → empty start.
         let (node_id, warm_contacts) = match persist_path.as_deref().and_then(persist::load) {
             Some((id, c)) => {
+                let kept = dialable_warm_contacts(c);
                 tracing::info!(
                     target: "dht",
-                    contacts = c.len(),
+                    contacts = kept.len(),
                     "loaded persisted dht state"
                 );
-                (Some(id), c)
+                (Some(id), kept)
             }
             None => (None, Vec::new()),
         };
@@ -148,5 +171,32 @@ impl Dht {
 
     pub async fn shutdown(&self) {
         let _ = self.cmd_tx.send(DhtCommand::Shutdown).await;
+    }
+}
+
+#[cfg(test)]
+mod warm_contacts_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn contact(ip: [u8; 4], port: u16) -> routing::Contact {
+        routing::Contact::new(
+            NodeId([9u8; 20]),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port),
+        )
+    }
+
+    #[test]
+    fn persisted_martian_contacts_are_dropped_before_warming() {
+        let contacts = vec![
+            contact([93, 184, 215, 14], 6881), // public — kept
+            contact([127, 0, 0, 1], 6881),     // loopback — dropped
+            contact([169, 254, 169, 254], 80), // link-local metadata — dropped
+            contact([192, 168, 1, 50], 51413), // site-local — allowed (clearnet DHT)
+        ];
+        let kept = dialable_warm_contacts(contacts);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].addr.to_string(), "93.184.215.14:6881");
+        assert_eq!(kept[1].addr.to_string(), "192.168.1.50:51413");
     }
 }
