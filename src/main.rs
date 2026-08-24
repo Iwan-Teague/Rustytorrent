@@ -884,6 +884,14 @@ fn effective_socks5_pass(flag: Option<String>, env: Option<String>) -> Option<St
     flag.or_else(|| env.filter(|p| !p.is_empty()))
 }
 
+/// Whether the magnet bootstrap may announce to this tracker URL. Mirrors
+/// the engine's anonymous-mode refusal of cleartext `http://` trackers:
+/// the announce body is plaintext on the proxy→tracker leg, so under
+/// `--anonymous` such trackers are skipped rather than announced to.
+fn bootstrap_allows_tracker(url: &str, anonymous: bool) -> bool {
+    !(anonymous && url.starts_with("http://"))
+}
+
 /// only — typically the Tor / VPN endpoint that actually enforces
 /// auth or where circuit isolation is meaningful. Earlier hops are
 /// usually just transit (e.g. a corporate VPN) that doesn't need auth.
@@ -1034,6 +1042,19 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
             num_want: 50,
         };
         for url in &magnet.trackers {
+            // Mirror the engine's anonymous-mode policy: cleartext http://
+            // trackers are refused because the announce body (info-hash,
+            // peer-id) is readable by anyone on the proxy→tracker leg, even
+            // though the dial itself rides the proxy. Skipping here keeps
+            // the bootstrap consistent with the session that follows.
+            if !bootstrap_allows_tracker(url, anonymous) {
+                tracing::warn!(
+                    target: "magnet",
+                    tracker = %rustytorrent::tracker::redact_url_query(url),
+                    "skipping cleartext http:// tracker under anonymous mode"
+                );
+                continue;
+            }
             match rustytorrent::tracker::announce_with_proxy_anon(
                 url,
                 &req,
@@ -1204,7 +1225,25 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::effective_socks5_pass;
+    use super::{bootstrap_allows_tracker, effective_socks5_pass};
+
+    #[test]
+    fn bootstrap_skips_cleartext_http_only_under_anonymous() {
+        assert!(!bootstrap_allows_tracker("http://t.example/announce", true));
+        // https is transport-encrypted end to end; udp is refused by the
+        // dispatcher under anonymous anyway, so both stay allowed here.
+        assert!(bootstrap_allows_tracker("https://t.example/announce", true));
+        assert!(bootstrap_allows_tracker(
+            "udp://t.example:6969/announce",
+            true
+        ));
+        // Clearnet sessions follow the engine's permissive policy.
+        assert!(bootstrap_allows_tracker("http://t.example/announce", false));
+        assert!(bootstrap_allows_tracker(
+            "https://t.example/announce",
+            false
+        ));
+    }
 
     #[test]
     fn socks5_pass_flag_wins_over_env() {
