@@ -935,4 +935,245 @@ mod tests {
         let url = cfg.as_socks5h_url();
         assert!(url.starts_with("socks5h://") && url.ends_with("@10.0.0.1:1080"));
     }
+
+    // ---- Hostile-proxy scripted replies: fail closed, never hang ----
+
+    /// One-shot proxy server whose behavior is entirely scripted by the
+    /// test closure. Lets us feed malformed protocol replies that a real
+    /// hostile (or just broken) proxy could produce.
+    async fn spawn_scripted_proxy<F, Fut>(script: F) -> SocketAddr
+    where
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                script(sock).await;
+            }
+        });
+        addr
+    }
+
+    fn loopback_target() -> SocketAddr {
+        "127.0.0.1:9".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn hostile_method_reply_bad_version_is_rejected() {
+        let addr = spawn_scripted_proxy(|mut sock| async move {
+            let mut g = [0u8; 2];
+            let _ = sock.read_exact(&mut g).await;
+            let mut methods = vec![0u8; g[1] as usize];
+            let _ = sock.read_exact(&mut methods).await;
+            // Wrong VER in the method reply.
+            let _ = sock.write_all(&[0x04, METHOD_NO_AUTH]).await;
+            // Keep the socket open briefly so a client bug would hang
+            // visibly rather than race EOF.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        })
+        .await;
+        let cfg = ProxyConfig {
+            addr,
+            credentials: None,
+            isolation: false,
+        };
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect(&cfg, loopback_target()),
+        )
+        .await
+        .expect("must fail fast, not hang")
+        .expect_err("bad method-reply version must be rejected");
+        match res {
+            Socks5Error::Protocol(m) => assert!(m.contains("ver"), "{m}"),
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_proxy_picking_unoffered_method_is_rejected() {
+        // We offer NO_AUTH only; the proxy answers with GSSAPI (0x01).
+        let addr = spawn_scripted_proxy(|mut sock| async move {
+            let mut g = [0u8; 2];
+            let _ = sock.read_exact(&mut g).await;
+            let mut methods = vec![0u8; g[1] as usize];
+            let _ = sock.read_exact(&mut methods).await;
+            let _ = sock.write_all(&[VER_SOCKS5, 0x01]).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        })
+        .await;
+        let cfg = ProxyConfig {
+            addr,
+            credentials: None,
+            isolation: false,
+        };
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect(&cfg, loopback_target()),
+        )
+        .await
+        .expect("must fail fast, not hang")
+        .expect_err("unoffered method must be rejected");
+        match res {
+            Socks5Error::Protocol(m) => assert!(m.contains("unsupported method 0x01"), "{m}"),
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_connect_reply_bad_version_is_rejected() {
+        let addr = spawn_scripted_proxy(|mut sock| async move {
+            let mut g = [0u8; 2];
+            let _ = sock.read_exact(&mut g).await;
+            let mut methods = vec![0u8; g[1] as usize];
+            let _ = sock.read_exact(&mut methods).await;
+            let _ = sock.write_all(&[VER_SOCKS5, METHOD_NO_AUTH]).await;
+            let mut req_head = [0u8; 4];
+            let _ = sock.read_exact(&mut req_head).await;
+            let mut addr_buf = [0u8; 6];
+            let _ = sock.read_exact(&mut addr_buf).await;
+            // Bad VER on the CONNECT reply.
+            let _ = sock
+                .write_all(&[0x06, REP_SUCCEEDED, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        })
+        .await;
+        let cfg = ProxyConfig {
+            addr,
+            credentials: None,
+            isolation: false,
+        };
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect(&cfg, loopback_target()),
+        )
+        .await
+        .expect("must fail fast, not hang")
+        .expect_err("bad connect-reply version must be rejected");
+        match res {
+            Socks5Error::Protocol(m) => assert!(m.contains("connect reply ver"), "{m}"),
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_connect_reply_unknown_atyp_is_rejected() {
+        let addr = spawn_scripted_proxy(|mut sock| async move {
+            let mut g = [0u8; 2];
+            let _ = sock.read_exact(&mut g).await;
+            let mut methods = vec![0u8; g[1] as usize];
+            let _ = sock.read_exact(&mut methods).await;
+            let _ = sock.write_all(&[VER_SOCKS5, METHOD_NO_AUTH]).await;
+            let mut req_head = [0u8; 4];
+            let _ = sock.read_exact(&mut req_head).await;
+            let mut addr_buf = [0u8; 6];
+            let _ = sock.read_exact(&mut addr_buf).await;
+            // Success but ATYP 0x07 is not defined by RFC 1928.
+            let _ = sock
+                .write_all(&[VER_SOCKS5, REP_SUCCEEDED, 0x00, 0x07])
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        })
+        .await;
+        let cfg = ProxyConfig {
+            addr,
+            credentials: None,
+            isolation: false,
+        };
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect(&cfg, loopback_target()),
+        )
+        .await
+        .expect("must fail fast, not hang")
+        .expect_err("unknown ATYP must be rejected");
+        match res {
+            Socks5Error::Protocol(m) => assert!(m.contains("ATYP 0x07"), "{m}"),
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_max_length_domain_bind_addr_drains_without_hang() {
+        // A DOMAIN bind address of the maximum 255 bytes must be drained
+        // cleanly (257 bytes total with port) and leave the stream usable.
+        let addr = spawn_scripted_proxy(|mut sock| async move {
+            let mut g = [0u8; 2];
+            let _ = sock.read_exact(&mut g).await;
+            let mut methods = vec![0u8; g[1] as usize];
+            let _ = sock.read_exact(&mut methods).await;
+            let _ = sock.write_all(&[VER_SOCKS5, METHOD_NO_AUTH]).await;
+            let mut req_head = [0u8; 4];
+            let _ = sock.read_exact(&mut req_head).await;
+            let mut addr_buf = [0u8; 6];
+            let _ = sock.read_exact(&mut addr_buf).await;
+            let mut reply = vec![VER_SOCKS5, REP_SUCCEEDED, 0x00, ATYP_DOMAIN, 255];
+            reply.extend_from_slice(&[0x41u8; 255]);
+            reply.extend_from_slice(&[0x00, 0x50]); // bind port
+            let _ = sock.write_all(&reply).await;
+            // Echo one byte back so the client can prove alignment.
+            let mut b = [0u8; 1];
+            let _ = sock.read_exact(&mut b).await;
+            let _ = sock.write_all(&b).await;
+        })
+        .await;
+        let cfg = ProxyConfig {
+            addr,
+            credentials: None,
+            isolation: false,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect(&cfg, loopback_target()),
+        )
+        .await
+        .expect("max-length domain drain must not hang")
+        .expect("handshake succeeds despite DOMAIN bind addr");
+        stream.write_all(b"X").await.unwrap();
+        let mut b = [0u8; 1];
+        stream.read_exact(&mut b).await.unwrap();
+        assert_eq!(b[0], b'X', "post-handshake stream must be byte-aligned");
+    }
+
+    #[tokio::test]
+    async fn hostile_truncated_reply_errors_promptly() {
+        // Reply head cut short, then the proxy vanishes: the client must
+        // surface an IO error promptly instead of stalling until timeout.
+        let addr = spawn_scripted_proxy(|mut sock| async move {
+            let mut g = [0u8; 2];
+            let _ = sock.read_exact(&mut g).await;
+            let mut methods = vec![0u8; g[1] as usize];
+            let _ = sock.read_exact(&mut methods).await;
+            let _ = sock.write_all(&[VER_SOCKS5, METHOD_NO_AUTH]).await;
+            let mut req_head = [0u8; 4];
+            let _ = sock.read_exact(&mut req_head).await;
+            let mut addr_buf = [0u8; 6];
+            let _ = sock.read_exact(&mut addr_buf).await;
+            let _ = sock.write_all(&[VER_SOCKS5, REP_SUCCEEDED, 0x00]).await;
+            drop(sock);
+        })
+        .await;
+        let cfg = ProxyConfig {
+            addr,
+            credentials: None,
+            isolation: false,
+        };
+        let start = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect(&cfg, loopback_target()),
+        )
+        .await
+        .expect("truncated reply must not hang")
+        .expect_err("truncated reply must error");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(4),
+            "error took too long: {res:?}"
+        );
+        assert!(matches!(res, Socks5Error::Io(_)), "got {res:?}");
+    }
 }
