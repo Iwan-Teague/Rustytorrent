@@ -30,17 +30,26 @@ pub fn info_hash_from_hex(s: &str) -> Option<[u8; 20]> {
 /// so other local users cannot list our state (peer id, hosted torrents,
 /// DHT routing table). Best-effort on other platforms.
 ///
-/// Only directories CREATED by this call are tightened — an existing
-/// directory keeps its mode, because the parent of a state file may be a
-/// shared location (e.g. `$TMPDIR`/`/tmp` in tests) whose permissions we
-/// must never touch.
+/// Directories are CREATED with 0700 from the first instant (a
+/// create-then-chmod sequence would leave a listable window). Only
+/// directories CREATED by this call get that mode — an existing directory
+/// keeps its mode, because the parent of a state file may be a shared
+/// location (e.g. `$TMPDIR`/`/tmp` in tests) whose permissions we must
+/// never touch.
 pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let existed = path.is_dir();
-        std::fs::create_dir_all(path)?;
+        // Recursive DirBuilder applies 0700 to every component it creates;
+        // existing components are untouched (EEXIST ignored).
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
         if !existed {
+            // Belt and braces: covers a racing creator between is_dir() and
+            // create() (their dir keeps its own mode otherwise).
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
         }
         Ok(())
@@ -53,11 +62,24 @@ pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
 
 /// Write `bytes` to `path` with owner-only permissions (0600 on Unix).
 /// Used for every state file that identifies the user or what they seed.
+///
+/// The file is CREATED with 0600 from the first instant — a plain
+/// `fs::write` followed by a chmod would leave a world-readable window
+/// during which the peer id or stored state could be observed by other
+/// local users. A pre-existing file keeps its old mode through `open()`,
+/// so it is tightened unconditionally afterwards.
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, bytes)?;
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
