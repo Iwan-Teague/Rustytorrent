@@ -889,7 +889,8 @@ async fn resolve_proxy_chain(
     // Credential hygiene: fall back to RUSTYTORRENT_SOCKS5_PASS so the
     // password never has to sit in argv (readable from `ps` by every
     // local user on multi-user boxes). An explicit flag wins.
-    let socks5_pass = effective_socks5_pass(socks5_pass, std::env::var("RUSTYTORRENT_SOCKS5_PASS").ok());
+    let socks5_pass =
+        effective_socks5_pass(socks5_pass, std::env::var("RUSTYTORRENT_SOCKS5_PASS").ok());
     if socks5.is_empty() {
         if socks5_user.is_some() || socks5_pass.is_some() || tor_isolation {
             anyhow::bail!("--socks5-user / --socks5-pass / --tor-isolation require --socks5");
@@ -1012,11 +1013,7 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
             // BEP 27 hint: port=0 whenever no inbound listener answers —
             // anonymous mode, or a proxy chain (which disables the
             // listener). Same rule as the engine's advertised_port.
-            port: rustytorrent::engine::advertised_port(
-                anonymous,
-                !proxies.is_empty(),
-                port,
-            ),
+            port: rustytorrent::engine::advertised_port(anonymous, !proxies.is_empty(), port),
             uploaded: 0,
             downloaded: 0,
             // We don't know `left` yet — magnet stage. Use 0 (the

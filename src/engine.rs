@@ -929,8 +929,7 @@ impl TorrentEngine {
                         "first announce"
                     );
                     let strict = self.cfg.anonymous || !self.cfg.proxies.is_empty();
-                    let (dialable, dropped) =
-                        filter_dialable_peers(&resp.peers, strict);
+                    let (dialable, dropped) = filter_dialable_peers(&resp.peers, strict);
                     if dropped > 0 {
                         tracing::debug!(
                             target: "engine",
@@ -2321,8 +2320,14 @@ mod tests {
         // Plain clearnet session: DHT allowed.
         assert!(dht_wanted(true, false, false, false));
         // Each disqualifier on its own.
-        assert!(!dht_wanted(false, false, false, false), "disabled by config");
-        assert!(!dht_wanted(true, true, false, false), "anonymous forbids DHT");
+        assert!(
+            !dht_wanted(false, false, false, false),
+            "disabled by config"
+        );
+        assert!(
+            !dht_wanted(true, true, false, false),
+            "anonymous forbids DHT"
+        );
         assert!(
             !dht_wanted(true, false, true, false),
             "proxied session forbids direct-UDP DHT (real-IP leak, linkable identity)"
@@ -2333,8 +2338,7 @@ mod tests {
     #[test]
     fn filter_dialable_peers_mixed_input() {
         use std::net::SocketAddr;
-        let parse =
-            |s: &str| -> SocketAddr { s.parse().expect("test addr must parse") };
+        let parse = |s: &str| -> SocketAddr { s.parse().expect("test addr must parse") };
         let addrs = vec![
             parse("93.184.215.14:6881"),
             parse("127.0.0.1:6881"),
@@ -2344,7 +2348,10 @@ mod tests {
         ];
         // Clearnet mode: only hard martians dropped, site-local kept.
         let (kept, dropped) = filter_dialable_peers(&addrs, false);
-        assert_eq!(dropped, 3, "loopback + link-local + multicast-class targets");
+        assert_eq!(
+            dropped, 3,
+            "loopback + link-local + multicast-class targets"
+        );
         assert_eq!(kept.len(), 2);
         assert!(kept.contains(&parse("93.184.215.14:6881")));
         assert!(kept.contains(&parse("10.0.0.5:6881")));
@@ -2451,17 +2458,14 @@ mod tests {
         let tiers = vec![vec![
             "http://private.example/a.php?passkey=SECRET123&k=ABCD".into(),
         ]];
-        let msg =
-            check_anonymous_tracker_urls(&tiers, None).expect("expected refusal");
+        let msg = check_anonymous_tracker_urls(&tiers, None).expect("expected refusal");
         assert!(msg.contains("http://private.example/a.php"));
         assert!(!msg.contains("SECRET123"), "passkey leaked: {msg}");
         assert!(!msg.contains("ABCD"), "key leaked: {msg}");
 
-        let msg = check_anonymous_tracker_urls(
-            &Vec::new(),
-            Some("http://frag.example/an#passkey=X"),
-        )
-        .expect("expected refusal");
+        let msg =
+            check_anonymous_tracker_urls(&Vec::new(), Some("http://frag.example/an#passkey=X"))
+                .expect("expected refusal");
         assert!(msg.contains("http://frag.example/an"));
         assert!(!msg.contains("passkey"), "fragment leaked: {msg}");
     }
