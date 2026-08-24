@@ -1014,14 +1014,14 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
                 Ok(resp) => {
                     tracing::info!(
                         target: "magnet",
-                        tracker = %url,
+                        tracker = %rustytorrent::tracker::redact_url_query(&url),
                         peers = resp.peers.len(),
                         "tracker bootstrap"
                     );
                     pool.extend(resp.peers);
                 }
                 Err(e) => {
-                    tracing::warn!(target: "magnet", tracker = %url, error = %e, "tracker failed");
+                    tracing::warn!(target: "magnet", tracker = %rustytorrent::tracker::redact_url_query(&url), error = %e, "tracker failed");
                 }
             }
         }

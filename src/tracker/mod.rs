@@ -7,6 +7,29 @@ use crate::peer_id::PeerId;
 pub mod http;
 pub mod udp;
 
+/// Strip the query string and fragment from a tracker URL for display in
+/// logs and error messages. Private-tracker announce URLs carry the user's
+/// passkey/key as query parameters; echoing the full URL into an error or
+/// tracing line would leak exactly the credential anonymous mode exists to
+/// protect. `scheme://host/path` keeps enough to identify the tracker.
+pub fn redact_url_query(url: &str) -> String {
+    url.split(['?', '#']).next().unwrap_or(url).to_string()
+}
+
+/// Remove any occurrence of `url` (e.g. one embedded by reqwest's error
+/// Display, which prints "… for url (https://host/a?passkey=…)") from a
+/// rendered error string, replacing it with its redacted form.
+pub fn scrub_url_from_message(msg: &str, url: &str) -> String {
+    if msg.is_empty() || url.is_empty() {
+        return msg.to_string();
+    }
+    let redacted = redact_url_query(url);
+    if redacted == url {
+        return msg.to_string();
+    }
+    msg.replace(url, &redacted)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     None,
@@ -90,7 +113,7 @@ pub async fn announce_with_proxy_anon(
         // Anonymous mode guarantees a SOCKS5 chain upstream; refuse
         // outright if a caller ever violates that.
         return Err(crate::error::Error::Tracker(format!(
-            "anonymous mode requires a SOCKS5 proxy; refusing direct tracker announce: {url}"
+            "anonymous mode requires a SOCKS5 proxy; refusing direct tracker announce: {}", redact_url_query(url)
         )));
     }
     if url.starts_with("udp://") {
@@ -101,7 +124,7 @@ pub async fn announce_with_proxy_anon(
             // when no proxy is configured (an upstream gate could be
             // bypassed; this is the last line of defense).
             return Err(crate::error::Error::Tracker(format!(
-                "skipping UDP tracker while proxy is configured or anonymous mode is on: {url}"
+                "skipping UDP tracker while proxy is configured or anonymous mode is on: {}", redact_url_query(url)
             )));
         }
         udp::announce(url, req, bind_iface).await
@@ -109,7 +132,7 @@ pub async fn announce_with_proxy_anon(
         http::announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await
     } else {
         Err(crate::error::Error::Tracker(format!(
-            "unsupported tracker scheme: {url}"
+            "unsupported tracker scheme: {}", redact_url_query(url)
         )))
     }
 }
@@ -301,5 +324,28 @@ mod tests {
             msg.contains("udp bind via rt_nonexistent_iface_xyz123"),
             "error must name the bound interface, got: {msg}"
         );
+    }
+
+    #[test]
+    fn redact_url_query_strips_query_and_fragment() {
+        assert_eq!(
+            redact_url_query("https://t.example/a.php?passkey=SECRET&k=X"),
+            "https://t.example/a.php"
+        );
+        assert_eq!(redact_url_query("http://t.example/an#frag"), "http://t.example/an");
+        // No query/fragment: unchanged.
+        assert_eq!(redact_url_query("udp://t.example:6969/announce"), "udp://t.example:6969/announce");
+    }
+
+    #[test]
+    fn scrub_url_from_message_redacts_embedded_url() {
+        let url = "https://t.example/a.php?passkey=SECRET";
+        let msg = format!("http send: error sending request for url ({url})");
+        let scrubbed = scrub_url_from_message(&msg, url);
+        assert!(scrubbed.contains("https://t.example/a.php"));
+        assert!(!scrubbed.contains("SECRET"), "passkey survived scrub: {scrubbed}");
+        // URL without query: nothing to scrub, message unchanged.
+        let plain = "http://x.example/a";
+        assert_eq!(scrub_url_from_message("boom", plain), "boom");
     }
 }

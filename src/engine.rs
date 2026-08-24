@@ -863,7 +863,13 @@ impl TorrentEngine {
             .await
             {
                 Ok((used_url, resp)) => {
-                    tracing::info!(target: "engine", tracker = %used_url, peers = resp.peers.len(), "first announce");
+                    // Redact passkeys: announce URLs may carry ?key=/passkey=.
+                    tracing::info!(
+                        target: "engine",
+                        tracker = %crate::tracker::redact_url_query(&used_url),
+                        peers = resp.peers.len(),
+                        "first announce"
+                    );
                     peers.try_connect_many(resp.peers.clone());
                     resp.interval
                 }
@@ -2145,25 +2151,22 @@ fn check_anonymous_tracker_urls(
     announce_list: &[Vec<String>],
     announce: Option<&str>,
 ) -> Option<String> {
-    // Report only scheme://host/path. Private-tracker announce URLs carry
-    // the user's passkey/key as a query parameter; echoing the full URL
-    // into an error that gets logged or printed would leak exactly the
-    // credential we're trying to protect.
-    fn redact(url: &str) -> String {
-        let no_query = url.split(['?', '#']).next().unwrap_or(url);
-        no_query.to_string()
-    }
+    // Report only scheme://host/path via tracker::redact_url_query.
+    // Private-tracker announce URLs carry the user's passkey/key as a
+    // query parameter; echoing the full URL into an error that gets
+    // logged or printed would leak exactly the credential we're trying
+    // to protect.
     let mut bad: Vec<String> = Vec::new();
     for tier in announce_list {
         for url in tier {
             if url.starts_with("http://") {
-                bad.push(redact(url));
+                bad.push(crate::tracker::redact_url_query(url));
             }
         }
     }
     if let Some(u) = announce {
         if u.starts_with("http://") {
-            bad.push(redact(u));
+            bad.push(crate::tracker::redact_url_query(u));
         }
     }
     if bad.is_empty() {
