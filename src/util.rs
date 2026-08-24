@@ -183,11 +183,24 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
             // dropped by construction; it exists so networks can blackhole
             // traffic. Never a swarm peer.
             let discard_only = segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0;
+            // Remaining IANA special-purpose assignments under 2001::/16:
+            // RFC 6890 IETF protocol assignments (2001:1::/32), RFC 5180
+            // benchmarking (2001:2::/48) and the deprecated RFC 4843 ORCHID
+            // range (2001:10::/28). None of them is ever announced by a
+            // real swarm peer.
+            let ietf_protocols6 = segs[0] == 0x2001 && segs[1] == 1;
+            // /48: the fourth hextet is inside the prefix, so only pin the
+            // first three.
+            let benchmarking6 = segs[0] == 0x2001 && segs[1] == 2 && segs[2] == 0;
+            let orchid = segs[0] == 0x2001 && (segs[1] & 0xfff0) == 0x0010;
             !nat64
                 && !nat64_local_use
                 && !six_to_four
                 && !teredo
                 && !doc6
+                && !ietf_protocols6
+                && !benchmarking6
+                && !orchid
                 && !zeronet6
                 && !discard_only
                 && !v6.is_unicast_link_local()
@@ -402,6 +415,26 @@ mod tests {
         }
         // Control: 200:: is NOT inside 100::/64 and stays dialable.
         let addr: SocketAddr = "[200::1]:51413".parse().unwrap();
+        assert!(is_dialable_peer_addr(&addr, false));
+    }
+
+    #[test]
+    fn remaining_iana_v6_special_purpose_addrs_are_never_dialable() {
+        // 2001:1::/32 (IETF protocol assignments), 2001:2::/48 (RFC 5180
+        // benchmarking) and the deprecated ORCHID range (2001:10::/28):
+        // registry-reserved, never announced by a real swarm peer.
+        for a in [
+            "[2001:1::1]:51413",
+            "[2001:2:0:abcd::1]:51413",
+            "[2001:10::dead]:51413",
+        ] {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert!(!is_dialable_peer_addr(&addr, false), "{a} clearnet");
+            assert!(!is_dialable_peer_addr(&addr, true), "{a} strict");
+        }
+        // Control: other 2001:x space is real-world address space and stays
+        // dialable — none of the new predicates may match it.
+        let addr: SocketAddr = "[2001:4860:4860::8888]:51413".parse().unwrap();
         assert!(is_dialable_peer_addr(&addr, false));
     }
 
