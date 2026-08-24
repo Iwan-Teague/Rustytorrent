@@ -147,10 +147,20 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
             // address targets the local network's NAT64 gateway, which
             // translates the embedded IPv4 host on ITS side — a hostile peer
             // source could use it to probe v4-only hosts behind that gateway.
-            // No legitimate swarm contact is announced under this prefix.
             let segs = v6.segments();
             let nat64 = segs[0] == 0x64 && segs[1] == 0xff9b && segs[2] == 0 && segs[3] == 0;
-            !nat64 && !v6.is_unicast_link_local() && !(strict && v6.is_unique_local())
+            // Same class of transition-mechanism addresses: RFC 3056 6to4
+            // (2002::/16, embedded v4 routed via a relay gateway) and RFC
+            // 4380 Teredo (2001:0::/32, tunnel endpoints behind relays).
+            // Dialing either sends our traffic through an operator we did not
+            // choose; no legitimate swarm contact is announced under them.
+            let six_to_four = segs[0] == 0x2002;
+            let teredo = segs[0] == 0x2001 && segs[1] == 0x0000;
+            !nat64
+                && !six_to_four
+                && !teredo
+                && !v6.is_unicast_link_local()
+                && !(strict && v6.is_unique_local())
         }
     }
 }
@@ -271,6 +281,25 @@ mod tests {
         }
         // Ordinary global v6 stays dialable.
         let addr: SocketAddr = "[2606:4700:4700::1111]:51413".parse().unwrap();
+        assert!(is_dialable_peer_addr(&addr, false));
+    }
+
+    #[test]
+    fn transition_mechanism_v6_addrs_are_never_dialable() {
+        // RFC 3056 6to4 (2002::/16) and RFC 4380 Teredo (2001:0::/32):
+        // both route dials through relay/tunnel operators chosen by whoever
+        // announced the contact — never legitimate swarm peers.
+        for a in [
+            "[2002:7f00:0001::]:6881",  // 6to4 wrapping 127.0.0.1
+            "[2002:8ef8:d616::]:51413", // 6to4 wrapping a public v4
+            "[2001:0:abcd::1]:51413",   // Teredo
+        ] {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert!(!is_dialable_peer_addr(&addr, false), "{a} clearnet");
+            assert!(!is_dialable_peer_addr(&addr, true), "{a} strict");
+        }
+        // 2001:x with a non-zero second group is NOT Teredo (real global v6).
+        let addr: SocketAddr = "[2001:4860:4860::8888]:51413".parse().unwrap();
         assert!(is_dialable_peer_addr(&addr, false));
     }
 
