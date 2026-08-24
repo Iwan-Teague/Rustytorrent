@@ -389,10 +389,12 @@ async fn connect_transport(
 }
 
 /// Whether the uTP leg may race the TCP dial. µTP is raw UDP: it can't
-/// ride a SOCKS5 CONNECT and isn't interface-bound, so any of proxy
-/// chain / `--bind-iface` / anonymous mode forbids it. `anonymous` is
-/// checked here — not just at engine socket creation — so this stays
-/// true even if a future caller hands us a µTP socket while anonymous.
+/// ride a SOCKS5 CONNECT, and anonymous mode forbids UDP egress entirely.
+/// A `--bind-iface` pin also keeps the race off — the engine still binds
+/// an interface-pinned µTP socket for INBOUND peers in that case, but
+/// outgoing dials stay TCP-only. `anonymous` is checked here — not just
+/// at engine socket creation — so this stays true even if a future caller
+/// hands us a µTP socket while anonymous.
 fn should_use_utp(proxies_empty: bool, bind_iface_set: bool, anonymous: bool) -> bool {
     proxies_empty && !bind_iface_set && !anonymous
 }
