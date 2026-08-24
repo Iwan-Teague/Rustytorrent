@@ -23,8 +23,8 @@
 //! ## Write backpressure
 //!
 //! The command channel is unbounded, so backpressure is enforced one
-//! level up, at [`UtpStream::poll_write`], via a per-connection
-//! [`SendGate`] credit ledger shared between the stream and the
+//! level up, at `UtpStream::poll_write`, via a per-connection
+//! `SendGate` credit ledger shared between the stream and the
 //! driver. A write first reserves `min(len, available)` bytes of
 //! credit; if none is available it parks the caller's waker and
 //! returns `Poll::Pending`. The driver releases credit exactly when
@@ -32,7 +32,7 @@
 //! `out_blocks`/`in_flight`), or dropped wholesale when the connection
 //! closes/reaps — and wakes the parked writer. Total driver-held
 //! outbound memory per connection is therefore bounded at
-//! [`SEND_BUF_CAP_BYTES`] regardless of how fast the application
+//! `SEND_BUF_CAP_BYTES` regardless of how fast the application
 //! writes.
 
 use std::collections::HashMap;

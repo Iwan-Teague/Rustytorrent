@@ -24,7 +24,7 @@
 //!   (`process_sack`). When a SACK reports >= 3 packets past the gap
 //!   (TCP-style duplicate-ack loss signal) the sender fast-retransmits
 //!   the gap immediately instead of waiting out its RTO.
-//! - **LEDBAT (BEP 29)**: a delay-based controller ([`Ledbat`]) sizes
+//! - **LEDBAT (BEP 29)**: a delay-based controller (`Ledbat`) sizes
 //!   the send window from one-way-delay samples (the peer's echoed
 //!   `timestamp_diff`), yielding to other traffic as queuing delay
 //!   builds. Falls back to the fixed `INITIAL_WINDOW_PACKETS` until a
@@ -589,7 +589,7 @@ impl Connection {
     /// behalf but the peer hasn't acked yet: unsent queue (`out_len`)
     /// plus every in-flight (sent, unacked) DATA payload. The driver's
     /// send-credit gate tracks exactly this quantity so a blocked
-    /// [`UtpStream`] writer resumes when bytes actually leave the
+    /// `UtpStream` writer resumes when bytes actually leave the
     /// connection — either because they were acked, or because the
     /// connection was reaped and its buffers dropped.
     ///

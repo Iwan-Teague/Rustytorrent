@@ -88,7 +88,7 @@ pub struct EngineConfig {
     /// SOCKS5 proxy chain for all outgoing peer dials. Empty → direct
     /// connections (clearnet). Length 1 → single-hop proxy (the typical
     /// `--socks5 host:port` case). Length 2+ → multi-hop chain: bytes
-    /// flow client → proxies[0] → proxies[1] → … → target via nested
+    /// flow client → `proxies[0]` → `proxies[1]` → … → target via nested
     /// SOCKS5 CONNECTs on a single TCP stream. Defeats single-proxy
     /// compromise (C1).
     ///
