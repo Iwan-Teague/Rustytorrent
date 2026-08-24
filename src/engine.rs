@@ -313,6 +313,18 @@ fn inbound_wanted(anonymous: bool, proxied: bool) -> bool {
     !anonymous && !proxied
 }
 
+/// The listen port we advertise to trackers. Whenever no inbound listener is
+/// running (`inbound_wanted` == false) we must not promise one: announcing a
+/// port that will never answer is both a lie to the swarm and a stable
+/// fingerprint the tracker can correlate across announces.
+fn advertised_port(anonymous: bool, proxied: bool, listen_port: u16) -> u16 {
+    if anonymous || proxied {
+        0
+    } else {
+        listen_port
+    }
+}
+
 impl TorrentEngine {
     pub fn new(torrent: TorrentFile, peer_id: PeerId, cfg: EngineConfig) -> Self {
         let pm = PieceManager::new(
@@ -1323,11 +1335,13 @@ impl TorrentEngine {
         let left = self.torrent.total_length().saturating_sub(downloaded);
         // Anonymous mode advertises port=0: we don't run a public listener,
         // so promising a port we won't honor is both a lie and a fingerprint.
-        let port = if self.cfg.anonymous {
-            0
-        } else {
-            self.cfg.listen_port
-        };
+        // Same reasoning applies whenever a proxy chain disabled the listener
+        // (`inbound_wanted` == false): the advertised port would be unreachable.
+        let port = advertised_port(
+            self.cfg.anonymous,
+            !self.cfg.proxies.is_empty(),
+            self.cfg.listen_port,
+        );
         AnnounceRequest {
             info_hash: self.torrent.info_hash,
             peer_id: self.peer_id,
@@ -2258,6 +2272,17 @@ mod tests {
             !inbound_wanted(false, true),
             "proxied session must not accept direct inbound"
         );
+    }
+
+    #[test]
+    fn advertised_port_is_zero_when_listener_disabled() {
+        // Plain clearnet session: advertise the real listen port.
+        assert_eq!(advertised_port(false, false, 6881), 6881);
+        // Anonymous: no listener exists — port must be 0.
+        assert_eq!(advertised_port(true, false, 6881), 0);
+        // Proxied: the listener is disabled (`inbound_wanted`) so a real
+        // port would be an unreachable lie and a correlation fingerprint.
+        assert_eq!(advertised_port(false, true, 6881), 0);
     }
 
     #[test]
