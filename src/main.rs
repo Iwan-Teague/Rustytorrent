@@ -112,6 +112,11 @@ enum Commands {
         /// the current directory.
         #[arg(long, default_value = ".")]
         torrent_dir: PathBuf,
+        /// Defense-in-depth: install an OS sandbox (seccomp whitelist on
+        /// Linux, sandbox-init SBPL deny-default on macOS) before each
+        /// hosted torrent's engine starts, same as the download commands.
+        #[arg(long, default_value_t = false)]
+        sandbox: bool,
     },
     /// Create a `.torrent` from a file or directory: hash the content,
     /// build the info dict, and write the metainfo file. Prints the
@@ -310,6 +315,7 @@ async fn main() -> Result<()> {
             no_dht,
             max_peers_total,
             torrent_dir,
+            sandbox,
         } => {
             cmd_daemon(
                 torrents,
@@ -319,6 +325,7 @@ async fn main() -> Result<()> {
                 no_dht,
                 max_peers_total,
                 torrent_dir,
+                sandbox,
             )
             .await
         }
@@ -618,6 +625,7 @@ async fn cmd_daemon(
     no_dht: bool,
     max_peers_total: usize,
     torrent_dir: PathBuf,
+    sandbox: bool,
 ) -> Result<()> {
     use rustytorrent::session::SessionManager;
 
@@ -686,6 +694,7 @@ async fn cmd_daemon(
             // Honor the saved intent, but the manager still forces it off
             // if this daemon ran --no-dht.
             enable_dht: entry.enable_dht && !no_dht,
+            sandbox,
             ..Default::default()
         };
         // Already on disk — plain add (re-persisting would be redundant).
@@ -718,6 +727,7 @@ async fn cmd_daemon(
             // Opt in to the DHT; the manager downgrades this to off if the
             // daemon was started --no-dht (or for private torrents).
             enable_dht: !no_dht,
+            sandbox,
             ..Default::default()
         };
         match mgr.add_persistent(t, peer_id, cfg, &raw).await {
@@ -727,9 +737,10 @@ async fn cmd_daemon(
     }
 
     println!(
-        "Daemon:     {} torrent(s) on shared port {port}{}; ≤{max_peers_total} peers total; UI at http://127.0.0.1:{web}/ (loopback)",
+        "Daemon:     {} torrent(s) on shared port {port}{}; ≤{max_peers_total} peers total; UI at http://127.0.0.1:{web}/ (loopback){}",
         mgr.len().await,
         if no_dht { " (DHT off)" } else { " (shared DHT)" },
+        if sandbox { "; Sandbox: on" } else { "" },
     );
 
     let state = rustytorrent::web::DaemonState {
