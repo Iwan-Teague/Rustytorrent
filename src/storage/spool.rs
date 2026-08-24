@@ -56,6 +56,22 @@ use crate::storage::layout::Layout;
 pub const MAGIC: &[u8; 4] = b"RTSP";
 pub const VERSION: u8 = 1;
 
+/// Open options for the spool file: created owner-only (0600 on Unix).
+///
+/// The payload is encrypted, but file size still leaks download volume and
+/// the header holds the salt/verifier; there is no reason for other local
+/// users to read it. `mode` applies only at creation, so an existing spool
+/// keeps its permissions.
+fn private_open_options() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    opts
+}
+
 /// Byte length of the spool header. See module docs for the layout.
 pub const HEADER_LEN: u64 =
     4 + 1 + 3 + SALT_LEN as u64 + 4 + 4 + NONCE_LEN as u64 + (16 + TAG_LEN) as u64;
@@ -108,13 +124,7 @@ impl EncryptedSpool {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .await?;
+        let mut file = private_open_options().open(path).await?;
         let existing_len = file.metadata().await?.len();
         let key = if existing_len == 0 {
             // Fresh spool: write the header now.
@@ -509,6 +519,20 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn created_spool_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir();
+        let path = dir.join("spool.bin");
+        let _spool = EncryptedSpool::open_or_create(&path, "pw", 1024, 1, 1024)
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(format!("{mode:o}"), "600", "spool must be owner-only");
     }
 
     #[tokio::test]

@@ -8,6 +8,23 @@ use tokio::sync::mpsc;
 use crate::error::{Error, Result};
 use crate::storage::layout::Layout;
 
+/// Open options for download data files: created owner-only (0600 on Unix).
+///
+/// Downloaded content is exactly what an anonymous-mode user does not want
+/// readable by other local users. `mode` only applies at creation time, so
+/// pre-existing files keep whatever permissions they already had.
+fn data_open_options() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        // tokio::fs::OpenOptions mirrors the std builder and exposes
+        // mode() natively on Unix.
+        opts.mode(0o600);
+    }
+    opts
+}
+
 #[derive(Debug)]
 pub enum StorageCommand {
     Write {
@@ -97,13 +114,7 @@ async fn run_storage(
         if let Some(parent) = span.path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&span.path)
-            .await?;
+        let f = data_open_options().open(&span.path).await?;
         // Sparse-allocate up to the file length.
         let cur = f.metadata().await?.len();
         if cur < span.length {
@@ -424,6 +435,45 @@ mod tests {
         assert_eq!(&a[100..150], &piece1[0..50]);
         let b = std::fs::read(&layout.files[1].path).unwrap();
         assert_eq!(&b[0..50], &piece1[50..100]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn created_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir();
+        let t = make_torrent_multi(100, vec![(100, "a.txt")]);
+        let layout = Layout::from_torrent(tmp.clone(), &t);
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+        let handle = spawn_storage_task(layout.clone(), cmd_rx, ev_tx);
+        cmd_tx
+            .send(StorageCommand::Write {
+                index: 0,
+                data: vec![7u8; 100],
+            })
+            .await
+            .unwrap();
+        match ev_rx.recv().await.unwrap() {
+            StorageEvent::Written { index } => assert_eq!(index, 0),
+            ev => panic!("unexpected event {ev:?}"),
+        }
+        cmd_tx.send(StorageCommand::Shutdown).await.unwrap();
+        let _ = handle.await;
+
+        let mode = std::fs::metadata(&layout.files[0].path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            format!("{mode:o}"),
+            "600",
+            "downloaded file must be created owner-only"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     fn tempdir() -> PathBuf {
