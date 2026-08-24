@@ -1666,7 +1666,21 @@ impl TorrentEngine {
                         "ignoring PEX (anonymous or private torrent)"
                     );
                 } else {
-                    let started = peers.try_connect_many(pex_peers);
+                    // PEX entries come straight from an untrusted peer, so
+                    // they get the same martian screening as tracker and DHT
+                    // ingestion: never dial loopback/link-local/metadata
+                    // targets a hostile peer tries to aim us at.
+                    let strict = self.cfg.anonymous || !self.cfg.proxies.is_empty();
+                    let (dialable, dropped) = filter_dialable_peers(&pex_peers, strict);
+                    if dropped > 0 {
+                        tracing::debug!(
+                            target: "engine",
+                            from = %addr,
+                            dropped,
+                            "dropped unroutable peer addresses from PEX"
+                        );
+                    }
+                    let started = peers.try_connect_many(dialable);
                     if started > 0 {
                         tracing::debug!(
                             target: "engine",
@@ -2313,6 +2327,34 @@ mod tests {
             "proxied session forbids direct-UDP DHT (real-IP leak, linkable identity)"
         );
         assert!(!dht_wanted(true, false, false, true), "private forbids DHT");
+    }
+
+    #[test]
+    fn filter_dialable_peers_mixed_input() {
+        use std::net::SocketAddr;
+        let parse =
+            |s: &str| -> SocketAddr { s.parse().expect("test addr must parse") };
+        let addrs = vec![
+            parse("93.184.215.14:6881"),
+            parse("127.0.0.1:6881"),
+            parse("169.254.169.254:80"),
+            parse("10.0.0.5:6881"),
+            parse("[fe80::1]:6881"),
+        ];
+        // Clearnet mode: only hard martians dropped, site-local kept.
+        let (kept, dropped) = filter_dialable_peers(&addrs, false);
+        assert_eq!(dropped, 3, "loopback + link-local + multicast-class targets");
+        assert_eq!(kept.len(), 2);
+        assert!(kept.contains(&parse("93.184.215.14:6881")));
+        assert!(kept.contains(&parse("10.0.0.5:6881")));
+        // Strict (anonymous/proxied) mode: site-local refused too.
+        let (kept_strict, dropped_strict) = filter_dialable_peers(&addrs, true);
+        assert_eq!(dropped_strict, 4);
+        assert_eq!(
+            kept_strict,
+            vec![parse("93.184.215.14:6881")],
+            "only the public peer survives strict screening"
+        );
     }
 
     #[test]
