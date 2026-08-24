@@ -340,7 +340,7 @@ pub fn parse_response(body: &[u8]) -> Result<AnnounceResponse> {
         .as_dict()
         .map_err(|e| Error::Tracker(format!("response: {e}")))?;
     if let Some(reason) = d.get(&b"failure reason".to_vec()) {
-        let msg = reason.as_str().unwrap_or("<non-utf8>").to_string();
+        let msg = crate::tracker::sanitize_tracker_text(reason.as_str().unwrap_or("<non-utf8>"));
         return Err(Error::Tracker(format!("failure: {msg}")));
     }
     let interval = d
@@ -650,6 +650,23 @@ mod tests {
     fn parse_response_failure_reason() {
         let body = b"d14:failure reason13:not authorizede";
         assert!(parse_response(body).is_err());
+    }
+
+    #[test]
+    fn parse_response_failure_reason_is_control_char_sanitized() {
+        // A hostile tracker must not be able to forge log lines via its
+        // failure reason text.
+        let reason = "\r\nFAKE LOG LINE\r\nnot authorized";
+        let mut body = b"d14:failure reason".to_vec();
+        body.extend_from_slice(format!("{}:", reason.len()).as_bytes());
+        body.extend_from_slice(reason.as_bytes());
+        body.push(b'e');
+        let err = match parse_response(&body) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("failure reason must be an error"),
+        };
+        assert!(err.contains("not authorized"), "{err}");
+        assert!(!err.contains('\r') && !err.contains('\n'), "{err}");
     }
 
     #[test]
