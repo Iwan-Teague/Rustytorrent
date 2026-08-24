@@ -31,6 +31,11 @@ jobs:
         run: cargo build --all-targets --locked
       - name: cargo test
         run: cargo test --all --locked
+      # Debug asserts hide arithmetic overflow; the release profile enables
+      # overflow-checks, so exercise it too (linux-only to bound CI time).
+      - name: cargo test --release (overflow-checks)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --release --all --locked
 
   # Style + lints — runs on a single platform since they're deterministic.
   lint:
