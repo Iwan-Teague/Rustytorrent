@@ -298,7 +298,13 @@ pub struct TorrentEngine {
 /// SOCKS5 CONNECT, so any of: disabled by config, anonymous mode, a proxy
 /// chain (real IP would leak and become linkable with the proxied
 /// tracker/peer identity per info-hash), or a private torrent forbids it.
-fn dht_wanted(enable_dht: bool, anonymous: bool, proxied: bool, private: bool) -> bool {
+///
+/// This is the single DHT gate for every engine-side spawn: the engine's
+/// own spawn, the daemon's per-session eligibility check, and the magnet
+/// bootstrap warm-up (`main.rs`) all route through it, so the fail-closed
+/// rules can't drift apart between call sites. `pub` only because the
+/// magnet path lives in the binary crate; treat as internal.
+pub fn dht_wanted(enable_dht: bool, anonymous: bool, proxied: bool, private: bool) -> bool {
     enable_dht && !anonymous && !proxied && !private
 }
 

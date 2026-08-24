@@ -106,7 +106,7 @@ fn parse_info_hash(s: &str) -> Result<[u8; 20]> {
 
 fn parse_hex_20(s: &str) -> Result<[u8; 20]> {
     let mut out = [0u8; 20];
-    for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+    for (i, chunk) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let hi = hex_nibble(chunk[0])?;
         let lo = hex_nibble(chunk[1])?;
         out[i] = (hi << 4) | lo;

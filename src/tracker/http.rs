@@ -414,7 +414,7 @@ fn parse_compact_v4(b: &[u8]) -> Result<Vec<SocketAddr>> {
         )));
     }
     let mut out = Vec::with_capacity(b.len() / 6);
-    for c in b.chunks_exact(6) {
+    for c in b.as_chunks::<6>().0 {
         let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
         let port = u16::from_be_bytes([c[4], c[5]]);
         out.push(SocketAddr::new(IpAddr::V4(ip), port));
@@ -430,7 +430,7 @@ fn parse_compact_v6(b: &[u8]) -> Result<Vec<SocketAddr>> {
         )));
     }
     let mut out = Vec::with_capacity(b.len() / 18);
-    for c in b.chunks_exact(18) {
+    for c in b.as_chunks::<18>().0 {
         let mut octets = [0u8; 16];
         octets.copy_from_slice(&c[..16]);
         let ip = Ipv6Addr::from(octets);

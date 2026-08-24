@@ -79,7 +79,8 @@ pub fn load(path: &Path) -> Option<(NodeId, Vec<Contact>)> {
         return None;
     }
     let mut contacts = Vec::with_capacity(n);
-    for chunk in bytes[29..].chunks_exact(26) {
+    // `expected` check above guarantees bytes[29..] is a multiple of 26.
+    for chunk in bytes[29..].as_chunks::<26>().0 {
         let mut cid = [0u8; 20];
         cid.copy_from_slice(&chunk[..20]);
         let ip = Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
