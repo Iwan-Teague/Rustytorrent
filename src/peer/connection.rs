@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{split, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{split, AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Instant};
@@ -20,6 +20,13 @@ use crate::socks5::{self, ProxyConfig};
 pub const MAX_FRAME_LEN: u32 = (BLOCK_SIZE + 1024) * 2; // covers a 16 KiB piece + headroom
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
+/// Liveness bound on the READ side. We send keepalives when the write
+/// side goes idle, but nothing forced us to notice a peer that simply
+/// never speaks again — such peers would hold their `MAX_PEERS` slots
+/// forever and a few dozen of them could stall connectivity entirely.
+/// BEP 3 keepalive convention is ~2 minutes; 5 minutes of total silence
+/// means the peer (or its NAT mapping) is gone.
+pub const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// B3 — per-peer rate limit on inbound `Request` messages. A misbehaving peer
 /// can otherwise hammer us with Requests faster than we can read pieces off
@@ -326,6 +333,27 @@ fn is_likely_mse_signal(e: &Error) -> bool {
         // is the third common signature of an MSE-only peer dropping us.
         Error::Network(s) => s.contains("Connection reset"),
         _ => false,
+    }
+}
+
+/// Read one peer-wire frame, but give up when the peer goes silent for
+/// `idle`. The write side sends keepalives when IT goes idle; without a
+/// read-side bound a connected-but-silent peer would hold its
+/// `MAX_PEERS` slot forever. The resulting error text deliberately
+/// matches nothing in `is_protocol_violation`, so the disconnect is
+/// treated as benign.
+async fn read_frame_with_idle<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_len: u32,
+    buf: &mut Vec<u8>,
+    idle: Duration,
+) -> Result<()> {
+    match timeout(idle, read_frame_into(reader, max_len, buf)).await {
+        Ok(res) => res,
+        Err(_) => Err(Error::Network(format!(
+            "peer idle: no message within {}s",
+            idle.as_secs()
+        ))),
     }
 }
 
@@ -852,7 +880,8 @@ where
             // nothing once it's grown to the largest frame seen.
             let mut frame = Vec::new();
             loop {
-                read_frame_into(&mut reader, MAX_FRAME_LEN, &mut frame).await?;
+                read_frame_with_idle(&mut reader, MAX_FRAME_LEN, &mut frame, READ_IDLE_TIMEOUT)
+                    .await?;
                 let msg = Message::decode(&frame)?;
                 // B3 — throttle inbound Request messages per peer. Drop the
                 // event when the bucket's dry; the peer will re-request
@@ -1114,6 +1143,42 @@ mod tests {
         assert!(!is_protocol_violation(&Error::Network(
             "frame body: io error".into()
         )));
+    }
+
+    #[test]
+    fn idle_read_disconnect_is_benign_not_violation() {
+        // The read-idle bound is a liveness cleanup, not an accusation:
+        // NAT timeouts and dead mobile peers are the normal case, so the
+        // escalation path must never see this error as a violation.
+        assert!(!is_protocol_violation(&Error::Network(format!(
+            "peer idle: no message within {}s",
+            READ_IDLE_TIMEOUT.as_secs()
+        ))));
+    }
+
+    #[tokio::test]
+    async fn silent_peer_read_times_out_as_idle_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _server = listener.accept().unwrap(); // accepted but never writes
+        let mut buf = Vec::new();
+        let started = std::time::Instant::now();
+        let res = read_frame_with_idle(
+            &mut client,
+            MAX_FRAME_LEN,
+            &mut buf,
+            Duration::from_millis(80),
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "idle bound must fire promptly, took {:?}",
+            started.elapsed()
+        );
+        let msg = res.err().unwrap().to_string();
+        assert!(msg.contains("peer idle"), "unexpected error: {msg}");
     }
 
     #[test]
