@@ -193,6 +193,16 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
             // first three.
             let benchmarking6 = segs[0] == 0x2001 && segs[1] == 2 && segs[2] == 0;
             let orchid = segs[0] == 0x2001 && (segs[1] & 0xfff0) == 0x0010;
+            // The last special-purpose assignments under 2001::/23: RFC 7450
+            // AMT relay namespace (2001:3::/32), RFC 7535 AS112-v6
+            // (2001:4:112::/48), RFC 7343 ORCHIDv2 (2001:20::/28) and the
+            // drone Remote-ID transport block (RFC 9415-style assignment,
+            // 2001:30::/28). Infrastructure namespaces — an announcer can
+            // only use them to steer our dials at gateways or blackholes.
+            let amt = segs[0] == 0x2001 && segs[1] == 3;
+            let as112v6 = segs[0] == 0x2001 && segs[1] == 4 && segs[2] == 0x112;
+            let orchid_v2 = segs[0] == 0x2001 && (segs[1] & 0xfff0) == 0x0020;
+            let drone_rta = segs[0] == 0x2001 && (segs[1] & 0xfff0) == 0x0030;
             !nat64
                 && !nat64_local_use
                 && !six_to_four
@@ -201,6 +211,10 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
                 && !ietf_protocols6
                 && !benchmarking6
                 && !orchid
+                && !amt
+                && !as112v6
+                && !orchid_v2
+                && !drone_rta
                 && !zeronet6
                 && !discard_only
                 && !v6.is_unicast_link_local()
@@ -436,6 +450,31 @@ mod tests {
         // dialable — none of the new predicates may match it.
         let addr: SocketAddr = "[2001:4860:4860::8888]:51413".parse().unwrap();
         assert!(is_dialable_peer_addr(&addr, false));
+    }
+
+    #[test]
+    fn last_iana_v6_blocks_are_never_dialable() {
+        // 2001:3::/32 (AMT relays), 2001:4:112::/48 (AS112-v6), the ORCHIDv2
+        // range 2001:20::/28 and the drone Remote-ID transport block
+        // 2001:30::/28: infrastructure namespaces an announcer can only use
+        // to steer our dials at gateways or blackholes.
+        for a in [
+            "[2001:3::1]:51413",
+            "[2001:4:112::1]:51413",
+            "[2001:2a::dead]:51413",
+            "[2001:33::1]:51413",
+        ] {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert!(!is_dialable_peer_addr(&addr, false), "{a} clearnet");
+            assert!(!is_dialable_peer_addr(&addr, true), "{a} strict");
+        }
+        // Control: global space just outside every new prefix stays
+        // dialable (2001:8:: is unassigned-but-global, and 2001:40:: is past
+        // both /28 blocks).
+        for a in ["[2001:8::1]:51413", "[2001:40::1]:51413"] {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert!(is_dialable_peer_addr(&addr, false), "{a}");
+        }
     }
 
     #[cfg(unix)]
