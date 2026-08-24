@@ -2145,17 +2145,25 @@ fn check_anonymous_tracker_urls(
     announce_list: &[Vec<String>],
     announce: Option<&str>,
 ) -> Option<String> {
-    let mut bad: Vec<&str> = Vec::new();
+    // Report only scheme://host/path. Private-tracker announce URLs carry
+    // the user's passkey/key as a query parameter; echoing the full URL
+    // into an error that gets logged or printed would leak exactly the
+    // credential we're trying to protect.
+    fn redact(url: &str) -> String {
+        let no_query = url.split(['?', '#']).next().unwrap_or(url);
+        no_query.to_string()
+    }
+    let mut bad: Vec<String> = Vec::new();
     for tier in announce_list {
         for url in tier {
             if url.starts_with("http://") {
-                bad.push(url.as_str());
+                bad.push(redact(url));
             }
         }
     }
     if let Some(u) = announce {
         if u.starts_with("http://") {
-            bad.push(u);
+            bad.push(redact(u));
         }
     }
     if bad.is_empty() {
@@ -2268,6 +2276,29 @@ mod tests {
         let single = "http://fallback.example/announce";
         let msg = check_anonymous_tracker_urls(&tiers, Some(single)).expect("expected refusal");
         assert!(msg.contains(single));
+    }
+
+    #[test]
+    fn anonymous_tracker_check_redacts_passkeys_in_refusal() {
+        // Private trackers carry the user's credential as a query param.
+        // The refusal is an error that gets logged/printed — it must name
+        // the offending tracker without echoing the passkey into logs.
+        let tiers = vec![vec![
+            "http://private.example/a.php?passkey=SECRET123&k=ABCD".into(),
+        ]];
+        let msg =
+            check_anonymous_tracker_urls(&tiers, None).expect("expected refusal");
+        assert!(msg.contains("http://private.example/a.php"));
+        assert!(!msg.contains("SECRET123"), "passkey leaked: {msg}");
+        assert!(!msg.contains("ABCD"), "key leaked: {msg}");
+
+        let msg = check_anonymous_tracker_urls(
+            &Vec::new(),
+            Some("http://frag.example/an#passkey=X"),
+        )
+        .expect("expected refusal");
+        assert!(msg.contains("http://frag.example/an"));
+        assert!(!msg.contains("passkey"), "fragment leaked: {msg}");
     }
 
     #[test]
