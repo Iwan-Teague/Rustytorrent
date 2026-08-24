@@ -105,6 +105,16 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P2 — sub-8 KiB/s rate caps silently stalled all transfers.**
+  [found by adversarial review] Throttle buckets sized capacity at 2 s
+  of burst (rate x 2), but request charges are up to BLOCK_SIZE
+  (16 KiB): any `--max-down`/`--max-up` <= 8 KiB/s produced capacity <
+  block charge, so try_consume refused EVERY block forever — a silent
+  total stall instead of a slow cap. DONE: capacity floored at one
+  max-size block (`throttle_bucket`, used by both download and upload
+  buckets); long-run rate stays honest since refill is unchanged.
+  Test pins one-block admissibility at 1 KiB/s plus rate honesty after
+  ~1 s. Mutation-checked: removing the floor fails the first assert.
 - [x] **P2 — DHT anti-reflection gate had no datagram-path test.** The
   per-IP token bucket was unit-tested at `allow_query_from` level, but
   nothing proved the datagram path consults it (deleting the check in

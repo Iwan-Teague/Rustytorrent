@@ -315,6 +315,19 @@ pub fn dht_wanted(enable_dht: bool, anonymous: bool, proxied: bool, private: boo
 /// UDP-over-proxy transport), this predicate re-tightens contact filtering
 /// to refuse RFC1918/ULA/site-local targets automatically. Callers pass it
 /// into `Dht::spawn`; never hardcode `false` there.
+/// Build a throttle bucket for `rate_bps`. Capacity is 2 s of burst
+/// headroom FLOORED AT ONE MAX-SIZE BLOCK (16 KiB): without the floor,
+/// any rate below 8 KiB/s yields capacity smaller than a single block
+/// charge, and `try_consume` would refuse EVERY transfer forever —
+/// a silent total stall instead of a smooth slow cap.
+fn throttle_bucket(rate_bps: u64) -> TokenBucket {
+    let rate = rate_bps as f64;
+    TokenBucket::new(
+        (rate * 2.0).max(crate::peer::message::BLOCK_SIZE as f64),
+        rate,
+    )
+}
+
 pub fn dht_martian_strict(anonymous: bool, proxied: bool) -> bool {
     anonymous || proxied
 }
@@ -380,16 +393,8 @@ impl TorrentEngine {
             torrent.num_pieces(),
         );
         let picker = Picker::new(torrent.num_pieces());
-        let download_bucket = cfg.max_down_bytes_per_sec.map(|r| {
-            let rate = r as f64;
-            // 2 s of burst headroom so the picker can refill the pipeline
-            // after a brief stall without the cap kicking in.
-            TokenBucket::new(rate * 2.0, rate)
-        });
-        let upload_bucket = cfg.max_up_bytes_per_sec.map(|r| {
-            let rate = r as f64;
-            TokenBucket::new(rate * 2.0, rate)
-        });
+        let download_bucket = cfg.max_down_bytes_per_sec.map(throttle_bucket);
+        let upload_bucket = cfg.max_up_bytes_per_sec.map(throttle_bucket);
         Self {
             torrent: Arc::new(torrent),
             peer_id,
@@ -2391,6 +2396,29 @@ mod tests {
             ..Default::default()
         }
         .martians_strict());
+    }
+
+    #[test]
+    fn throttle_bucket_floors_capacity_at_one_block() {
+        use crate::peer::message::BLOCK_SIZE;
+        // --max-down 1 KiB/s: naive 2 s capacity (2048) is smaller than a
+        // single 16 KiB block charge, which would stall every transfer.
+        let mut b = throttle_bucket(1024);
+        assert!(
+            b.try_consume(BLOCK_SIZE as f64),
+            "one full block must always be admissible"
+        );
+        assert!(
+            !b.try_consume(1.0),
+            "immediately after, the bucket must be drained (rate still honored)"
+        );
+        // Long-run rate stays honest: after one second only ~1 KiB + floor
+        // logic must not grant another block instantly.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(
+            !b.try_consume(BLOCK_SIZE as f64),
+            "1 KiB/s must not fund a block in 1s"
+        );
     }
 
     #[test]
