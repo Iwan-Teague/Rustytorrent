@@ -105,6 +105,23 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P2 — no martian re-check at the dial syscall (defense in
+  depth).** [review finding] Screening lived only at peer INGESTION
+  (tracker/DHT/PEX); anything reaching a dial through a future
+  unfiltered path would go straight to connect(). DONE:
+  `util::is_safe_dial_target(addr, strict)` applied inside BOTH dial
+  primitives (`peer/connection.rs::dial_tcp`, `metadata_fetch::dial`),
+  strictness derived per-dial from `anonymous || proxied` via
+  `dht_martian_strict`. One deliberate divergence from ingestion:
+  LOOPBACK is exempt — multi-instance local peering (`--peer`,
+  `seed_peers`) dials 127.0.0.1 by design and ingested loopback is
+  already refused upstream. Tests: link-local metadata target refused
+  even clearnet (fast-fail before the connect timeout), LAN refused
+  under proxied sessions BEFORE the SOCKS5 chain attempt with a
+  clearnet control proving non-strict behavior unchanged, loopback
+  exemption proven both by dedicated asserts and by every existing
+  loopback e2e staying green. Mutation-checked: removing the screen
+  makes the metadata test fail on a 10 s timeout instead of refusal.
 - [x] **P1 — DHT/web martian filters hardcoded strict=false (implicit
   coupling with anonymity gating).** [review finding] Safe only while
   `dht_wanted()` forbids DHT under anon/proxy; if that gating ever

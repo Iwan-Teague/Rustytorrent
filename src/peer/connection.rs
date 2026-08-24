@@ -520,6 +520,17 @@ async fn dial_tcp(
             "anonymous mode requires a SOCKS5 proxy; refusing direct dial".into(),
         ));
     }
+    // Belt-and-braces martian screen at the syscall boundary. Ingestion
+    // (tracker/DHT/PEX) filters per-source with session strictness; this
+    // re-check refuses anything that ever reaches a dial through a future
+    // unfiltered path. Loopback stays allowed for local multi-instance
+    // peering (see util::is_safe_dial_target).
+    let martian_strict = crate::engine::dht_martian_strict(anonymous, !proxies.is_empty());
+    if !crate::util::is_safe_dial_target(&addr, martian_strict) {
+        return Err(Error::Network(format!(
+            "refusing martian dial target {addr} (strict={martian_strict})"
+        )));
+    }
     if !proxies.is_empty() {
         // Through a SOCKS5 chain: we connect to the first hop's IP, not
         // the peer's. With --bind-iface set, the FIRST hop's TCP dial
@@ -1273,6 +1284,53 @@ mod tests {
         // regression removes the anon guard, the first assertion above
         // fails instead of silently passing.
         let _stream = dial_tcp(addr, &[], None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dial_tcp_refuses_link_local_metadata_target_even_clearnet() {
+        // The invariant half of the dial-time screen: link-local metadata
+        // endpoints are never legitimate peer targets, anonymous or not.
+        let addr: SocketAddr = "169.254.169.254:80".parse().unwrap();
+        let err = dial_tcp(addr, &[], None, false)
+            .await
+            .expect_err("metadata endpoint must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refusing martian dial target") && msg.contains("169.254.169.254"),
+            "expected martian refusal, got: {msg}"
+        );
+        // And it must fail FAST — before any 10 s connect timeout.
+        assert!(msg.contains("strict=false"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn dial_tcp_strict_refuses_lan_target_when_proxied() {
+        // Session-strict half: with a proxy configured (proxied session),
+        // LAN targets are refused too — and the refusal must fire BEFORE
+        // the SOCKS5 chain is attempted (error text discriminates).
+        let addr: SocketAddr = "192.168.1.5:6881".parse().unwrap();
+        let proxies = vec![ProxyConfig {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            credentials: None,
+            isolation: false,
+        }];
+        let err = dial_tcp(addr, &proxies, None, false)
+            .await
+            .expect_err("LAN target must be refused in a proxied session");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refusing martian dial target") && msg.contains("strict=true"),
+            "expected strict martian refusal before the chain dial, got: {msg}"
+        );
+
+        // Control: the same target on a clearnet session passes the
+        // screen and fails later at actual connect (different error).
+        let err2 = dial_tcp(addr, &[], None, false).await.unwrap_err();
+        let msg2 = format!("{err2}");
+        assert!(
+            !msg2.contains("refusing martian dial target"),
+            "clearnet session must not apply strict screening: {msg2}"
+        );
     }
 
     #[test]
