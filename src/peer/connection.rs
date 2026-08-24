@@ -379,13 +379,22 @@ async fn connect_transport(
     bind_iface: Option<&str>,
     anonymous: bool,
 ) -> Result<Transport> {
-    let use_utp = proxies.is_empty() && bind_iface.is_none();
+    let use_utp = should_use_utp(proxies.is_empty(), bind_iface.is_some(), anonymous);
     let transport = match (use_utp, utp) {
         (true, Some(utp)) => race_tcp_utp(addr, utp, proxies, bind_iface, anonymous).await?,
         _ => Transport::Tcp(dial_tcp(addr, proxies, bind_iface, anonymous).await?),
     };
     transport.set_nodelay();
     Ok(transport)
+}
+
+/// Whether the uTP leg may race the TCP dial. µTP is raw UDP: it can't
+/// ride a SOCKS5 CONNECT and isn't interface-bound, so any of proxy
+/// chain / `--bind-iface` / anonymous mode forbids it. `anonymous` is
+/// checked here — not just at engine socket creation — so this stays
+/// true even if a future caller hands us a µTP socket while anonymous.
+fn should_use_utp(proxies_empty: bool, bind_iface_set: bool, anonymous: bool) -> bool {
+    proxies_empty && !bind_iface_set && !anonymous
 }
 
 /// Race a TCP dial against a µTP dial. Returns the first transport to
@@ -1142,5 +1151,16 @@ mod tests {
         // regression removes the anon guard, the first assertion above
         // fails instead of silently passing.
         let _stream = dial_tcp(addr, &[], None, false).await.unwrap();
+    }
+
+    #[test]
+    fn should_use_utp_covers_anonymous() {
+        // Truth table: µTP (raw UDP, no proxy support, no iface binding)
+        // is only allowed with no proxy chain, no --bind-iface, and
+        // anonymous mode OFF. Any single condition forbids it.
+        assert!(!should_use_utp(true, false, true), "anonymous forbids uTP");
+        assert!(should_use_utp(true, false, false));
+        assert!(!should_use_utp(false, false, false), "proxies forbid uTP");
+        assert!(!should_use_utp(true, true, false), "bind-iface forbids uTP");
     }
 }
