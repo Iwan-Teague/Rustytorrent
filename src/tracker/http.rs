@@ -23,9 +23,38 @@ use crate::tracker::{AnnounceRequest, AnnounceResponse};
 /// when the tunnel drops. The IP is part of the cache key because the
 /// binding lives on the client, not the request; within one process run
 /// it never changes, so the map stays tiny.
+/// Announces carry identity material in the query string — info-hash,
+/// peer-id, and for private trackers the passkey. reqwest's default policy
+/// follows redirects across hosts, so a hostile (or MITM'd) tracker could
+/// 302 the announce to an attacker URL and harvest all of it, even though
+/// the redirect still rides our proxy. Restrict following to same-host
+/// redirects only: every hop must target the host of the ORIGINAL request
+/// (`previous().first()`), which also forbids scheme changes like a forced
+/// http→https downgrade to a different port. Same-host hops stay allowed,
+/// since some trackers genuinely round-robin between their own mirrors.
+fn same_host_redirect_policy() -> reqwest::redirect::Policy {
+    const MAX_HOPS: usize = 10;
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= MAX_HOPS {
+            return attempt.error("too many redirects");
+        }
+        let Some(first) = attempt.previous().first() else {
+            return attempt.follow();
+        };
+        let origin = || (first.host_str(), first.port_or_known_default());
+        let next = || (attempt.url().host_str(), attempt.url().port_or_known_default());
+        if origin() == next() {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 fn build_direct_client(local_ip: Option<IpAddr>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(same_host_redirect_policy())
         .user_agent(concat!("rustytorrent/", env!("CARGO_PKG_VERSION")));
     if let Some(ip) = local_ip {
         builder = builder.local_address(ip);
@@ -54,6 +83,7 @@ fn build_proxied_client(proxy_url: &str, local_ip: Option<IpAddr>) -> reqwest::C
         reqwest::Proxy::all(proxy_url).expect("malformed SOCKS5 proxy URL — validated upstream");
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(same_host_redirect_policy())
         .user_agent(concat!("rustytorrent/", env!("CARGO_PKG_VERSION")));
     // Bind the socket TO THE PROXY to the kill-switch interface — same
     // invariant as the peer/magnet first-hop dials: if the tunnel drops,
@@ -674,6 +704,101 @@ mod tests {
             let _ = sock.shutdown().await;
         });
         (addr, rx)
+    }
+
+    /// Raw-TCP fake tracker that answers each request based on its path:
+    /// - `redirect_from` gets "HTTP/1.1 302 Found" pointing at `location`
+    ///   (and bumps `hits`), everything else gets a valid bencode reply.
+    /// Accepts in a loop so redirect chains can hit it repeatedly.
+    async fn spawn_path_server(
+        redirect_from: &'static str,
+        location: String,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let hits = hits.clone();
+                let location = location.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("");
+                    let resp = if path.starts_with(redirect_from) {
+                        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    } else {
+                        let body = b"d8:intervali900e5:peers0:e";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        ) + std::str::from_utf8(body).unwrap()
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn announce_follows_same_host_redirect() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = spawn_path_server(
+            "/redirect-me",
+            format!("/announce"),
+            hits.clone(),
+        )
+        .await;
+        let url = format!("http://{addr}/redirect-me");
+        announce_with_proxy_anon(&url, &dummy_req(), None, false, None)
+            .await
+            .expect("same-host redirect should be followed to a valid response");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "redirect target must have been requested exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn announce_cross_host_redirect_not_followed() {
+        let evil_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let evil_addr =
+            spawn_path_server("/announce", format!("/stolen"), evil_hits.clone()).await;
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = spawn_path_server(
+            "/announce",
+            format!("http://{evil_addr}/announce?passkey=X"),
+            hits.clone(),
+        )
+        .await;
+
+        let url = format!("http://{addr}/announce?passkey=SECRET123");
+        let err = announce_with_proxy_anon(&url, &dummy_req(), None, false, None)
+            .await
+            .expect_err("cross-host redirect must not be followed");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("SECRET123") && !msg.contains("passkey="),
+            "refusal must not leak the announce query: {msg}"
+        );
+        assert_eq!(
+            evil_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the cross-host target must never be contacted"
+        );
+        // The origin served the 302 exactly once; nothing beyond it.
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     fn dummy_req() -> AnnounceRequest {
