@@ -84,9 +84,14 @@ pub async fn announce_with_proxy_anon(
     anonymous: bool,
 ) -> Result<AnnounceResponse> {
     if url.starts_with("udp://") {
-        if proxy.is_some() {
+        if anonymous || proxy.is_some() {
+            // Fail closed: UDP cannot ride the SOCKS5 CONNECT path, so
+            // under anonymous mode a udp:// announce would egress the
+            // real interface and leak our IP. Refuse outright — even
+            // when no proxy is configured (an upstream gate could be
+            // bypassed; this is the last line of defense).
             return Err(crate::error::Error::Tracker(format!(
-                "skipping UDP tracker while proxy is configured: {url}"
+                "skipping UDP tracker while proxy is configured or anonymous mode is on: {url}"
             )));
         }
         udp::announce(url, req).await
@@ -143,4 +148,54 @@ pub async fn announce_with_fallback_anon(
         }
     }
     Err(last_err.unwrap_or_else(|| crate::error::Error::Tracker("no trackers configured".into())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req() -> AnnounceRequest {
+        AnnounceRequest {
+            info_hash: [7u8; 20],
+            peer_id: crate::peer_id::generate(),
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            event: Event::Started,
+            num_want: 50,
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_announce_refused_in_anonymous_mode_even_without_proxy() {
+        // Host is deliberately unresolvable (.invalid TLD): the guard
+        // must fire BEFORE any DNS or socket work, so the error is the
+        // anonymity refusal — not a dns failure.
+        let err = announce_with_proxy_anon("udp://anon-guard-test.invalid:80", &req(), None, true)
+            .await
+            .expect_err("anonymous UDP announce must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("skipping UDP tracker") && msg.contains("anonymous"),
+            "expected anonymity refusal, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_announce_guard_does_not_fire_without_anon_or_proxy() {
+        // Mutation-sensitivity control: identical call with anonymous
+        // OFF must get PAST the guard (it then fails on the bogus host
+        // with some other error). If the guard ever widens to refuse
+        // all UDP announces, this test catches it.
+        let err =
+            announce_with_proxy_anon("udp://anon-guard-test.invalid:80", &req(), None, false)
+                .await
+                .expect_err("bogus host should fail somehow");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("skipping UDP tracker"),
+            "guard fired without anon/proxy: {msg}"
+        );
+    }
 }
