@@ -302,6 +302,17 @@ fn dht_wanted(enable_dht: bool, anonymous: bool, proxied: bool, private: bool) -
     enable_dht && !anonymous && !proxied && !private
 }
 
+/// Whether this session may open an inbound peer listener. A direct inbound
+/// TCP connection arrives over the real network path — it exposes the real
+/// IP to whoever connects and ties it to the info-hash via the completed
+/// handshake. Under a proxy chain that is exactly the mixed-mode leak the
+/// proxy was meant to prevent (same reasoning as `dht_wanted`), so the
+/// listener is off whenever DHT-style UDP egress would be off for
+/// anonymity reasons.
+fn inbound_wanted(anonymous: bool, proxied: bool) -> bool {
+    !anonymous && !proxied
+}
+
 impl TorrentEngine {
     pub fn new(torrent: TorrentFile, peer_id: PeerId, cfg: EngineConfig) -> Self {
         let pm = PieceManager::new(
@@ -501,7 +512,12 @@ impl TorrentEngine {
         // --bind-iface no longer disables DHT: its UDP socket is now
         // pinned to the interface (see Dht::spawn / netbind), so it fails
         // closed with the rest of the kill switch instead of leaking.
-        let dht_enabled = self.cfg.enable_dht && !self.cfg.anonymous && !private;
+        let dht_enabled = dht_wanted(
+            self.cfg.enable_dht,
+            self.cfg.anonymous,
+            !self.cfg.proxies.is_empty(),
+            private,
+        );
         crate::peer::handshake::set_extension_bytes(crate::peer::handshake::extension_bytes_from(
             dht_enabled,
             true,
@@ -611,7 +627,16 @@ impl TorrentEngine {
                     }
                 });
             }
-            let listener_handle = if self.cfg.anonymous {
+            let listener_handle = if !inbound_wanted(
+                self.cfg.anonymous,
+                !self.cfg.proxies.is_empty(),
+            ) {
+                if !self.cfg.anonymous {
+                    tracing::info!(
+                        target: "engine",
+                        "proxy configured: incoming listener disabled (direct inbound would bypass the proxy and expose the real IP)"
+                    );
+                }
                 drop(incoming_tx);
                 None
             } else {
@@ -2219,6 +2244,20 @@ mod tests {
             "proxied session forbids direct-UDP DHT (real-IP leak, linkable identity)"
         );
         assert!(!dht_wanted(true, false, false, true), "private forbids DHT");
+    }
+
+    #[test]
+    fn inbound_wanted_truth_table() {
+        // Plain clearnet session: listener allowed.
+        assert!(inbound_wanted(false, false));
+        // Anonymous: no inbound at all.
+        assert!(!inbound_wanted(true, false), "anonymous forbids inbound");
+        // Proxied but not anonymous: direct inbound would bypass the proxy
+        // and expose the real IP — same mixed-mode hole as DHT.
+        assert!(
+            !inbound_wanted(false, true),
+            "proxied session must not accept direct inbound"
+        );
     }
 
     #[test]
