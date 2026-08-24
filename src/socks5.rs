@@ -42,7 +42,7 @@ const REP_SUCCEEDED: u8 = 0x00;
 
 /// Proxy configuration shared across all outgoing peer dials in a session.
 /// Cheaply cloneable.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProxyConfig {
     /// Where the SOCKS5 server listens. Resolved IP, not a host name; if the
     /// user supplied a hostname we resolve it once at startup so we don't
@@ -85,10 +85,30 @@ impl ProxyConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Credentials {
     pub username: String,
     pub password: String,
+}
+
+// Manual `Debug` impls: the derived forms would print proxy passwords in
+// cleartext anywhere a `{:?}` lands — tracing lines, panic messages, error
+// context. Credentials are opaque ("Credentials { .. }"); `ProxyConfig`
+// keeps only its non-secret fields readable so dial debugging still works.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Credentials { .. }")
+    }
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("addr", &self.addr)
+            .field("credentials", &self.credentials)
+            .field("isolation", &self.isolation)
+            .finish()
+    }
 }
 
 impl ProxyConfig {
@@ -877,5 +897,39 @@ mod tests {
             other => panic!("expected Refused(0x05), got {other:?}"),
         }
         server.await.unwrap();
+    }
+
+    #[test]
+    fn debug_output_never_contains_credentials() {
+        let secret_user = "alice-secret-account".to_string();
+        let secret_pass = "hunter2-super-secret".to_string();
+        let cfg = ProxyConfig {
+            addr: "10.0.0.1:1080".parse().unwrap(),
+            credentials: Some(Credentials {
+                username: secret_user.clone(),
+                password: secret_pass.clone(),
+            }),
+            isolation: true,
+        };
+
+        let cfg_dbg = format!("{cfg:?}");
+        assert!(!cfg_dbg.contains(&secret_pass), "password leaked: {cfg_dbg}");
+        assert!(
+            !cfg_dbg.contains(&secret_user),
+            "username leaked: {cfg_dbg}"
+        );
+        // Non-secret fields stay readable for dial debugging.
+        assert!(cfg_dbg.contains("10.0.0.1:1080"));
+        assert!(cfg_dbg.contains("isolation: true"));
+
+        let creds_dbg = format!("{:?}", cfg.credentials.as_ref().unwrap());
+        assert!(!creds_dbg.contains(&secret_pass));
+        assert!(!creds_dbg.contains(&secret_user));
+
+        // The URL form is intentionally credential-bearing (reqwest needs
+        // it); just pin its shape so a future refactor can't silently
+        // change the scheme away from socks5h remote-DNS.
+        let url = cfg.as_socks5h_url();
+        assert!(url.starts_with("socks5h://") && url.ends_with("@10.0.0.1:1080"));
     }
 }
