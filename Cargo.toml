@@ -18,7 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand         = "0.8"
 num-bigint   = "0.4"
 num-traits   = "0.2"
-lru          = "0.12"
+lru          = "0.18"
 zeroize      = { version = "1.8", features = ["derive"] }  # wipe crypto secrets on drop
 subtle       = "2"                                          # constant-time byte comparisons
 socket2      = "0.6"                                        # interface-binding for VPN kill switch
