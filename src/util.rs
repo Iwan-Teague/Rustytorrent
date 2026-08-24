@@ -139,6 +139,10 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
             // ANY 0.x.y.z dial locally — a hostile peer source can smuggle a
             // loopback probe past `is_unspecified()` as 0.0.0.1.
             let this_network = o[0] == 0;
+            // RFC 6890 "IETF protocol assignments" 192.0.0.0/24: PCP/NAT-PMP
+            // anycast relays and similar protocol endpoints live here — a
+            // dial reaches infrastructure gateways, never a swarm peer.
+            let ietf_protocols = o[0] == 192 && o[1] == 0 && o[2] == 0;
             !(v4.is_broadcast()
                 || v4.is_link_local()
                 || cgnat
@@ -146,6 +150,7 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
                 || v4.is_documentation()
                 || reserved
                 || this_network
+                || ietf_protocols
                 || (strict && v4.is_private()))
         }
         IpAddr::V6(v6) => {
@@ -341,6 +346,20 @@ mod tests {
         }
         // 1.0.0.x is public APNIC space and must stay dialable.
         let addr: SocketAddr = "1.0.0.1:51413".parse().unwrap();
+        assert!(is_dialable_peer_addr(&addr, false));
+    }
+
+    #[test]
+    fn ietf_protocol_assignment_addrs_are_never_dialable() {
+        // RFC 6890 IETF protocol assignments (192.0.0.0/24): PCP/NAT-PMP
+        // anycast and friends — infrastructure gateways, not peers.
+        for a in ["192.0.0.1:6881", "192.0.0.10:443"] {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert!(!is_dialable_peer_addr(&addr, false), "{a} clearnet");
+            assert!(!is_dialable_peer_addr(&addr, true), "{a} strict");
+        }
+        // Public control: outside every special-purpose block.
+        let addr: SocketAddr = "8.8.8.8:51413".parse().unwrap();
         assert!(is_dialable_peer_addr(&addr, false));
     }
 
