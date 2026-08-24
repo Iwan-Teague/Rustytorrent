@@ -105,6 +105,13 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P2 — `create` accepted zero-length inputs, writing unloadable
+  torrents.** Empty files (or directories containing only empty files)
+  produced zero piece hashes — metainfo our own loader rejects
+  (`total_length == 0`) and other clients treat as degenerate.
+  DONE: refused up front with an explicit error; empty DIRECTORY was
+  already rejected, empty FILE / all-empty dir now too. Two tests;
+  mutation-checked by removing the guard.
 - [x] **P2 — `--port 0` advertised port=0 to trackers while a live
   listener existed.** [found by adversarial review] The engine bound the
   OS-assigned ephemeral port but never wrote it back into the session

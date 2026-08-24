@@ -95,6 +95,19 @@ pub fn create_torrent(
         )));
     };
 
+    // Zero-length input (an empty file, or a directory containing only
+    // empty files) would produce ZERO piece hashes — a metainfo our own
+    // loader rejects (total_length == 0) and other clients treat as
+    // degenerate. Refuse up front instead of writing an unloadable
+    // .torrent.
+    let total_length: u64 = files.iter().map(|f| f.length).sum();
+    if total_length == 0 {
+        return Err(Error::Bencode(format!(
+            "{} has zero total length; torrents of empty data are not representable",
+            input.display()
+        )));
+    }
+
     // Hash the concatenated stream of all files in order, in
     // piece_length chunks. The final piece may be short.
     let pieces = hash_pieces(&files, piece_length)?;
@@ -333,6 +346,32 @@ mod tests {
         let file = dir.join("z.bin");
         std::fs::write(&file, b"x").unwrap();
         assert!(create_torrent(&file, &[], 0, None, false).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_empty_file() {
+        let dir = scratch();
+        let file = dir.join("empty.bin");
+        std::fs::write(&file, b"").unwrap();
+        let err =
+            create_torrent(&file, &[], 16384, None, false).expect_err("empty file must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("zero total length"), "{msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_directory_containing_only_empty_files() {
+        let dir = scratch();
+        let sub = dir.join("payload");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.bin"), b"").unwrap();
+        std::fs::write(sub.join("b.bin"), b"").unwrap();
+        let err = create_torrent(&dir, &[], 16384, None, false)
+            .expect_err("all-empty directory must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("zero total length"), "{msg}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
