@@ -164,6 +164,26 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 2. Privacy & anonymity
 
+- [x] **P1 — tracker-privacy audit: UDP announce + peer_id in anon
+  mode.** [verified this pass] (1) `udp://` announces are refused
+  BEFORE any DNS/socket work whenever anonymous OR a proxy is
+  configured (`tracker/mod.rs` dispatcher — the only caller of
+  `udp::announce`; engine/magnet paths all thread the anon flag, and
+  the clearnet-only `peers` subcommand is the sole exception by
+  design). Dispatcher unit tests prove refusal-by-error; NEW kernel-
+  level proof added to `tests/anon_mode_sockets.rs`: an anonymous
+  engine with a `udp://` tracker baked into its metainfo (trackers
+  ENABLED) still owns zero UDP sockets beyond the test's own sink.
+  The sink targets a silent local socket because loopback ICMP-
+  unreachable fails attempts in microseconds — faster than any /proc
+  sample; a real attempt holds its ephemeral socket through the 15 s
+  retry backoff. Mutation-checked: disabling the guard fails with the
+  leaked socket named. Audits serialized via a process lock (their own
+  helper sockets would otherwise cross-contaminate snapshots).
+  (2) peer_id: anonymous sessions use EPHEMERAL libtorrent-lookalike
+  ids (`-LT2090-`, random tail, never persisted, rotated per
+  reannounce); the stable persisted `-RT0100-` identity never leaves
+  clearnet sessions — no client-version fingerprint leak.
 - [x] **P1 — DHT direct-UDP leak audit: every spawn site fail-closed.**
   [DONE] Audited all three `Dht::spawn` call sites for anon/proxy gating.
   (1) Engine: gated by `dht_wanted(enable_dht, anonymous, proxied,
