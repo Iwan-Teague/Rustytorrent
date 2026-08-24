@@ -1038,6 +1038,9 @@ where
                                 PeerCommand::HaveAll => Message::HaveAll.encode(),
                                 PeerCommand::HaveNone => Message::HaveNone.encode(),
                             };
+                            if std::env::var("RT_W2").is_ok() {
+                                eprintln!("DBG wrote id={:?}", bytes.get(4));
+                            }
                             timeout(WRITE_STALL_TIMEOUT, writer.write_all(&bytes))
                                 .await
                                 .map_err(|_| write_stall_error())?

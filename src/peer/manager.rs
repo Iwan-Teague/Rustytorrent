@@ -454,6 +454,21 @@ impl PeerManager {
 mod tests {
     use super::*;
 
+    /// Ban must also gate FUTURE dials: try_connect_many silently skips
+    /// addresses whose IP is on the ban list (a banned peer that reconnects
+    /// would otherwise be re-admitted). Mutation-checked: disabling the
+    /// ban-list check in try_connect_many fails this test.
+    #[test]
+    fn banned_ip_is_skipped_by_try_connect_many() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut m = PeerManager::new([0u8; 20], [0u8; 20], tx);
+        let addr: SocketAddr = "10.0.0.9:6881".parse().unwrap();
+        m.ban(addr.ip());
+        let started = m.try_connect_many([addr]);
+        assert_eq!(started, 0, "banned IP must be skipped");
+        assert_eq!(m.connected_count(), 0);
+    }
+
     #[tokio::test]
     async fn ban_drops_existing_peer() {
         let (tx, _rx) = mpsc::channel(16);

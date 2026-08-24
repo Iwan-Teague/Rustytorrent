@@ -105,6 +105,20 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P2 — ban-list re-dial refusal untested at the manager level.**
+  try_connect_many's skip of banned IPs (the "poisoned peer reconnects"
+  path) had no coverage; mutation-checked that disabling the ban-list
+  check fails the new pin.
+- [ ] **OPEN (parked, needs investigation): post-ban socket lifetime.**
+  While building a poisoned-block e2e, evidence showed `peers.ban()` /
+  drop_peer aborts the OUTER peer task but the independently spawned
+  inner read task survives holding the reader half — potentially keeping
+  a banned peer's TCP connection half-open for up to READ_IDLE_TIMEOUT
+  (300 s) and delaying PeerEvent::Disconnected indefinitely. An e2e
+  poisoned-block test was written but parked: it also exposed harness
+  complexity (loopback seeder+attacker share an IP, so banning one bans
+  both; PIECE frame header is 8 bytes not 12). Needs: inner-task abort
+  or read_done_rx-driven cleanup on drop_peer, then re-land the e2e.
 - [x] **P2 — `create` accepted zero-length inputs, writing unloadable
   torrents.** Empty files (or directories containing only empty files)
   produced zero piece hashes — metainfo our own loader rejects
