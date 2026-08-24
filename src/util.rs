@@ -142,7 +142,16 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
                 || reserved
                 || (strict && v4.is_private()))
         }
-        IpAddr::V6(v6) => !v6.is_unicast_link_local() && !(strict && v6.is_unique_local()),
+        IpAddr::V6(v6) => {
+            // RFC 6052 NAT64 synthesis prefix 64:ff9b::/96: dialing such an
+            // address targets the local network's NAT64 gateway, which
+            // translates the embedded IPv4 host on ITS side — a hostile peer
+            // source could use it to probe v4-only hosts behind that gateway.
+            // No legitimate swarm contact is announced under this prefix.
+            let segs = v6.segments();
+            let nat64 = segs[0] == 0x64 && segs[1] == 0xff9b && segs[2] == 0 && segs[3] == 0;
+            !nat64 && !v6.is_unicast_link_local() && !(strict && v6.is_unique_local())
+        }
     }
 }
 
@@ -244,6 +253,25 @@ mod tests {
         let addr: SocketAddr = "[::ffff:93.184.215.14]:51413".parse().unwrap();
         assert!(is_dialable_peer_addr(&addr, false));
         assert!(is_dialable_peer_addr(&addr, true));
+    }
+
+    #[test]
+    fn nat64_synthesized_addrs_are_never_dialable() {
+        // 64:ff9b::/96 (RFC 6052): dialing goes to the local network's NAT64
+        // gateway, which translates the embedded v4 host on its side.
+        let nat64 = [
+            "[64:ff9b::127.0.0.1]:6881",
+            "[64:ff9b::169.254.169.254]:80",
+            "[64:ff9b::93.184.215.14]:51413",
+        ];
+        for a in nat64 {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert!(!is_dialable_peer_addr(&addr, false), "{a} clearnet");
+            assert!(!is_dialable_peer_addr(&addr, true), "{a} strict");
+        }
+        // Ordinary global v6 stays dialable.
+        let addr: SocketAddr = "[2606:4700:4700::1111]:51413".parse().unwrap();
+        assert!(is_dialable_peer_addr(&addr, false));
     }
 
     #[cfg(unix)]
