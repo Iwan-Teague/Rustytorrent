@@ -706,6 +706,21 @@ impl TorrentEngine {
             } else {
                 match bind_dual_stack_listener(self.cfg.listen_port) {
                     Ok(l) => {
+                        // Resolve `--port 0`: the kernel picked an ephemeral
+                        // port, so adopt it as THE session port. Otherwise
+                        // every announce would advertise port=0 ("I have no
+                        // listener") while a live seeder socket actually
+                        // exists — silently breaking passive discovery.
+                        if let Ok(local) = l.local_addr() {
+                            if self.cfg.listen_port == 0 {
+                                self.cfg.listen_port = local.port();
+                                tracing::info!(
+                                    target: "engine",
+                                    port = local.port(),
+                                    "--port 0 resolved to ephemeral port"
+                                );
+                            }
+                        }
                         tracing::info!(
                             target: "engine",
                             port = self.cfg.listen_port,

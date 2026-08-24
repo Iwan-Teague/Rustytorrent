@@ -105,6 +105,17 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P2 — `--port 0` advertised port=0 to trackers while a live
+  listener existed.** [found by adversarial review] The engine bound the
+  OS-assigned ephemeral port but never wrote it back into the session
+  config, so announces carried the protocol's "I have no listener"
+  placeholder — passive discovery silently broken for anyone using the
+  standard pick-a-random-port convention. DONE: the bound port is
+  resolved into cfg.listen_port at bind time (DHT spawn and every later
+  announce inherit it). tests/port_zero_announce.rs: scripted HTTP
+  tracker captures the announced port= and asserts it is non-zero AND
+  reachable via a full BT handshake round-trip. Mutation-checked:
+  reverting the capture advertises 0 and fails.
 - [x] **P2 — `--max-down 0` / `--max-up 0` stalled all transfers
   (doc-vs-code divergence).** Both flags' help text promised "Unset or
   0 = unthrottled", but Some(0) flowed straight into a rate-0 token
