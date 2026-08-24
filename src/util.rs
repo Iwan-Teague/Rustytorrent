@@ -109,6 +109,29 @@ pub fn is_dialable_peer_addr(addr: &SocketAddr, strict: bool) -> bool {
     is_dialable_ip(&addr.ip(), strict)
 }
 
+/// Last-line-of-defense screen applied AT THE DIAL SYSCALL, independent
+/// of which source produced the address. Peer ingestion (tracker/DHT/PEX
+/// responses) applies this policy per-source with session-derived
+/// strictness; this re-check catches anything that ever reaches a dial
+/// through a future unfiltered path.
+///
+/// One deliberate divergence from [`is_dialable_peer_addr`]: LOOPBACK is
+/// allowed here. Multi-instance local peering (`--peer`, engine
+/// `seed_peers`) dials 127.0.0.1 by design; ingested loopback contacts
+/// are already refused upstream, and dialing our own machine exposes
+/// nothing a remote actor doesn't already have.
+///
+/// Strictness mirrors ingestion: `strict = anonymous || proxied`,
+/// derived by the caller (see `engine::dht_martian_strict`) so LAN/ULA
+/// targets are additionally refused whenever the session runs behind an
+/// anonymity tunnel.
+pub fn is_safe_dial_target(addr: &SocketAddr, strict: bool) -> bool {
+    if addr.ip().is_loopback() {
+        return true;
+    }
+    is_dialable_peer_addr(addr, strict)
+}
+
 fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
     // IPv4-mapped IPv6 (::ffff:a.b.c.d) must be judged by the IPv4 rules:
     // the kernel dials such addresses as plain IPv4, while Ipv6Addr predicates
@@ -539,5 +562,46 @@ mod tests {
         assert_eq!(mode_of(&path) & 0o777, 0o600);
         assert_eq!(std::fs::read(&path).unwrap(), b"secret");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn safe_dial_target_refuses_invariant_martians_but_allows_loopback() {
+        let p = |s: &str| s.parse::<SocketAddr>().unwrap();
+        // Loopback exemption: local multi-instance peering dials loopback
+        // via --peer / seed_peers, in both modes.
+        assert!(is_safe_dial_target(&p("127.0.0.1:6881"), false));
+        assert!(is_safe_dial_target(&p("127.0.0.1:6881"), true));
+        assert!(is_safe_dial_target(&p("[::1]:6881"), true));
+
+        // Invariant martians — refused regardless of strictness.
+        let refused_both = [
+            "169.254.169.254:80",        // link-local metadata endpoint
+            "0.0.0.1:6881",              // this-network smuggle
+            "192.0.2.50:443",            // documentation range
+            "100.64.1.1:6881",           // CGNAT
+            "[fe80::1]:6881",            // link-local v6
+            "[64:ff9b::5d38:d70e]:6881", // NAT64 synthesis
+        ];
+        for bad in refused_both {
+            assert!(
+                !is_safe_dial_target(&p(bad), false),
+                "{bad} must be refused even non-strict"
+            );
+            assert!(
+                !is_safe_dial_target(&p(bad), true),
+                "{bad} must be refused strict"
+            );
+        }
+
+        // Session-strict extras — LAN/ULA refused only when strict.
+        let lan = ["192.168.1.50:51413", "10.0.0.7:6881", "[fd00::5]:6881"];
+        for addr in lan {
+            let a = p(addr);
+            assert!(is_safe_dial_target(&a, false), "{addr} allowed on clearnet");
+            assert!(
+                !is_safe_dial_target(&a, true),
+                "{addr} refused under anonymity"
+            );
+        }
     }
 }

@@ -506,6 +506,14 @@ async fn dial(
             "magnet bootstrap: anonymous mode requires --socks5; refusing direct dial".into(),
         ));
     }
+    // Same belt-and-braces martian screen as the engine's dial_tcp:
+    // ingestion filters per-source; this is the last line at the syscall.
+    let martian_strict = crate::engine::dht_martian_strict(anonymous, !proxies.is_empty());
+    if !crate::util::is_safe_dial_target(&addr, martian_strict) {
+        return Err(Error::Network(format!(
+            "refusing martian dial target {addr} (strict={martian_strict})"
+        )));
+    }
     if !proxies.is_empty() {
         // Per-hop materialization so Tor stream isolation refreshes the
         // SOCKS5 username for this dial; non-isolated hops are cloned
@@ -630,6 +638,31 @@ mod tests {
         assert!(
             msg.contains("failed"),
             "expected exhausted-attempts error, got: {msg}"
+        );
+    }
+    #[tokio::test]
+    async fn metadata_dial_refuses_martian_target() {
+        // Belt-and-braces screen on the magnet bootstrap dial: the
+        // link-local metadata endpoint is refused before any socket work,
+        // clearnet or not.
+        let addr: SocketAddr = "169.254.169.254:80".parse().unwrap();
+        let err = dial(addr, &[], false, None)
+            .await
+            .expect_err("martian target must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refusing martian dial target"),
+            "expected martian refusal, got: {msg}"
+        );
+
+        // Loopback exemption still holds for local bootstrap setups.
+        let ok = dial("127.0.0.1:1".parse().unwrap(), &[], false, None)
+            .await
+            .unwrap_err();
+        let msg2 = format!("{ok}");
+        assert!(
+            msg2.contains("connect 127.0.0.1:1"),
+            "loopback must pass the screen and fail at connect instead, got: {msg2}"
         );
     }
 }
