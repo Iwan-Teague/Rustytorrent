@@ -155,6 +155,11 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
             // source could use it to probe v4-only hosts behind that gateway.
             let segs = v6.segments();
             let nat64 = segs[0] == 0x64 && segs[1] == 0xff9b && segs[2] == 0 && segs[3] == 0;
+            // RFC 8215 local-use NAT64 (64:ff9b:1::/48): same translation
+            // trick as the well-known prefix, scoped to a site's own NAT64
+            // translator — the embedded v4 host is dialed on ITS side, so it
+            // is just as unusable as a swarm contact.
+            let nat64_local_use = segs[0] == 0x64 && segs[1] == 0xff9b && segs[2] == 1;
             // Same class of transition-mechanism addresses: RFC 3056 6to4
             // (2002::/16, embedded v4 routed via a relay gateway) and RFC
             // 4380 Teredo (2001:0::/32, tunnel endpoints behind relays).
@@ -162,13 +167,18 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
             // choose; no legitimate swarm contact is announced under them.
             let six_to_four = segs[0] == 0x2002;
             let teredo = segs[0] == 0x2001 && segs[1] == 0x0000;
+            // RFC 3849 documentation block 2001:db8::/32: reserved for
+            // examples and never announced by a real swarm peer.
+            let doc6 = segs[0] == 0x2001 && segs[1] == 0x0db8;
             // The IPv6 "unspecified prefix" block (::/128 minus :: itself,
             // RFC 4291): ::2 and friends are reserved, and Linux dials them
             // as local addresses just like 0.0.0.0/8 in v4.
             let zeronet6 = segs[..7].iter().all(|&s| s == 0);
             !nat64
+                && !nat64_local_use
                 && !six_to_four
                 && !teredo
+                && !doc6
                 && !zeronet6
                 && !v6.is_unicast_link_local()
                 && !(strict && v6.is_unique_local())
@@ -331,6 +341,27 @@ mod tests {
         }
         // 1.0.0.x is public APNIC space and must stay dialable.
         let addr: SocketAddr = "1.0.0.1:51413".parse().unwrap();
+        assert!(is_dialable_peer_addr(&addr, false));
+    }
+
+    #[test]
+    fn nat64_local_use_and_v6_documentation_addrs_are_never_dialable() {
+        // RFC 8215 local-use NAT64 (64:ff9b:1::/48) translates the embedded
+        // v4 host on the site's own NAT64 gateway — same SSRF class as the
+        // well-known prefix. RFC 3849 documentation addresses are reserved
+        // for examples and never a real swarm contact.
+        for a in [
+            "[64:ff9b:1::127.0.0.1]:6881",
+            "[64:ff9b:1::169.254.169.254]:80",
+            "[64:ff9b:1::93.184.215.14]:51413",
+            "[2001:db8::dead]:51413",
+        ] {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert!(!is_dialable_peer_addr(&addr, false), "{a} clearnet");
+            assert!(!is_dialable_peer_addr(&addr, true), "{a} strict");
+        }
+        // Quad-9's real v6 anycast must stay dialable (2001:x but not db8).
+        let addr: SocketAddr = "[2620:fe::fe]:51413".parse().unwrap();
         assert!(is_dialable_peer_addr(&addr, false));
     }
 
