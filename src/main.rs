@@ -488,7 +488,8 @@ async fn cmd_download(
     // is closest to us, the last is closest to the destination. We
     // resolve the hosts once at startup so we don't emit DNS queries on
     // the clearnet for every dial.
-    let proxies = resolve_proxy_chain(socks5, socks5_user, socks5_pass, tor_isolation).await?;
+    let proxies =
+        resolve_proxy_chain(socks5, socks5_user, socks5_pass, tor_isolation, anonymous).await?;
 
     // Anonymous mode insists on a fresh, non-persisted peer_id every run —
     // a stable id across sessions would let observers correlate. The
@@ -915,6 +916,7 @@ async fn resolve_proxy_chain(
     socks5_user: Option<String>,
     socks5_pass: Option<String>,
     tor_isolation: bool,
+    require_ip_literals: bool,
 ) -> Result<Vec<rustytorrent::socks5::ProxyConfig>> {
     // Credential hygiene: fall back to RUSTYTORRENT_SOCKS5_PASS /
     // RUSTYTORRENT_SOCKS5_USER so neither credential has to sit in argv
@@ -941,11 +943,26 @@ async fn resolve_proxy_chain(
     let last_idx = socks5.len() - 1;
     let mut chain = Vec::with_capacity(socks5.len());
     for (i, spec) in socks5.iter().enumerate() {
-        let addr = tokio::net::lookup_host(spec.as_str())
-            .await
-            .with_context(|| format!("resolving SOCKS5 proxy {spec}"))?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("SOCKS5 proxy {spec} did not resolve"))?;
+        // Under anonymity, resolving a proxy HOSTNAME here would query
+        // the clearnet system resolver BEFORE any proxy exists — leaking
+        // our IP to the resolver, plus the proxy's name (correlating us
+        // with that VPN/Tor endpoint). Fail closed: require literals.
+        let addr = if require_ip_literals {
+            match spec.parse::<std::net::SocketAddr>() {
+                Ok(a) => a,
+                Err(_) => anyhow::bail!(
+                    "--anonymous requires each --socks5 hop as an IP literal                      (resolving '{spec}' via clearnet DNS would leak your IP \
+                     and this hop's name before the tunnel exists); \
+                     e.g. --socks5 127.0.0.1:9050 or --socks5 '[2001:db8::1]:1080'"
+                ),
+            }
+        } else {
+            tokio::net::lookup_host(spec.as_str())
+                .await
+                .with_context(|| format!("resolving SOCKS5 proxy {spec}"))?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("SOCKS5 proxy {spec} did not resolve"))?
+        };
         let is_last = i == last_idx;
         let creds = if is_last { credentials.clone() } else { None };
         let iso = if is_last { tor_isolation } else { false };
@@ -1018,7 +1035,8 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
         rustytorrent::peer::handshake::extension_bytes_from(dht && !anonymous, true),
     );
 
-    let proxies = resolve_proxy_chain(socks5, socks5_user, socks5_pass, tor_isolation).await?;
+    let proxies =
+        resolve_proxy_chain(socks5, socks5_user, socks5_pass, tor_isolation, anonymous).await?;
 
     let peer_id = if anonymous {
         rustytorrent::peer_id::generate_libtorrent_lookalike()
@@ -1242,7 +1260,84 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{bootstrap_allows_tracker, effective_socks5_pass, effective_socks5_user};
+    use super::{
+        bootstrap_allows_tracker, effective_socks5_pass, effective_socks5_user, resolve_proxy_chain,
+    };
+
+    #[tokio::test]
+    async fn anon_mode_refuses_hostname_proxy_before_any_dns() {
+        // `.invalid` TLD can never resolve; if we ever reached lookup_host
+        // the error would mention resolving/DNS instead of the refusal.
+        let err = resolve_proxy_chain(
+            vec!["proxy.example.invalid:1080".into()],
+            None,
+            None,
+            false,
+            true, // anonymous
+        )
+        .await
+        .expect_err("hostname hop must be refused in anonymous mode");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("IP literal") && msg.contains("proxy.example.invalid"),
+            "expected literal-requirement refusal naming the hop, got: {msg}"
+        );
+        assert!(
+            !msg.contains("resolving SOCKS5 proxy"),
+            "refusal must fire BEFORE the clearnet resolver path: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anon_mode_accepts_ip_literal_hops() {
+        let v4 = resolve_proxy_chain(vec!["127.0.0.1:9050".into()], None, None, false, true)
+            .await
+            .expect("v4 literal must be accepted");
+        assert_eq!(v4.len(), 1);
+        assert_eq!(v4[0].addr.to_string(), "127.0.0.1:9050");
+
+        let v6 = resolve_proxy_chain(vec!["[::1]:1080".into()], None, None, false, true)
+            .await
+            .expect("bracketed v6 literal must be accepted");
+        assert_eq!(v6[0].addr.to_string(), "[::1]:1080");
+
+        // Multi-hop chain: every hop is checked.
+        let chain = resolve_proxy_chain(
+            vec!["127.0.0.1:1".into(), "[::1]:2".into()],
+            None,
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("literal chain accepted");
+        assert_eq!(chain.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn clearnet_mode_still_resolves_hostnames_via_dns_path() {
+        // Over-fire control: without anonymity a hostname goes to the
+        // resolver path (fails here only because .invalid cannot
+        // resolve) — proving the literal gate did not widen.
+        let err = resolve_proxy_chain(
+            vec!["unresolvable-guard.invalid:1080".into()],
+            None,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect_err(".invalid cannot resolve");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("resolving SOCKS5 proxy"),
+            "expected the DNS-resolution error path, got: {msg}"
+        );
+        assert!(
+            !msg.contains("IP literal"),
+            "literal gate leaked into clearnet mode: {msg}"
+        );
+    }
 
     #[test]
     fn bootstrap_skips_cleartext_http_only_under_anonymous() {
