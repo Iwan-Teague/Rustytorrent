@@ -134,12 +134,18 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
             let cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
             let benchmarking = o[0] == 198 && (18..=19).contains(&o[1]);
             let reserved = o[0] & 0xF0 == 240 && !v4.is_broadcast();
+            // RFC 1122 §3.2.1.3 "this network" (0.0.0.0/8): only the exact
+            // unspecified address has a std predicate, but the kernel routes
+            // ANY 0.x.y.z dial locally — a hostile peer source can smuggle a
+            // loopback probe past `is_unspecified()` as 0.0.0.1.
+            let this_network = o[0] == 0;
             !(v4.is_broadcast()
                 || v4.is_link_local()
                 || cgnat
                 || benchmarking
                 || v4.is_documentation()
                 || reserved
+                || this_network
                 || (strict && v4.is_private()))
         }
         IpAddr::V6(v6) => {
@@ -156,9 +162,14 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
             // choose; no legitimate swarm contact is announced under them.
             let six_to_four = segs[0] == 0x2002;
             let teredo = segs[0] == 0x2001 && segs[1] == 0x0000;
+            // The IPv6 "unspecified prefix" block (::/128 minus :: itself,
+            // RFC 4291): ::2 and friends are reserved, and Linux dials them
+            // as local addresses just like 0.0.0.0/8 in v4.
+            let zeronet6 = segs[..7].iter().all(|&s| s == 0);
             !nat64
                 && !six_to_four
                 && !teredo
+                && !zeronet6
                 && !v6.is_unicast_link_local()
                 && !(strict && v6.is_unique_local())
         }
@@ -300,6 +311,26 @@ mod tests {
         }
         // 2001:x with a non-zero second group is NOT Teredo (real global v6).
         let addr: SocketAddr = "[2001:4860:4860::8888]:51413".parse().unwrap();
+        assert!(is_dialable_peer_addr(&addr, false));
+    }
+
+    #[test]
+    fn this_network_addrs_are_never_dialable() {
+        // RFC 1122 §3.2.1.3 (0.0.0.0/8) and the v6 unspecified prefix block
+        // (::/128 minus ::): the kernel dials these locally, so a hostile
+        // peer source can aim us at our own loopback with them.
+        for a in [
+            "0.0.0.1:6881",
+            "0.127.0.1:51413",
+            "[::2]:6881",
+            "[::1234]:51413",
+        ] {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert!(!is_dialable_peer_addr(&addr, false), "{a} clearnet");
+            assert!(!is_dialable_peer_addr(&addr, true), "{a} strict");
+        }
+        // 1.0.0.x is public APNIC space and must stay dialable.
+        let addr: SocketAddr = "1.0.0.1:51413".parse().unwrap();
         assert!(is_dialable_peer_addr(&addr, false));
     }
 
