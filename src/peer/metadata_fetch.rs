@@ -214,7 +214,7 @@ async fn try_fetch_from(
 ) -> Result<Vec<u8>> {
     // Attempt 1: plain BT handshake on a fresh TcpStream.
     let plain_result = async {
-        let mut stream = dial(addr, proxies).await?;
+        let mut stream = dial(addr, proxies, anonymous).await?;
         let _ = stream.set_nodelay(true);
         let theirs = match timeout(
             HANDSHAKE_TIMEOUT,
@@ -246,7 +246,7 @@ async fn try_fetch_from(
     // Attempt 2: MSE handshake on a fresh TcpStream. The first TCP
     // attempt is now in some intermediate state (we sent the plain pstr
     // and got a reject or EOF), so we redial cleanly.
-    let stream = dial(addr, proxies).await?;
+    let stream = dial(addr, proxies, anonymous).await?;
     let _ = stream.set_nodelay(true);
     let mut enc = match timeout(
         HANDSHAKE_TIMEOUT,
@@ -481,7 +481,14 @@ where
     }
 }
 
-async fn dial(addr: SocketAddr, proxies: &[ProxyConfig]) -> Result<TcpStream> {
+async fn dial(addr: SocketAddr, proxies: &[ProxyConfig], anonymous: bool) -> Result<TcpStream> {
+    if anonymous && proxies.is_empty() {
+        // Fail closed: a direct dial here would put the real IP on the
+        // wire. Anonymous mode without proxies must never fall back.
+        return Err(Error::Network(
+            "magnet bootstrap: anonymous mode requires --socks5; refusing direct dial".into(),
+        ));
+    }
     if !proxies.is_empty() {
         // Per-hop materialization so Tor stream isolation refreshes the
         // SOCKS5 username for this dial; non-isolated hops are cloned
@@ -533,5 +540,28 @@ mod tests {
     fn metadata_reservation_rejects_overflow() {
         // checked_add guards against usize overflow in the ceiling math.
         assert!(MetadataReservation::try_acquire(usize::MAX).is_none());
+    }
+
+    #[tokio::test]
+    async fn dial_refuses_direct_socket_when_anonymous_without_proxies() {
+        // A live listener proves the target is connectable — the only
+        // reason `dial` may not reach it is the anonymous fail-closed
+        // guard, not an unreachable peer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let err = dial(addr, &[], true)
+            .await
+            .expect_err("anonymous dial without proxies must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refusing direct dial") && msg.contains("anonymous"),
+            "unexpected refusal message: {msg}"
+        );
+
+        // Control: without anonymous mode the same dial connects. If a
+        // regression removes the anon guard, this pair of assertions
+        // fails on the first one instead of silently passing.
+        let _stream = dial(addr, &[], false).await.unwrap();
     }
 }
