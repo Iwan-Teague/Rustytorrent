@@ -654,6 +654,12 @@ async fn cmd_daemon(
     // peers is barely a daemon, so a bind failure is fatal here.
     let listener = rustytorrent::engine::bind_dual_stack_listener(port)
         .with_context(|| format!("binding shared listener on port {port}"))?;
+    // Resolve `--port 0`: adopt the kernel-assigned port as THE shared
+    // session port, so the DHT socket, SessionManager, and every tracker
+    // announce agree on one value. Raw 0 here would advertise "I have no
+    // listener" while the acceptor was live — same bug class as the
+    // single-torrent engine path.
+    let port = listener.local_addr()?.port();
     let registry = rustytorrent::acceptor::new_registry();
 
     // One shared DHT (unless --no-dht). Per-session DHTs would race on the
