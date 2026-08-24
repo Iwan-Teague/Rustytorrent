@@ -11,6 +11,7 @@
 //! `perform_incoming_with_buffered`.
 
 use rand::{Rng, RngCore};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::dh::{self, Keypair, KEY_LEN};
@@ -242,11 +243,22 @@ where
     for i in 0..20 {
         req2_xor_req3[i] = req23[i] ^ req3[i];
     }
-    let matched = info_hashes
-        .iter()
-        .find(|ih| sha1_concat(&[b"req2", *ih]) == req2_xor_req3)
-        .copied()
-        .ok_or(MseError::UnknownSkey)?;
+    // Constant-time candidate evaluation: sweep EVERY hosted info-hash
+    // with a data-independent comparison (subtle::ConstantTimeEq), no
+    // early exit. A short-circuiting `find` over plain `==` would let an
+    // active prober time the handshake to learn whether its SKEY guess
+    // hit at all, and which hosted torrent it belongs to (candidate
+    // index). Info-hashes are unique per torrent, so at most one
+    // candidate satisfies the equation — last-match-wins is equivalent
+    // to `find` while being timing-uniform in the candidate set.
+    let mut matched: Option<[u8; 20]> = None;
+    for ih in info_hashes {
+        let cand = sha1_concat(&[b"req2", &ih[..]]);
+        if bool::from(cand.ct_eq(&req2_xor_req3)) {
+            matched = Some(*ih);
+        }
+    }
+    let matched = matched.ok_or(MseError::UnknownSkey)?;
 
     // 5) Derive both ciphers.
     let mut in_cipher = derive_rc4(b"keyA", &s, &matched);
@@ -382,6 +394,32 @@ mod tests {
         // The initiator side errors out when the receiver closes mid-handshake;
         // we don't care about the exact error, only that the receiver rejects.
         let _ = perform_outgoing(client_side, unknown).await;
+        server.await.unwrap();
+    }
+
+    /// The receiver hosts SEVERAL torrents and the initiator speaks for a
+    /// NON-FIRST candidate. Pins that the constant-time sweep still
+    /// selects the correct SKEY — the sweep evaluates every candidate
+    /// precisely so candidate order/index can't leak through timing, and
+    /// this test makes sure that restructuring didn't break selection.
+    #[tokio::test]
+    async fn skey_selection_among_many_candidates_picks_right_one() {
+        let candidates: [[u8; 20]; 4] = [[0xA1; 20], [0xB2; 20], [0xC3; 20], [0xD4; 20]];
+        let wanted = candidates[2]; // third hosted torrent
+
+        let (client_side, server_side) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            let (mut enc, matched) = perform_incoming(server_side, &candidates, &[])
+                .await
+                .unwrap();
+            assert_eq!(matched, wanted);
+            let mut buf = [0u8; 5];
+            enc.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"hello");
+        });
+
+        let mut client = perform_outgoing(client_side, wanted).await.unwrap();
+        client.write_all(b"hello").await.unwrap();
         server.await.unwrap();
     }
 }
