@@ -308,6 +308,17 @@ pub fn dht_wanted(enable_dht: bool, anonymous: bool, proxied: bool, private: boo
     enable_dht && !anonymous && !proxied && !private
 }
 
+/// Martian-filter strictness the DHT must run with, derived from the same
+/// anonymity inputs as [`dht_wanted`]. Today `dht_wanted` forbids the DHT
+/// under anonymous/proxied sessions entirely — but that coupling is
+/// DELIBERATELY one-directional: if DHT gating ever loosens (e.g. a future
+/// UDP-over-proxy transport), this predicate re-tightens contact filtering
+/// to refuse RFC1918/ULA/site-local targets automatically. Callers pass it
+/// into `Dht::spawn`; never hardcode `false` there.
+pub fn dht_martian_strict(anonymous: bool, proxied: bool) -> bool {
+    anonymous || proxied
+}
+
 /// Whether this session may open an inbound peer listener. A direct inbound
 /// TCP connection arrives over the real network path — it exposes the real
 /// IP to whoever connects and ties it to the info-hash via the completed
@@ -1016,11 +1027,13 @@ impl TorrentEngine {
                 self.cfg.dht_bootstrap.clone()
             };
             let persist = Some(crate::dht::persist::default_path());
+            let dht_strict = dht_martian_strict(self.cfg.anonymous, !self.cfg.proxies.is_empty());
             match crate::dht::Dht::spawn(
                 self.cfg.listen_port,
                 bootstrap,
                 persist,
                 self.cfg.bind_iface.clone(),
+                dht_strict,
             )
             .await
             {
@@ -2348,6 +2361,19 @@ fn jittered_interval(base: Duration, anonymous: bool) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dht_martian_strict_truth_table() {
+        // Strict exactly when the session is anonymized — independent of
+        // enable_dht, because this governs FILTERING, not spawning.
+        assert!(
+            !dht_martian_strict(false, false),
+            "clearnet stays non-strict"
+        );
+        assert!(dht_martian_strict(true, false), "anonymous → strict");
+        assert!(dht_martian_strict(false, true), "proxied → strict");
+        assert!(dht_martian_strict(true, true), "both → strict");
+    }
 
     #[test]
     fn dht_wanted_truth_table() {

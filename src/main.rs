@@ -657,7 +657,11 @@ async fn cmd_daemon(
             .map(|s| (*s).to_string())
             .collect();
         let persist = Some(rustytorrent::dht::persist::default_path());
-        match rustytorrent::dht::Dht::spawn(port, bootstrap, persist, None).await {
+        // Daemon v1 has no --anonymous/--socks5 knobs at all (clearnet by
+        // design, documented in ANONYMITY.md), so non-strict is correct
+        // HERE. If daemon anonymity knobs ever exist, derive
+        // dht_martian_strict(anonymous, proxied) instead.
+        match rustytorrent::dht::Dht::spawn(port, bootstrap, persist, None, false).await {
             Ok(d) => Some(d),
             Err(e) => {
                 eprintln!("warning: shared DHT failed to start ({e}); continuing tracker-only");
@@ -1136,7 +1140,10 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
             "router.utorrent.com:6881".to_string(),
             "dht.transmissionbt.com:6881".to_string(),
         ];
-        match rustytorrent::dht::Dht::spawn(port, bootstrap, None, None).await {
+        // Same anonymity inputs as the gate above; see
+        // engine::dht_martian_strict for why strictness is derived here.
+        let dht_strict = rustytorrent::engine::dht_martian_strict(anonymous, !proxies.is_empty());
+        match rustytorrent::dht::Dht::spawn(port, bootstrap, None, None, dht_strict).await {
             Ok(d) => {
                 // Brief warm-up so get_peers has something to work
                 // with. Engine's persistent table would be better
