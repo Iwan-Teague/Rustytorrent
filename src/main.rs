@@ -1028,10 +1028,12 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
     }
 
     // DHT bootstrap. Skipped under --anonymous (UDP can't ride SOCKS5
-    // and would leak our IP) and when the caller explicitly turned it
-    // off. We spawn a temporary DHT just for the bootstrap; the
-    // engine spawns its own DHT later when it takes over.
-    let dht_handle = if dht && !anonymous {
+    // and would leak our IP), when the caller explicitly turned it off,
+    // and when a proxy chain is configured: peers/trackers would go via
+    // SOCKS5 while this warm-up exposes the real IP over UDP on the same
+    // info-hash — a linkable identity, so a proxied magnet session is
+    // DHT-ineligible (mirrors the engine's dht_wanted gate).
+    let dht_handle = if dht && !anonymous && proxies.is_empty() {
         println!("Bootstrap:  warming up DHT (allow ~10s)");
         let bootstrap = vec![
             "router.bittorrent.com:6881".to_string(),
