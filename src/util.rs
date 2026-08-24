@@ -106,7 +106,23 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// legitimately share", it just aims our proxy at its own localhost/
 /// intranet. Clearnet users on a genuine LAN swarm keep working.
 pub fn is_dialable_peer_addr(addr: &SocketAddr, strict: bool) -> bool {
-    let ip = addr.ip();
+    is_dialable_ip(&addr.ip(), strict)
+}
+
+fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
+    // IPv4-mapped IPv6 (::ffff:a.b.c.d) must be judged by the IPv4 rules:
+    // the kernel dials such addresses as plain IPv4, while Ipv6Addr predicates
+    // do NOT match them (::ffff:127.0.0.1 is not `is_loopback()`). Without
+    // this normalization a hostile peer source could smuggle martian v4
+    // targets — loopback, link-local metadata, LAN — past the filter in a
+    // v6 wrapper.
+    let ip = match ip {
+        IpAddr::V4(_) => *ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => *ip,
+        },
+    };
     if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
         return false;
     }
@@ -204,6 +220,30 @@ mod tests {
             assert!(is_dialable_peer_addr(&addr, false), "{a}");
             assert!(is_dialable_peer_addr(&addr, true), "{a}");
         }
+    }
+
+    #[test]
+    fn ipv4_mapped_v6_addrs_are_judged_by_v4_rules() {
+        // ::ffff:a.b.c.d is dialed as plain IPv4 by the kernel; the v6
+        // predicates would wave it through.
+        let always_bad = [
+            "[::ffff:127.0.0.1]:6881",     // mapped loopback
+            "[::ffff:169.254.169.254]:80", // mapped link-local metadata
+        ];
+        for a in always_bad {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert!(!is_dialable_peer_addr(&addr, false), "{a} clearnet");
+            assert!(!is_dialable_peer_addr(&addr, true), "{a} strict");
+        }
+        for a in ["[::ffff:10.20.30.40]:5555", "[::ffff:192.168.1.5]:6881"] {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert!(is_dialable_peer_addr(&addr, false), "{a} clearnet LAN ok");
+            assert!(!is_dialable_peer_addr(&addr, true), "{a} refused strict");
+        }
+        // A mapped PUBLIC address stays dialable in both modes.
+        let addr: SocketAddr = "[::ffff:93.184.215.14]:51413".parse().unwrap();
+        assert!(is_dialable_peer_addr(&addr, false));
+        assert!(is_dialable_peer_addr(&addr, true));
     }
 
     #[cfg(unix)]
