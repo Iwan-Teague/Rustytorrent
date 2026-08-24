@@ -13,7 +13,11 @@ pub mod udp;
 /// tracing line would leak exactly the credential anonymous mode exists to
 /// protect. `scheme://host/path` keeps enough to identify the tracker.
 pub fn redact_url_query(url: &str) -> String {
-    url.split(['?', '#']).next().unwrap_or(url).to_string()
+    let base = url.split(['?', '#']).next().unwrap_or(url);
+    // URLs come from torrent files, i.e. from whoever authored the torrent.
+    // Control characters (CRLF included) would let a crafted announce URL
+    // forge additional lines in our logs; drop them.
+    base.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Remove any occurrence of `url` (e.g. one embedded by reqwest's error
@@ -335,6 +339,18 @@ mod tests {
         assert_eq!(redact_url_query("http://t.example/an#frag"), "http://t.example/an");
         // No query/fragment: unchanged.
         assert_eq!(redact_url_query("udp://t.example:6969/announce"), "udp://t.example:6969/announce");
+    }
+
+    #[test]
+    fn redact_url_query_strips_control_chars() {
+        // A crafted announce URL must not be able to forge log lines.
+        let forged = "http://t.example/x\r\nINFO spoofed line?q=1";
+        let out = redact_url_query(forged);
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('\n'));
+        assert_eq!(out, "http://t.example/xINFO spoofed line");
+        // Host and path survive; DEL (0x7F) is also a control char.
+        assert_eq!(redact_url_query("http://h/p\u{7f}q"), "http://h/pq");
     }
 
     #[test]
