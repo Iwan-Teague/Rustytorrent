@@ -22,9 +22,11 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse};
+use axum::extract::{Path, Request, State};
+use axum::http::header::{HOST, ORIGIN};
+use axum::http::{Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::Serialize;
@@ -210,6 +212,67 @@ impl EngineStats {
     }
 }
 
+/// Host part of a `Host` or `Origin` header value: strips any scheme,
+/// path and port. IPv6 literals keep their brackets (`[::1]:8317` →
+/// `[::1]`); compare via [`is_loopback_host`] which tolerates them.
+fn host_part(value: &str) -> Option<&str> {
+    let rest = value.split_once("://").map(|(_, r)| r).unwrap_or(value);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if let Some(end) = authority.rfind(']') {
+        return Some(&authority[..=end]);
+    }
+    Some(authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority))
+}
+
+/// True for the loopback names a legitimate local client sends in
+/// `Host`/`Origin`. Anything else — a rebound public hostname, a LAN
+/// name, an attacker's origin — is rejected by [`csrf_guard`].
+fn is_loopback_host(host: &str) -> bool {
+    matches!(
+        host.trim_matches(['[', ']']),
+        "127.0.0.1" | "::1" | "localhost"
+    )
+}
+
+/// Loopback-only request guard applied to both web routers.
+///
+/// The servers bind `127.0.0.1`, but that alone does not stop a browser:
+///
+/// 1. DNS rebinding — a page at `https://evil.example` re-resolves its
+///    own name to `127.0.0.1`; the browser happily talks to our port
+///    while sending `Host: evil.example`. Rejecting non-loopback Host
+///    headers kills the whole class (including read endpoints).
+/// 2. Drive-by CSRF — any web page can issue cross-site POSTs to
+///    `http://127.0.0.1:<port>/api/...`; browsers attach an `Origin`
+///    header to such fetches even though CORS blocks reading the
+///    response. A mutating POST carrying a non-loopback Origin is
+///    refused; header-less clients (curl, scripts) pass.
+async fn csrf_guard(req: Request, next: Next) -> Response {
+    let host_ok = req
+        .headers()
+        .get(HOST)
+        .and_then(|h| h.to_str().ok())
+        .and_then(host_part)
+        .map(is_loopback_host)
+        .unwrap_or(false);
+    if !host_ok {
+        return (StatusCode::FORBIDDEN, "foreign Host header").into_response();
+    }
+    if req.method() == Method::POST {
+        let origin_ok = req
+            .headers()
+            .get(ORIGIN)
+            .and_then(|o| o.to_str().ok())
+            .and_then(host_part)
+            .map(is_loopback_host)
+            .unwrap_or(true); // no Origin → not a browser fetch
+        if !origin_ok {
+            return (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response();
+        }
+    }
+    next.run(req).await
+}
+
 /// Build the monitoring + control router. Split out from [`serve`] so
 /// tests can drive it over an ephemeral listener.
 pub fn router(state: WebState) -> Router {
@@ -222,6 +285,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/resume", post(resume))
         .route("/api/shutdown", post(shutdown))
         .route("/metrics", get(metrics))
+        .layer(middleware::from_fn(csrf_guard))
         .with_state(state)
 }
 
@@ -352,6 +416,7 @@ pub fn daemon_router(state: DaemonState) -> Router {
         .route("/api/torrent/:ih/pause", post(daemon_pause))
         .route("/api/torrent/:ih/resume", post(daemon_resume))
         .route("/api/torrent/:ih/remove", post(daemon_remove))
+        .layer(middleware::from_fn(csrf_guard))
         .with_state(state)
 }
 
@@ -974,5 +1039,127 @@ mod tests {
         let t = TorrentFile::from_bytes(&bytes).unwrap();
         assert_eq!(t.info.name, "t.bin");
         assert!(t.announce.is_none());
+    }
+
+    #[test]
+    fn host_part_parses_authority_forms() {
+        assert_eq!(host_part("127.0.0.1:8317"), Some("127.0.0.1"));
+        assert_eq!(host_part("localhost"), Some("localhost"));
+        assert_eq!(host_part("[::1]:9000"), Some("[::1]"));
+        // Origin form: scheme + optional path.
+        assert_eq!(host_part("https://evil.example/x?y"), Some("evil.example"));
+        assert_eq!(host_part("http://127.0.0.1:8317"), Some("127.0.0.1"));
+        // Garbage still yields something parseable or None — never panic.
+        assert_eq!(host_part(""), Some(""));
+    }
+
+    #[test]
+    fn loopback_host_accepts_only_loopback_names() {
+        for ok in ["127.0.0.1", "::1", "[::1]", "localhost"] {
+            assert!(is_loopback_host(ok), "{ok} should be loopback");
+        }
+        for bad in ["", "evil.example", "[fe80::1]", "127.0.0.2"] {
+            assert!(!is_loopback_host(bad), "{bad} must NOT be loopback");
+        }
+    }
+
+    // ---- csrf_guard integration through the real router ----
+
+    mod guard {
+        use super::*;
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        fn app() -> (axum::Router, mpsc::Receiver<EngineControl>) {
+            let (_tx, rx) = tokio::sync::watch::channel(sample());
+            let (ctl, ctl_rx) = mpsc::channel::<EngineControl>(4);
+            (
+                router(WebState { rx, ctl }),
+                // The caller must keep this alive: dropping it makes every
+                // control POST legitimately answer 503.
+                ctl_rx,
+            )
+        }
+
+        async fn respond(
+            method: &str,
+            uri: &str,
+            host: Option<&str>,
+            origin: Option<&str>,
+        ) -> StatusCode {
+            let (a, _ctl_rx) = app();
+            let mut b = axum::http::Request::builder().method(method).uri(uri);
+            if let Some(h) = host {
+                b = b.header("host", h);
+            }
+            if let Some(o) = origin {
+                b = b.header("origin", o);
+            }
+            let resp = a.oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+            resp.status()
+        }
+
+        #[tokio::test]
+        async fn rebound_or_missing_host_is_rejected_everywhere() {
+            assert_eq!(
+                respond("GET", "/api/status", Some("evil.example"), None).await,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                respond("GET", "/api/status", None, None).await,
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        #[tokio::test]
+        async fn loopback_hosts_are_served() {
+            assert_eq!(
+                respond("GET", "/api/status", Some("127.0.0.1:8317"), None).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                respond("GET", "/metrics", Some("localhost:8317"), None).await,
+                StatusCode::OK
+            );
+        }
+
+        #[tokio::test]
+        async fn cross_origin_post_is_rejected() {
+            // Drive-by CSRF: a page at evil.example POSTing to loopback.
+            assert_eq!(
+                respond(
+                    "POST",
+                    "/api/pause",
+                    Some("127.0.0.1:8317"),
+                    Some("https://evil.example")
+                )
+                .await,
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        #[tokio::test]
+        async fn headerless_client_post_passes() {
+            // curl / scripts send no Origin — the trusted local case.
+            assert_eq!(
+                respond("POST", "/api/pause", Some("127.0.0.1:8317"), None).await,
+                StatusCode::OK
+            );
+        }
+
+        #[tokio::test]
+        async fn same_origin_browser_post_passes() {
+            // The bundled UI's own fetches carry a loopback Origin.
+            assert_eq!(
+                respond(
+                    "POST",
+                    "/api/pause",
+                    Some("127.0.0.1:8317"),
+                    Some("http://127.0.0.1:8317")
+                )
+                .await,
+                StatusCode::OK
+            );
+        }
     }
 }
