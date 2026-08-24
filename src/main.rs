@@ -241,10 +241,10 @@ struct SharedDownloadArgs {
     #[arg(long)]
     spool: Option<PathBuf>,
     /// Cap download rate at this many KiB/s, engine-wide across
-    /// all peers. Unset = unthrottled. Gated at Request issuance.
+    /// all peers. Unset or 0 = unthrottled. Gated at Request issuance.
     #[arg(long)]
     max_down: Option<u64>,
-    /// Cap upload rate at this many KiB/s. Unset = unthrottled.
+    /// Cap upload rate at this many KiB/s. Unset or 0 = unthrottled.
     /// Gated at `serve_request`; over-quota peer requests are
     /// silently dropped (peer re-requests later).
     #[arg(long)]
@@ -550,8 +550,8 @@ async fn cmd_download(
         sandbox,
         passphrase: resolved_passphrase,
         spool_path: spool,
-        max_down_bytes_per_sec: max_down.map(|k| k * 1024),
-        max_up_bytes_per_sec: max_up.map(|k| k * 1024),
+        max_down_bytes_per_sec: parse_rate_kib(max_down),
+        max_up_bytes_per_sec: parse_rate_kib(max_up),
         utp_enabled: utp,
         web_port: web,
         selected_files: select,
@@ -584,6 +584,15 @@ async fn cmd_download(
 /// perfect either (readable via `/proc/<pid>/environ` by the same user
 /// or root) but it stays out of the process argument list and shell
 /// history, which is the common-case exposure.
+/// Normalize a `--max-down`/`--max-up` value: KiB/s -> B/s, with `0`
+/// (and absence) meaning UNLIMITED. Without the zero-case, a rate-0
+/// token bucket would admit exactly one floored block and then stall
+/// every transfer forever.
+fn parse_rate_kib(k: Option<u64>) -> Option<u64> {
+    k.filter(|kib| *kib != 0)
+        .map(|kib| kib.saturating_mul(1024))
+}
+
 fn resolve_passphrase(flag: Option<String>) -> Result<String> {
     if let Some(p) = flag {
         eprintln!(
@@ -1249,8 +1258,8 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
         sandbox,
         passphrase: resolved_passphrase,
         spool_path: spool,
-        max_down_bytes_per_sec: max_down.map(|k| k * 1024),
-        max_up_bytes_per_sec: max_up.map(|k| k * 1024),
+        max_down_bytes_per_sec: parse_rate_kib(max_down),
+        max_up_bytes_per_sec: parse_rate_kib(max_up),
         utp_enabled: utp,
         web_port: web,
         selected_files: select,
@@ -1269,8 +1278,20 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        bootstrap_allows_tracker, effective_socks5_pass, effective_socks5_user, resolve_proxy_chain,
+        bootstrap_allows_tracker, effective_socks5_pass, effective_socks5_user, parse_rate_kib,
+        resolve_proxy_chain,
     };
+
+    #[test]
+    fn parse_rate_kib_zero_means_unlimited() {
+        assert_eq!(parse_rate_kib(None), None);
+        assert_eq!(parse_rate_kib(Some(0)), None, "0 must mean unlimited");
+        assert_eq!(parse_rate_kib(Some(5)), Some(5 * 1024));
+        assert_eq!(
+            parse_rate_kib(Some(u64::MAX / 2)),
+            Some((u64::MAX / 2).saturating_mul(1024))
+        );
+    }
 
     #[tokio::test]
     async fn anon_mode_refuses_hostname_proxy_before_any_dns() {
