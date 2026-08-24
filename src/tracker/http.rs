@@ -27,6 +27,18 @@ fn direct_client() -> &'static reqwest::Client {
     })
 }
 
+fn build_proxied_client(proxy_url: &str) -> reqwest::Client {
+    // `socks5h://` forces remote DNS resolution — no clearnet DNS leak.
+    let proxy =
+        reqwest::Proxy::all(proxy_url).expect("malformed SOCKS5 proxy URL — validated upstream");
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent(concat!("rustytorrent/", env!("CARGO_PKG_VERSION")))
+        .proxy(proxy)
+        .build()
+        .expect("build proxied reqwest client")
+}
+
 fn proxied_client(proxy_url: &str) -> reqwest::Client {
     static CACHE: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -34,17 +46,24 @@ fn proxied_client(proxy_url: &str) -> reqwest::Client {
     if let Some(c) = guard.get(proxy_url) {
         return c.clone();
     }
-    // `socks5h://` forces remote DNS resolution — no clearnet DNS leak.
-    let proxy =
-        reqwest::Proxy::all(proxy_url).expect("malformed SOCKS5 proxy URL — validated upstream");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent(concat!("rustytorrent/", env!("CARGO_PKG_VERSION")))
-        .proxy(proxy)
-        .build()
-        .expect("build proxied reqwest client");
+    let client = build_proxied_client(proxy_url);
     guard.insert(proxy_url.to_string(), client.clone());
     client
+}
+
+/// Per-announce proxy materialization. Mirrors the peer/magnet dial
+/// paths (`ProxyConfig::for_dial`): when Tor stream isolation is on,
+/// every announce gets a freshly-randomized SOCKS5 username so Tor
+/// routes it over its own circuit, and the result must NOT be cached
+/// (each URL is single-use; caching would both correlate announces
+/// onto one circuit and grow the cache without bound). Without
+/// isolation the URL is stable and the pooled/cached client is right.
+fn proxied_url_for_announce(p: &crate::socks5::ProxyConfig) -> (String, bool) {
+    // for_dial() clears its own isolation flag once it has applied the
+    // fresh username, so cacheability is decided from the INPUT config.
+    let cacheable = !p.isolation;
+    let url = p.for_dial().as_socks5h_url();
+    (url, cacheable)
 }
 
 /// Percent-encode every byte that isn't an unreserved character per RFC 3986.
@@ -135,7 +154,12 @@ async fn announce_inner(
     let client_owned;
     let client: &reqwest::Client = match proxy {
         Some(p) => {
-            client_owned = proxied_client(&p.as_socks5h_url());
+            let (url, cacheable) = proxied_url_for_announce(p);
+            client_owned = if cacheable {
+                proxied_client(&url)
+            } else {
+                build_proxied_client(&url)
+            };
             &client_owned
         }
         None => direct_client(),
@@ -271,6 +295,36 @@ fn parse_compact_v6(b: &[u8]) -> Result<Vec<SocketAddr>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxied_url_rotates_under_tor_stream_isolation() {
+        let cfg = ProxyConfig {
+            addr: "127.0.0.1:9050".parse().unwrap(),
+            credentials: None,
+            isolation: true,
+        };
+        let (url_a, cacheable_a) = proxied_url_for_announce(&cfg);
+        let (url_b, cacheable_b) = proxied_url_for_announce(&cfg);
+        assert!(!cacheable_a && !cacheable_b, "isolated announces must not be cached");
+        assert_ne!(
+            url_a, url_b,
+            "isolation must rotate the SOCKS5 username per announce"
+        );
+    }
+
+    #[test]
+    fn proxied_url_stable_without_isolation() {
+        let cfg = ProxyConfig {
+            addr: "127.0.0.1:1080".parse().unwrap(),
+            credentials: None,
+            isolation: false,
+        };
+        let (url_a, cacheable) = proxied_url_for_announce(&cfg);
+        let (url_b, _) = proxied_url_for_announce(&cfg);
+        assert!(cacheable, "non-isolated announces should reuse the pooled client");
+        assert_eq!(url_a, url_b);
+        assert!(url_a.starts_with("socks5h://"), "must force remote DNS: {url_a}");
+    }
 
     #[test]
     fn percent_encode_unreserved_passes_through() {
