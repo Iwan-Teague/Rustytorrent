@@ -70,7 +70,7 @@ pub async fn announce_with_proxy(
     req: &AnnounceRequest,
     proxy: Option<&crate::socks5::ProxyConfig>,
 ) -> Result<AnnounceResponse> {
-    announce_with_proxy_anon(url, req, proxy, false).await
+    announce_with_proxy_anon(url, req, proxy, false, None).await
 }
 
 /// As `announce_with_proxy`, but when `anonymous` is true the HTTP
@@ -82,6 +82,7 @@ pub async fn announce_with_proxy_anon(
     req: &AnnounceRequest,
     proxy: Option<&crate::socks5::ProxyConfig>,
     anonymous: bool,
+    bind_iface: Option<&str>,
 ) -> Result<AnnounceResponse> {
     if anonymous && proxy.is_none() {
         // Fail closed: without a proxy an http(s):// announce rides the
@@ -103,9 +104,9 @@ pub async fn announce_with_proxy_anon(
                 "skipping UDP tracker while proxy is configured or anonymous mode is on: {url}"
             )));
         }
-        udp::announce(url, req).await
+        udp::announce(url, req, bind_iface).await
     } else if url.starts_with("http://") || url.starts_with("https://") {
-        http::announce_with_proxy_anon(url, req, proxy, anonymous).await
+        http::announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await
     } else {
         Err(crate::error::Error::Tracker(format!(
             "unsupported tracker scheme: {url}"
@@ -122,7 +123,7 @@ pub async fn announce_with_fallback(
     req: &AnnounceRequest,
     proxy: Option<&crate::socks5::ProxyConfig>,
 ) -> Result<(String, AnnounceResponse)> {
-    announce_with_fallback_anon(tiers, fallback_single, req, proxy, false).await
+    announce_with_fallback_anon(tiers, fallback_single, req, proxy, false, None).await
 }
 
 /// Anonymous-aware variant of `announce_with_fallback`: forwards the
@@ -134,11 +135,12 @@ pub async fn announce_with_fallback_anon(
     req: &AnnounceRequest,
     proxy: Option<&crate::socks5::ProxyConfig>,
     anonymous: bool,
+    bind_iface: Option<&str>,
 ) -> Result<(String, AnnounceResponse)> {
     let mut last_err: Option<crate::error::Error> = None;
     for tier in tiers {
         for url in tier {
-            match announce_with_proxy_anon(url, req, proxy, anonymous).await {
+            match announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await {
                 Ok(r) => return Ok((url.clone(), r)),
                 Err(e) => {
                     tracing::warn!(url = %url, error = %e, "tracker announce failed");
@@ -148,7 +150,7 @@ pub async fn announce_with_fallback_anon(
         }
     }
     if let Some(url) = fallback_single {
-        match announce_with_proxy_anon(url, req, proxy, anonymous).await {
+        match announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await {
             Ok(r) => return Ok((url.to_string(), r)),
             Err(e) => {
                 tracing::warn!(url = %url, error = %e, "tracker announce failed");
@@ -181,7 +183,7 @@ mod tests {
         // Host is deliberately unresolvable (.invalid TLD): the guard
         // must fire BEFORE any DNS or socket work, so the error is the
         // anonymity refusal — not a dns failure.
-        let err = announce_with_proxy_anon("udp://anon-guard-test.invalid:80", &req(), None, true)
+        let err = announce_with_proxy_anon("udp://anon-guard-test.invalid:80", &req(), None, true, None)
             .await
             .expect_err("anonymous UDP announce must be refused");
         let msg = format!("{err}");
@@ -206,6 +208,7 @@ mod tests {
             &req(),
             Some(&cfg),
             false,
+            None,
         )
         .await
         .expect_err("proxied UDP announce must be refused");
@@ -220,10 +223,15 @@ mod tests {
     async fn http_announce_refused_in_anonymous_mode_without_proxy() {
         // Same fail-closed contract for http(s):// trackers: no proxy +
         // anonymous must refuse before any request/DNS work.
-        let err =
-            announce_with_proxy_anon("https://anon-guard-test.invalid/announce", &req(), None, true)
-                .await
-                .expect_err("anonymous HTTP announce without proxy must be refused");
+        let err = announce_with_proxy_anon(
+            "https://anon-guard-test.invalid/announce",
+            &req(),
+            None,
+            true,
+            None,
+        )
+        .await
+        .expect_err("anonymous HTTP announce without proxy must be refused");
         let msg = format!("{err}");
         assert!(
             msg.contains("refusing direct tracker announce") && msg.contains("anonymous"),
@@ -244,6 +252,7 @@ mod tests {
             &req(),
             Some(&cfg),
             true,
+            None,
         )
         .await
         .expect_err("bogus host via dead proxy should fail somehow");
@@ -260,14 +269,37 @@ mod tests {
         // OFF must get PAST the guard (it then fails on the bogus host
         // with some other error). If the guard ever widens to refuse
         // all UDP announces, this test catches it.
-        let err =
-            announce_with_proxy_anon("udp://anon-guard-test.invalid:80", &req(), None, false)
-                .await
-                .expect_err("bogus host should fail somehow");
+        let err = announce_with_proxy_anon(
+            "udp://anon-guard-test.invalid:80",
+            &req(),
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("bogus host should fail somehow");
         let msg = format!("{err}");
         assert!(
             !msg.contains("skipping UDP tracker"),
             "guard fired without anon/proxy: {msg}"
+        );
+    }
+
+    /// Kill-switch invariant end-to-end: with `--bind-iface` set, a UDP
+    /// announce must bind its socket to that interface — a missing one
+    /// fails closed naming the iface, never silently riding the default
+    /// route. Loopback host: DNS resolves, so the ONLY way this errors
+    /// is the interface bind.
+    #[tokio::test]
+    async fn udp_announce_honors_bind_iface_fail_closed() {
+        let err =
+            announce_with_proxy_anon("udp://127.0.0.1:9/announce", &req(), None, false, Some("rt_nonexistent_iface_xyz123"))
+                .await
+                .expect_err("missing bind iface must fail closed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("udp bind via rt_nonexistent_iface_xyz123"),
+            "error must name the bound interface, got: {msg}"
         );
     }
 }

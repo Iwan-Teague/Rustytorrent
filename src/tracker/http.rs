@@ -9,45 +9,74 @@ use crate::socks5::ProxyConfig;
 use crate::tracker::{AnnounceRequest, AnnounceResponse};
 
 /// Process-wide HTTP client cache. We keep:
-/// - One "direct" client for non-proxied use.
-/// - One client per distinct proxy URL (rare — usually just one in a session).
+/// - One "direct" client per bound source IP (None = default route).
+/// - One client per distinct (proxy URL, source IP) pair.
 ///
 /// `reqwest::Client` is cheap to clone and pools TCP/TLS connections internally,
-/// so we keep exactly one per (proxy?) and reuse it for every tracker announce.
+/// so we keep exactly one per key and reuse it for every tracker announce.
 /// Building a fresh client per announce throws away the connection pool and
 /// forces a new TLS handshake each time.
-fn direct_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent(concat!("rustytorrent/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("build static reqwest client with default config")
-    })
+///
+/// The source IP comes from `--bind-iface` resolution (`netbind::
+/// interface_local_ip`): pinning reqwest's outbound sockets to the
+/// kill-switch interface's address keeps announces off the default route
+/// when the tunnel drops. The IP is part of the cache key because the
+/// binding lives on the client, not the request; within one process run
+/// it never changes, so the map stays tiny.
+fn build_direct_client(local_ip: Option<IpAddr>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent(concat!("rustytorrent/", env!("CARGO_PKG_VERSION")));
+    if let Some(ip) = local_ip {
+        builder = builder.local_address(ip);
+    }
+    builder
+        .build()
+        .expect("build static reqwest client with default config")
 }
 
-fn build_proxied_client(proxy_url: &str) -> reqwest::Client {
+fn direct_client(local_ip: Option<IpAddr>) -> reqwest::Client {
+    static CACHE: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = format!("{local_ip:?}");
+    let mut guard = cache.lock().expect("direct client cache mutex poisoned");
+    if let Some(c) = guard.get(&key) {
+        return c.clone();
+    }
+    let client = build_direct_client(local_ip);
+    guard.insert(key, client.clone());
+    client
+}
+
+fn build_proxied_client(proxy_url: &str, local_ip: Option<IpAddr>) -> reqwest::Client {
     // `socks5h://` forces remote DNS resolution — no clearnet DNS leak.
     let proxy =
         reqwest::Proxy::all(proxy_url).expect("malformed SOCKS5 proxy URL — validated upstream");
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
-        .user_agent(concat!("rustytorrent/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("rustytorrent/", env!("CARGO_PKG_VERSION")));
+    // Bind the socket TO THE PROXY to the kill-switch interface — same
+    // invariant as the peer/magnet first-hop dials: if the tunnel drops,
+    // connecting to the proxy fails instead of riding the default route.
+    if let Some(ip) = local_ip {
+        builder = builder.local_address(ip);
+    }
+    builder
         .proxy(proxy)
         .build()
         .expect("build proxied reqwest client")
 }
 
-fn proxied_client(proxy_url: &str) -> reqwest::Client {
+fn proxied_client(proxy_url: &str, local_ip: Option<IpAddr>) -> reqwest::Client {
     static CACHE: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = format!("{proxy_url}#{local_ip:?}");
     let mut guard = cache.lock().expect("proxy client cache mutex poisoned");
-    if let Some(c) = guard.get(proxy_url) {
+    if let Some(c) = guard.get(&key) {
         return c.clone();
     }
-    let client = build_proxied_client(proxy_url);
-    guard.insert(proxy_url.to_string(), client.clone());
+    let client = build_proxied_client(proxy_url, local_ip);
+    guard.insert(key, client.clone());
     client
 }
 
@@ -110,7 +139,7 @@ pub async fn announce_with_proxy(
     req: &AnnounceRequest,
     proxy: Option<&ProxyConfig>,
 ) -> Result<AnnounceResponse> {
-    announce_inner(base_url, req, proxy, None).await
+    announce_inner(base_url, req, proxy, None, None).await
 }
 
 /// User-Agent string we send when anonymized: matches libtorrent 2.0.9
@@ -128,13 +157,14 @@ pub async fn announce_with_proxy_anon(
     req: &AnnounceRequest,
     proxy: Option<&ProxyConfig>,
     anonymous: bool,
+    bind_iface: Option<&str>,
 ) -> Result<AnnounceResponse> {
     let ua_override = if anonymous {
         Some(LIBTORRENT_LOOKALIKE_UA)
     } else {
         None
     };
-    announce_inner(base_url, req, proxy, ua_override).await
+    announce_inner(base_url, req, proxy, ua_override, bind_iface).await
 }
 
 async fn announce_inner(
@@ -142,27 +172,38 @@ async fn announce_inner(
     req: &AnnounceRequest,
     proxy: Option<&ProxyConfig>,
     ua_override: Option<&str>,
+    bind_iface: Option<&str>,
 ) -> Result<AnnounceResponse> {
+    // Resolve the kill-switch interface to a source IP up front and fail
+    // closed if it doesn't exist — before any DNS or socket work.
+    let local_ip = match bind_iface {
+        Some(iface) => Some(
+            crate::netbind::interface_local_ip(iface, base_url.contains("[:"))
+                .map_err(|e| Error::Tracker(format!("bind-iface {iface}: {e}")))?,
+        ),
+        None => None,
+    };
     let url = build_url(base_url, req);
     tracing::debug!(
         target: "tracker::http",
         url = %base_url,
         via_proxy = proxy.is_some(),
         ua_override = ua_override.is_some(),
+        bound_ip = ?local_ip,
         "announcing"
     );
     let client_owned;
-    let client: &reqwest::Client = match proxy {
+    let client: reqwest::Client = match proxy {
         Some(p) => {
             let (url, cacheable) = proxied_url_for_announce(p);
             client_owned = if cacheable {
-                proxied_client(&url)
+                proxied_client(&url, local_ip)
             } else {
-                build_proxied_client(&url)
+                build_proxied_client(&url, local_ip)
             };
-            &client_owned
+            client_owned
         }
-        None => direct_client(),
+        None => direct_client(local_ip),
     };
     let mut builder = client.get(&url);
     if let Some(ua) = ua_override {
@@ -398,6 +439,27 @@ mod tests {
         assert!(parse_compact_v4(&[1, 2, 3, 4]).is_err());
     }
 
+    /// Kill-switch invariant: a missing `--bind-iface` must abort the
+    /// announce before any socket work, never fall back to the default
+    /// route. Port 9 on loopback would fail anyway — the point is the
+    /// error NAMES the interface (fail-closed at bind time).
+    #[tokio::test]
+    async fn bind_iface_missing_fails_closed_before_request() {
+        let res = announce_with_proxy_anon(
+            "http://127.0.0.1:9/announce",
+            &dummy_req(),
+            None,
+            false,
+            Some("rt_nonexistent_iface_xyz123"),
+        )
+        .await;
+        let err = format!("{}", res.unwrap_err());
+        assert!(
+            err.contains("bind-iface rt_nonexistent_iface_xyz123"),
+            "error must name the interface, got {err}"
+        );
+    }
+
     #[test]
     fn parse_response_compact() {
         // d8:intervali900e5:peers6:\x01\x02\x03\x04\x1a\xe1e
@@ -488,7 +550,7 @@ mod tests {
     async fn anonymous_uses_libtorrent_ua() {
         let (addr, rx) = spawn_ua_capture().await;
         let url = format!("http://{addr}/announce");
-        let _ = announce_with_proxy_anon(&url, &dummy_req(), None, true)
+        let _ = announce_with_proxy_anon(&url, &dummy_req(), None, true, None)
             .await
             .unwrap();
         let ua = rx.await.unwrap();
@@ -499,7 +561,7 @@ mod tests {
     async fn non_anonymous_uses_default_ua() {
         let (addr, rx) = spawn_ua_capture().await;
         let url = format!("http://{addr}/announce");
-        let _ = announce_with_proxy_anon(&url, &dummy_req(), None, false)
+        let _ = announce_with_proxy_anon(&url, &dummy_req(), None, false, None)
             .await
             .unwrap();
         let ua = rx.await.unwrap();

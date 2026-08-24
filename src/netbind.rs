@@ -17,7 +17,7 @@
 //! the resulting bound socket into `tokio::net::TcpStream::from_std`.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpStream, UdpSocket};
@@ -73,6 +73,39 @@ pub fn bind_udp_to_interface(local: SocketAddr, iface: &str) -> io::Result<UdpSo
     socket.set_nonblocking(true)?;
     let std_sock: std::net::UdpSocket = socket.into();
     UdpSocket::from_std(std_sock)
+}
+
+/// Discover the local IP address of network interface `iface`.
+///
+/// Used by paths that can't take an interface *name* directly (e.g.
+/// `reqwest::ClientBuilder::local_address`, which wants an IP) so they can
+/// still pin their sockets to the kill-switch interface. Fails closed with
+/// an `io::Error` if the interface doesn't exist — callers must not fall
+/// back to the default route.
+///
+/// Implementation: create a UDP socket, bind it to the device, then
+/// `connect()` it to a TEST-NET address of the requested family and read
+/// back the kernel-chosen source address via `getsockname`. A UDP
+/// `connect` sends no packets, so this is side-effect free; the kernel
+/// just performs route selection constrained by our device binding.
+pub fn interface_local_ip(iface: &str, want_ipv6: bool) -> io::Result<IpAddr> {
+    let domain = if want_ipv6 {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let remote: SocketAddr = if want_ipv6 {
+        // RFC 3849 documentation prefix — guaranteed unroutable, and we
+        // never actually send anyway.
+        "[2001:db8::1]:9".parse().expect("valid v6 TEST-NET addr")
+    } else {
+        "192.0.2.1:9".parse().expect("valid v4 TEST-NET addr")
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    bind_socket_to_interface(&socket, iface, !want_ipv6)?;
+    socket.connect(&remote.into())?;
+    let local = socket.local_addr()?;
+    Ok(local.as_socket().expect("AF_INET/AF_INET6 local addr").ip())
 }
 
 /// Apply the per-platform setsockopt that binds `socket` to `iface`.
@@ -178,5 +211,36 @@ mod tests {
             bind_udp_to_interface("0.0.0.0:0".parse().unwrap(), "rt_nonexistent_iface_xyz123")
         });
         assert!(res.is_err(), "expected error for missing interface (UDP)");
+    }
+
+    #[test]
+    fn local_ip_missing_interface_is_rejected() {
+        // The reqwest-side helper must fail closed too — no default-route
+        // fallback when the named interface is absent.
+        for v6 in [false, true] {
+            let res = interface_local_ip("rt_nonexistent_iface_xyz123", v6);
+            assert!(
+                res.is_err(),
+                "expected error for missing interface (v6={v6}), got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_ip_loopback_resolves() {
+        // Platform loopback names differ; try the known ones and skip the
+        // test if none exist (e.g. a container with lo renamed).
+        let candidates = ["lo0", "lo"];
+        let Some(iface) = candidates
+            .iter()
+            .find(|n| interface_local_ip(n, false).is_ok())
+        else {
+            return; // no standard loopback name on this host
+        };
+        let ip = interface_local_ip(iface, false).unwrap();
+        assert!(
+            ip.is_loopback(),
+            "loopback iface {iface} should resolve to a 127.x address, got {ip}"
+        );
     }
 }
