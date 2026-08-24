@@ -167,6 +167,24 @@ pub async fn announce_with_proxy_anon(
     announce_inner(base_url, req, proxy, ua_override, bind_iface).await
 }
 
+/// Does the URL's *authority* (host) use an IPv6 literal (`[...]`)? Checked
+/// against the host only — never the whole URL — so a query string or path
+/// containing a stray `[` can't flip the address-family choice for
+/// `--bind-iface` resolution.
+fn url_host_is_ipv6_literal(url: &str) -> bool {
+    let rest = match url.split_once("://") {
+        Some((_, r)) => r,
+        None => url,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = match authority.rsplit_once('@') {
+        // Strip userinfo (user:pass@host) so creds containing '[' don't lie.
+        Some((_, h)) => h,
+        None => authority,
+    };
+    host.starts_with('[')
+}
+
 async fn announce_inner(
     base_url: &str,
     req: &AnnounceRequest,
@@ -178,7 +196,7 @@ async fn announce_inner(
     // closed if it doesn't exist — before any DNS or socket work.
     let local_ip = match bind_iface {
         Some(iface) => Some(
-            crate::netbind::interface_local_ip(iface, base_url.contains("[:"))
+            crate::netbind::interface_local_ip(iface, url_host_is_ipv6_literal(base_url))
                 .map_err(|e| Error::Tracker(format!("bind-iface {iface}: {e}")))?,
         ),
         None => None,
@@ -437,6 +455,22 @@ mod tests {
     #[test]
     fn parse_compact_v4_rejects_short() {
         assert!(parse_compact_v4(&[1, 2, 3, 4]).is_err());
+    }
+
+    #[test]
+    fn url_host_is_ipv6_literal_parses_authority_only() {
+        assert!(url_host_is_ipv6_literal("http://[2001:db8::1]:8080/announce"));
+        // A bracket in the query must NOT flip the family decision.
+        assert!(!url_host_is_ipv6_literal(
+            "http://tracker.example/announce?key=[abc"
+        ));
+        // Userinfo containing '[' is stripped before the host check.
+        assert!(!url_host_is_ipv6_literal(
+            "http://us[r:p[w@example.com/announce"
+        ));
+        assert!(url_host_is_ipv6_literal("http://user@[::1]:80/a?x=["));
+        // No scheme: treat the string as authority.
+        assert!(url_host_is_ipv6_literal("[2607:f8b0::1]:6969"));
     }
 
     /// Kill-switch invariant: a missing `--bind-iface` must abort the
