@@ -537,6 +537,13 @@ async fn cmd_download(
     if let Some(u) = max_up {
         println!("Max up:     {u} KiB/s");
     }
+    match web {
+        Some(0) => println!(
+            "Web:        enabled on a random free port \u{2014} see the 'web server' log line"
+        ),
+        Some(p) => println!("Web:        http://127.0.0.1:{p}/"),
+        None => {}
+    }
 
     let cfg = rustytorrent::engine::EngineConfig {
         output_dir: output,
@@ -1249,6 +1256,13 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
     }
     if let Some(u) = max_up {
         println!("Max up:     {u} KiB/s");
+    }
+    match web {
+        Some(0) => println!(
+            "Web:        enabled on a random free port \u{2014} see the 'web server' log line"
+        ),
+        Some(p) => println!("Web:        http://127.0.0.1:{p}/"),
+        None => {}
     }
 
     let cfg = rustytorrent::engine::EngineConfig {

@@ -308,7 +308,11 @@ pub async fn serve(port: u16, rx: watch::Receiver<EngineStats>, ctl: mpsc::Sende
             return;
         }
     };
-    tracing::info!(target: "web", %addr, "monitoring UI at http://{addr}/");
+    // Resolve `--web 0`: report the kernel-assigned port, not the
+    // requested placeholder, so an ephemeral-bound UI can actually be
+    // found.
+    let bound = listener.local_addr().unwrap_or(addr);
+    tracing::info!(target: "web", "monitoring UI at http://{bound}/");
     if let Err(e) = axum::serve(listener, app).await {
         tracing::warn!(target: "web", error = %e, "web server stopped");
     }
@@ -436,7 +440,9 @@ pub async fn serve_daemon(port: u16, state: DaemonState) {
             return;
         }
     };
-    tracing::info!(target: "web", %addr, "daemon UI at http://{addr}/");
+    let bound = listener.local_addr().unwrap_or(addr);
+    println!("Web UI:     http://{bound}/");
+    tracing::info!(target: "web", "daemon UI at http://{bound}/");
     if let Err(e) = axum::serve(listener, daemon_router(state)).await {
         tracing::warn!(target: "web", error = %e, "daemon web server stopped");
     }
