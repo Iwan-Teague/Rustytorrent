@@ -383,10 +383,24 @@ async fn ingest_nodes_from(state: &Arc<SharedState>, resp: &Response) {
     };
     if let Some(nodes) = nodes {
         let mut rt = state.routing.lock().await;
-        for c in nodes {
-            rt.insert(c.clone());
+        for c in dialable_nodes(nodes) {
+            rt.insert(c);
         }
     }
+}
+
+/// Contacts decoded from a remote response may point anywhere — including
+/// loopback, link-local or LAN addresses we must never probe. A hostile node
+/// feeding us such contacts turns our DHT traffic into a UDP scan of the
+/// host or its network (SSRF). Keep only globally dialable contacts; the DHT
+/// never runs under a proxy chain or anonymous mode, so the non-strict
+/// martian set is sufficient.
+fn dialable_nodes(nodes: &[Contact]) -> Vec<Contact> {
+    nodes
+        .iter()
+        .filter(|c| crate::util::is_dialable_peer_addr(&c.addr, false))
+        .cloned()
+        .collect()
 }
 
 fn next_txid() -> Vec<u8> {
@@ -628,7 +642,7 @@ async fn lookup_find_node(
             if let Ok(Some(resp)) = t.await {
                 ingest_nodes_from(state, &resp).await;
                 if let Response::Nodes { nodes, .. } = resp {
-                    shortlist.extend(nodes);
+                    shortlist.extend(dialable_nodes(&nodes));
                 }
             }
         }
@@ -699,7 +713,7 @@ async fn lookup_get_peers(
                         ..
                     } => {
                         tokens.insert(c.id, (token.clone(), c.addr));
-                        shortlist.extend(nodes.clone());
+                        shortlist.extend(dialable_nodes(nodes));
                     }
                     _ => {}
                 }
@@ -770,7 +784,7 @@ async fn announce_peer(
                     _ => {}
                 }
                 if let Response::PeersNodes { ref nodes, .. } = resp {
-                    shortlist.extend(nodes.clone());
+                    shortlist.extend(dialable_nodes(nodes));
                 }
                 ingest_nodes_from(state, &resp).await;
             }
@@ -844,5 +858,50 @@ mod tests {
             "allowed {allowed} > burst {QUERY_BURST}"
         );
         assert!(allowed >= 1, "the burst must permit at least some queries");
+    }
+
+    #[test]
+    fn remote_node_contacts_are_filtered_before_dialing() {
+        let mk = |ip: &str| Contact::new(NodeId::random(), ip.parse().unwrap());
+        let nodes = vec![
+            mk("127.0.0.1:6881"),
+            mk("169.254.169.254:6881"),
+            mk("192.168.1.50:6881"),
+            mk("93.184.215.14:6881"),
+        ];
+        // The DHT only runs on the clearnet (it is force-disabled under
+        // --anonymous / proxy chains), so site-local contacts are allowed
+        // exactly like clearnet peer dialing; true martians are not.
+        let kept = dialable_nodes(&nodes);
+        assert_eq!(kept.len(), 2);
+        let addrs: Vec<String> = kept.iter().map(|c| c.addr.to_string()).collect();
+        assert!(addrs.contains(&"192.168.1.50:6881".to_string()));
+        assert!(addrs.contains(&"93.184.215.14:6881".to_string()));
+    }
+
+    #[tokio::test]
+    async fn ingest_never_routes_martian_contacts() {
+        use super::super::krpc::Response;
+
+        let state = Arc::new(SharedState::new(NodeId([7u8; 20])));
+        let resp = Response::Nodes {
+            id: NodeId([9u8; 20]),
+            nodes: vec![
+                Contact::new(NodeId([1u8; 20]), "127.0.0.1:6881".parse().unwrap()),
+                Contact::new(
+                    NodeId([2u8; 20]),
+                    "93.184.215.14:6881".parse().unwrap(),
+                ),
+            ],
+        };
+        ingest_nodes_from(&state, &resp).await;
+        let rt = state.routing.lock().await;
+        assert_eq!(rt.len(), 1, "martian contact must not enter the table");
+        let got = rt.closest(&NodeId([2u8; 20]), 8);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].addr.to_string(),
+            "93.184.215.14:6881"
+        );
     }
 }
