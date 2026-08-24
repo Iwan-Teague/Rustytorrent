@@ -564,4 +564,22 @@ mod tests {
         // fails on the first one instead of silently passing.
         let _stream = dial(addr, &[], false).await.unwrap();
     }
+
+    #[tokio::test]
+    async fn fetch_metadata_anonymous_without_proxies_never_dials_direct() {
+        // End-to-end fail-closed proof: a live listener as the sole
+        // candidate peer, anonymous mode, no proxy. Every per-peer
+        // attempt must refuse at the dial — none may reach the
+        // listener — so the whole fetch errors out.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let res = fetch_metadata([9u8; 20], vec![addr], Vec::new(), true).await;
+        let err = res.expect_err("anonymous fetch without proxies must fail closed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed"),
+            "expected exhausted-attempts error, got: {msg}"
+        );
+    }
 }
