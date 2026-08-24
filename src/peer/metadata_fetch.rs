@@ -132,6 +132,7 @@ pub async fn fetch_metadata(
     peer_pool: Vec<SocketAddr>,
     proxies: Vec<ProxyConfig>,
     anonymous: bool,
+    bind_iface: Option<String>,
 ) -> Result<Vec<u8>> {
     if peer_pool.is_empty() {
         return Err(Error::Network(
@@ -155,12 +156,22 @@ pub async fn fetch_metadata(
         let sem = sem.clone();
         let tx = tx.clone();
         let proxies = proxies.clone();
+        let bind_iface = bind_iface.clone();
         let handle = tokio::spawn(async move {
             let permit = match sem.acquire().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
-            match try_fetch_from(addr, info_hash, our_peer_id, &proxies, anonymous).await {
+            match try_fetch_from(
+                addr,
+                info_hash,
+                our_peer_id,
+                &proxies,
+                anonymous,
+                bind_iface.as_deref(),
+            )
+            .await
+            {
                 Ok(bytes) => {
                     // tx is bounded(1) — first sender wins; subsequent
                     // sends short-circuit because the receiver has
@@ -211,10 +222,11 @@ async fn try_fetch_from(
     our_peer_id: PeerId,
     proxies: &[ProxyConfig],
     anonymous: bool,
+    bind_iface: Option<&str>,
 ) -> Result<Vec<u8>> {
     // Attempt 1: plain BT handshake on a fresh TcpStream.
     let plain_result = async {
-        let mut stream = dial(addr, proxies, anonymous).await?;
+        let mut stream = dial(addr, proxies, anonymous, bind_iface).await?;
         let _ = stream.set_nodelay(true);
         let theirs = match timeout(
             HANDSHAKE_TIMEOUT,
@@ -246,7 +258,7 @@ async fn try_fetch_from(
     // Attempt 2: MSE handshake on a fresh TcpStream. The first TCP
     // attempt is now in some intermediate state (we sent the plain pstr
     // and got a reject or EOF), so we redial cleanly.
-    let stream = dial(addr, proxies, anonymous).await?;
+    let stream = dial(addr, proxies, anonymous, bind_iface).await?;
     let _ = stream.set_nodelay(true);
     let mut enc = match timeout(
         HANDSHAKE_TIMEOUT,
@@ -481,7 +493,12 @@ where
     }
 }
 
-async fn dial(addr: SocketAddr, proxies: &[ProxyConfig], anonymous: bool) -> Result<TcpStream> {
+async fn dial(
+    addr: SocketAddr,
+    proxies: &[ProxyConfig],
+    anonymous: bool,
+    bind_iface: Option<&str>,
+) -> Result<TcpStream> {
     if anonymous && proxies.is_empty() {
         // Fail closed: a direct dial here would put the real IP on the
         // wire. Anonymous mode without proxies must never fall back.
@@ -493,18 +510,26 @@ async fn dial(addr: SocketAddr, proxies: &[ProxyConfig], anonymous: bool) -> Res
         // Per-hop materialization so Tor stream isolation refreshes the
         // SOCKS5 username for this dial; non-isolated hops are cloned
         // as-is. The chain can be a single proxy (length 1) or many.
-        // No --bind-iface here: the magnet bootstrap path doesn't
-        // currently take an iface; if it ever does, plumb it down.
+        // With a kill-switch interface set, the FIRST hop's dial rides
+        // netbind so the TCP connection to the proxy itself can't
+        // escape onto the default route if the tunnel drops — same
+        // contract as the engine's peer dials.
         let effective: Vec<ProxyConfig> = proxies.iter().map(|p| p.for_dial()).collect();
-        return timeout(DIAL_TIMEOUT, socks5::connect_chain(&effective, addr, None))
+        return timeout(DIAL_TIMEOUT, socks5::connect_chain(&effective, addr, bind_iface))
             .await
             .map_err(|_| Error::Network(format!("socks5 dial {addr}: timeout")))?
             .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}")));
     }
-    timeout(DIAL_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| Error::Network(format!("connect {addr}: timeout")))?
-        .map_err(|e| Error::Network(format!("connect {addr}: {e}")))
+    match bind_iface {
+        Some(iface) => timeout(DIAL_TIMEOUT, crate::netbind::connect_via_interface(addr, iface))
+            .await
+            .map_err(|_| Error::Network(format!("connect {addr} via {iface}: timeout")))?
+            .map_err(|e| Error::Network(format!("connect {addr} via {iface}: {e}"))),
+        None => timeout(DIAL_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| Error::Network(format!("connect {addr}: timeout")))?
+            .map_err(|e| Error::Network(format!("connect {addr}: {e}"))),
+    }
 }
 
 #[cfg(test)]
@@ -550,7 +575,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let err = dial(addr, &[], true)
+        let err = dial(addr, &[], true, None)
             .await
             .expect_err("anonymous dial without proxies must be refused");
         let msg = format!("{err}");
@@ -562,7 +587,26 @@ mod tests {
         // Control: without anonymous mode the same dial connects. If a
         // regression removes the anon guard, this pair of assertions
         // fails on the first one instead of silently passing.
-        let _stream = dial(addr, &[], false).await.unwrap();
+        let _stream = dial(addr, &[], false, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dial_honors_bind_iface_on_direct_path() {
+        // Non-anon, no proxy, bogus interface name: dial must take the
+        // netbind path (error names the iface) rather than silently
+        // falling through to a plain clearnet connect that would
+        // succeed against the listener.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let err = dial(addr, &[], false, Some("rn-no-such-iface-0"))
+            .await
+            .expect_err("bogus iface must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("via rn-no-such-iface-0"),
+            "expected netbind-path error naming the iface, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -574,7 +618,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let res = fetch_metadata([9u8; 20], vec![addr], Vec::new(), true).await;
+        let res = fetch_metadata([9u8; 20], vec![addr], Vec::new(), true, None).await;
         let err = res.expect_err("anonymous fetch without proxies must fail closed");
         let msg = format!("{err}");
         assert!(
