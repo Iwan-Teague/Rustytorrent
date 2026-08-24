@@ -93,7 +93,8 @@ pub fn load_or_generate(path: &Path) -> PeerId {
     }
     let id = generate();
     if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
+        // 0700: the peer id is a persistent swarm identity.
+        if let Err(e) = crate::util::ensure_private_dir(parent) {
             tracing::debug!(
                 target: "peer_id",
                 path = %parent.display(),
@@ -103,7 +104,7 @@ pub fn load_or_generate(path: &Path) -> PeerId {
             return id;
         }
     }
-    if let Err(e) = std::fs::write(path, id) {
+    if let Err(e) = crate::util::write_private_file(path, &id) {
         tracing::debug!(
             target: "peer_id",
             path = %path.display(),
