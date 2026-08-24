@@ -70,7 +70,11 @@ pub const INITIAL_WINDOW_PACKETS: usize = 8;
 pub const MAX_DATA_PAYLOAD: usize = 1200;
 /// Receive window we advertise to the peer (bytes). Plenty for any
 /// real BitTorrent block-exchange flow; sized to make wnd_size
-/// effectively non-throttling.
+/// effectively non-throttling. This is also the hard bound on undelivered
+/// receive-side bytes per connection (`in_buf` + stashed out-of-order
+/// payloads): incoming DATA past it is refused unacked until the
+/// application drains, so even a hostile peer that ignores wnd_size can
+/// overshoot by at most one packet instead of buffering without limit.
 pub const RECV_WINDOW_BYTES: u32 = 1024 * 1024;
 /// Hard cap on out-of-order DATA packets we'll buffer while waiting
 /// for the gap-filling packet to arrive. Without this, a malicious
@@ -503,7 +507,7 @@ impl Connection {
             connection_id: conn.send_id,
             timestamp_micros: 0,
             timestamp_diff_micros: 0,
-            wnd_size: RECV_WINDOW_BYTES,
+            wnd_size: conn.recv_window(),
             seq_nr: conn.next_seq_nr,
             ack_nr: syn.seq_nr,
             extensions: Vec::new(),
@@ -744,6 +748,23 @@ impl Connection {
                 // across the 65535→0 seq_nr wrap.
                 let dist = payload_seq.wrapping_sub(self.peer_seq_nr_acked);
                 if dist == 1 {
+                    // Receive-window enforcement: if the application
+                    // hasn't drained what we already delivered, REFUSE
+                    // the packet — do not buffer it, do not advance the
+                    // frontier. The cumulative ack stays where it was,
+                    // so a conforming peer stalls (and retransmits at
+                    // its RTO) exactly like TCP with a zero window.
+                    // Without this, a hostile peer that ignores our
+                    // advertised wnd_size could grow `in_buf` (and the
+                    // driver→stream queue) without bound while the app
+                    // reads slowly or not at all — a remote OOM. With
+                    // it, undelivered receive-side memory per
+                    // connection is hard-bounded at RECV_WINDOW_BYTES
+                    // (+ one stashed-packet allowance via MAX_PENDING_IN
+                    // for the out-of-order case).
+                    if self.in_buf.len() >= RECV_WINDOW_BYTES as usize {
+                        return Some(self.build_state_ack());
+                    }
                     // In-order delivery. Push to in_buf, then drain any
                     // buffered packets that now close the gap.
                     self.in_buf.extend(packet.payload.iter().copied());
@@ -797,11 +818,28 @@ impl Connection {
     /// rebasing is needed — absolute keys stay valid across the 16-bit
     /// seq_nr wrap.
     fn drain_pending_in(&mut self) {
-        while let Some(buf) = self.pending_in.remove(&(self.peer_logical_acked + 1)) {
+        // Same window bound as the in-order accept path: stashed packets
+        // draining behind a closed gap must not overflow `in_buf` either
+        // (to within one packet — each append is checked before it runs).
+        // Whatever doesn't fit stays stashed and drains on a later call
+        // once the application has consumed some bytes.
+        while self.in_buf.len() < RECV_WINDOW_BYTES as usize {
+            let Some(buf) = self.pending_in.remove(&(self.peer_logical_acked + 1)) else {
+                break;
+            };
             self.in_buf.extend(buf.iter().copied());
             self.peer_seq_nr_acked = self.peer_seq_nr_acked.wrapping_add(1);
             self.peer_logical_acked += 1;
         }
+    }
+
+    /// The receive window we advertise: total buffer minus what the
+    /// application hasn't taken yet. Advertising the honest remaining
+    /// space lets a conforming peer pause *before* we have to drop, and
+    /// keeps our advertised value from being a lie that invites the
+    /// refusal path above.
+    fn recv_window(&self) -> u32 {
+        RECV_WINDOW_BYTES.saturating_sub(self.in_buf.len() as u32)
     }
 
     /// Produce outgoing DATA / FIN packets up to the send window.
@@ -859,7 +897,7 @@ impl Connection {
                 connection_id: self.send_id,
                 timestamp_micros: 0,
                 timestamp_diff_micros: 0,
-                wnd_size: RECV_WINDOW_BYTES,
+                wnd_size: self.recv_window(),
                 seq_nr: self.next_seq_nr,
                 ack_nr: self.peer_seq_nr_acked,
                 extensions: Vec::new(),
@@ -888,7 +926,7 @@ impl Connection {
                 connection_id: self.send_id,
                 timestamp_micros: 0,
                 timestamp_diff_micros: 0,
-                wnd_size: RECV_WINDOW_BYTES,
+                wnd_size: self.recv_window(),
                 seq_nr: self.next_seq_nr,
                 ack_nr: self.peer_seq_nr_acked,
                 extensions: Vec::new(),
@@ -937,7 +975,7 @@ impl Connection {
             connection_id: self.send_id,
             timestamp_micros: 0,
             timestamp_diff_micros: 0,
-            wnd_size: RECV_WINDOW_BYTES,
+            wnd_size: self.recv_window(),
             // STATE packets reuse the current seq_nr — they don't
             // advance it.
             seq_nr: self.next_seq_nr,
@@ -1873,5 +1911,146 @@ mod tests {
         };
         let _ = recv.handle_incoming(&good, t);
         assert!(recv.return_path_confirmed());
+    }
+
+    // ---- Receive-window enforcement (flow control / OOM defense) ----
+
+    /// Hand-craft a DATA packet as the receiver would send it: the
+    /// connection_id the initiator expects (`syn.connection_id`), an
+    /// explicit seq_nr, and an exact payload. Lets tests script precise
+    /// sequences instead of routing through `pending_send_packets`.
+    fn raw_data(conn_id: u16, seq: u16, ack: u16, payload: &[u8]) -> Packet {
+        let mut p = Packet::new(PacketType::Data, conn_id, seq, ack);
+        p.payload = Payload::slice(Arc::from(payload), 0, payload.len());
+        p
+    }
+
+    /// A peer that ignores our advertised window must not be able to grow
+    /// our receive buffer without bound: once `in_buf` holds a full
+    /// window of undelivered bytes, further in-order packets are refused
+    /// (frontier does NOT advance - the ack pins the peer) until the
+    /// application drains. The refused seq becomes deliverable again
+    /// after the drain.
+    #[test]
+    fn receive_window_refuses_in_order_data_when_app_is_not_reading() {
+        let t = now();
+        let (mut init, syn) = Connection::new_initiator(700, t);
+        let (_recv, state) = Connection::new_receiver_with_seq(&syn, t, 100).unwrap();
+        let _ = init.handle_incoming(&state, t);
+
+        let cid = syn.connection_id; // expected on incoming packets
+        let pkt_len = MAX_DATA_PAYLOAD;
+        let payload = vec![0x11u8; pkt_len];
+
+        // Feed strictly in-order DATA while the app reads NOTHING, until
+        // the window refuses. With the guard in place this happens within
+        // ~one window of buffered bytes; without it acceptance is
+        // unbounded and no refusal ever occurs.
+        let mut seq = 100u16;
+        let mut fed = 0usize;
+        for _ in 0..((RECV_WINDOW_BYTES as usize / pkt_len) * 3) {
+            let reply = init
+                .handle_incoming(&raw_data(cid, seq, 0, &payload), t)
+                .unwrap();
+            if reply.ack_nr != seq {
+                // Refused: the cumulative ack stayed pinned at seq-1.
+                assert_eq!(reply.ack_nr, seq.wrapping_sub(1));
+                // Overshoot is bounded by one partial-window packet
+                // (check-before-append).
+                assert!(
+                    fed <= RECV_WINDOW_BYTES as usize + pkt_len,
+                    "accepted {fed} bytes - window not enforced"
+                );
+                // Recovery: once the application drains, the SAME seq
+                // delivers (the peer's retransmit would).
+                let got = init.take_received(usize::MAX);
+                assert_eq!(got.len(), fed, "drain returns everything accepted");
+                let _ = init
+                    .handle_incoming(&raw_data(cid, seq, 0, &payload), t)
+                    .unwrap();
+                let got = init.take_received(usize::MAX);
+                assert_eq!(got.len(), pkt_len, "refused seq delivers after drain");
+                return;
+            }
+            fed += pkt_len;
+            seq = seq.wrapping_add(1);
+        }
+        panic!("window never refused - guard missing");
+    }
+
+    /// The out-of-order drain path obeys the same bound: stashed packets
+    /// released behind a closing gap stop filling `in_buf` at the window
+    /// and stay stashed for a later drain, instead of overflowing.
+    #[test]
+    fn receive_window_bounds_drain_of_stashed_packets() {
+        let t = now();
+        let (mut init, syn) = Connection::new_initiator(701, t);
+        let (_recv, state) = Connection::new_receiver_with_seq(&syn, t, 200).unwrap();
+        let _ = init.handle_incoming(&state, t);
+
+        let cid = syn.connection_id;
+        let pkt_len = MAX_DATA_PAYLOAD;
+        let payload = vec![0x22u8; pkt_len];
+
+        // Stash a run starting one past the frontier (gap at 200).
+        let stash_count = RECV_WINDOW_BYTES as usize / pkt_len + 50;
+        for i in 1..=stash_count {
+            let seq = 200u16.wrapping_add(i as u16);
+            let _ = init
+                .handle_incoming(&raw_data(cid, seq, 0, &payload), t)
+                .unwrap();
+        }
+
+        // Close the gap with seq 200 - triggers the drain, which must
+        // stop at the window bound rather than emptying the stash.
+        let reply = init
+            .handle_incoming(&raw_data(cid, 200, 0, &payload), t)
+            .unwrap();
+        let drained = init.take_received(usize::MAX).len();
+        assert!(drained > 0, "gap close must deliver");
+        // Bound is window + at most one packet (the drain checks before
+        // each append, so the last append may straddle the line).
+        assert!(
+            drained <= RECV_WINDOW_BYTES as usize + pkt_len,
+            "drain overflowed the receive buffer: {drained}"
+        );
+        // Frontier advanced only through what was actually delivered:
+        // `drained` covers the gap-closing packet AND the stashed run,
+        // and the pre-handshake frontier was seq 199.
+        assert_eq!(
+            reply.ack_nr,
+            199u16.wrapping_add((drained / pkt_len) as u16),
+            "ack must reflect exactly the delivered prefix"
+        );
+
+        // Delivery resumes from the frontier once space is free again.
+        let next = reply.ack_nr.wrapping_add(1);
+        let r2 = init
+            .handle_incoming(&raw_data(cid, next, 0, &payload), t)
+            .unwrap();
+        assert_eq!(r2.ack_nr, next, "delivery resumes after drain");
+    }
+
+    /// Outgoing packets advertise honest remaining space, so a conforming
+    /// peer throttles BEFORE we reach the refusal path.
+    #[test]
+    fn advertised_wnd_size_reflects_undrained_bytes() {
+        let t = now();
+        let (mut init, syn) = Connection::new_initiator(702, t);
+        let (_recv, state) = Connection::new_receiver_with_seq(&syn, t, 300).unwrap();
+        let _ = init.handle_incoming(&state, t);
+
+        let cid = syn.connection_id;
+        let payload = vec![0x33u8; 10_000];
+        let _ = init
+            .handle_incoming(&raw_data(cid, 300, 0, &payload), t)
+            .unwrap();
+
+        let ack = init.build_state_ack();
+        assert_eq!(
+            ack.wnd_size,
+            RECV_WINDOW_BYTES - 10_000,
+            "wnd_size must shrink by undelivered bytes"
+        );
     }
 }

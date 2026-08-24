@@ -314,6 +314,22 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 4. Correctness & robustness
 
+- [x] **P1 — µTP receive path had no window enforcement (remote OOM).**
+  [verified] We advertise a fixed `RECV_WINDOW_BYTES` (1 MiB) but never
+  enforced it on receive: the in-order accept path extended `in_buf`
+  unconditionally, so a hostile peer ignoring `wnd_size` could grow
+  undelivered receive memory without bound while the application read
+  slowly or not at all. (The out-of-order path was already capped via
+  `MAX_PENDING_IN`; the in-order path — the cheaper attack — was not.)
+  DONE: in-order DATA past the window is now refused unacked (frontier
+  pinned; conforming peers stall and retransmit like TCP with a zero
+  window), `drain_pending_in` obeys the same bound for stashed packets,
+  and outgoing packets advertise honest remaining space instead of the
+  constant. Undelivered receive memory per connection is now bounded at
+  RECV_WINDOW_BYTES (+≤1 packet overshoot from check-before-append)
+  regardless of peer behavior. Three unit tests; both guards
+  independently mutation-checked (removing either fails its test).
+
 - [x] **P0 — `complete_count()` can exceed `wanted_count()` under
   `--select` after a resume.** [DONE] Added
   `PieceManager::wanted_complete_count()` (counts `wanted & local`) and
