@@ -778,8 +778,9 @@ async fn cmd_create(
             PathBuf::from(format!("{}.torrent", t.info.name))
         }
     };
-    tokio::fs::write(&out_path, &bytes)
-        .await
+    // Owner-only: a private torrent's announce URL can embed the user's
+    // passkey, so the .torrent file must not be world-readable.
+    rustytorrent::util::write_private_file(&out_path, &bytes)
         .with_context(|| format!("writing {}", out_path.display()))?;
 
     println!("Created:    {}", out_path.display());
