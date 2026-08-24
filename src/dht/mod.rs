@@ -210,6 +210,112 @@ mod warm_contacts_tests {
         assert_eq!(kept[1].addr.to_string(), "192.168.1.50:51413");
     }
 
+    /// END-TO-END pin of the strictness threading: `Dht::spawn(strict)`
+    /// must reach the wire-ingest filter through SharedState. A scripted
+    /// bootstrap node answers our find_node with one LAN + one public
+    /// contact; with strict=true the routing table must hold ONLY the
+    /// public contact, with strict=false both survive (control).
+    ///
+    /// Mutation target: hardcoding `false` at the server::spawn ->
+    /// SharedState hand-off makes the strict case grow to 2 and fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_threads_martian_strictness_into_wire_ingest() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+
+        async fn scripted_node(
+            lan_included: bool,
+            done: Arc<AtomicBool>,
+        ) -> (std::net::SocketAddr, u16) {
+            let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 1500];
+                // One-shot responder: first datagram gets the crafted reply.
+                if let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                    if let Ok(msg) = krpc::Message::decode(&buf[..n]) {
+                        let tid = match &msg {
+                            krpc::Message::Query { transaction_id, .. }
+                            | krpc::Message::Response { transaction_id, .. }
+                            | krpc::Message::Error { transaction_id, .. } => transaction_id.clone(),
+                        };
+                        let mut nodes_bytes = Vec::new();
+                        // Public contact first.
+                        {
+                            let mut row = Vec::with_capacity(26);
+                            row.extend_from_slice(&[9u8; 20]);
+                            row.extend_from_slice(&[93, 184, 215, 14]);
+                            row.extend_from_slice(&6881u16.to_be_bytes());
+                            nodes_bytes.extend_from_slice(&row);
+                        }
+                        if lan_included {
+                            let mut row = Vec::with_capacity(26);
+                            row.extend_from_slice(&[8u8; 20]);
+                            row.extend_from_slice(&[192, 168, 1, 50]);
+                            row.extend_from_slice(&51413u16.to_be_bytes());
+                            nodes_bytes.extend_from_slice(&row);
+                        }
+                        if let Ok(parsed) = krpc::parse_nodes_bytes(&nodes_bytes) {
+                            let resp = krpc::Message::Response {
+                                transaction_id: tid,
+                                response: krpc::Response::Nodes {
+                                    id: NodeId([0xAB; 20]),
+                                    nodes: parsed,
+                                },
+                            };
+                            let _ = sock.send_to(&resp.encode(), from).await;
+                            done.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+            (addr, 0)
+        }
+
+        async fn table_size_after(dht: &Dht, want: usize) -> usize {
+            let deadline = std::time::Instant::now() + Duration::from_secs(6);
+            loop {
+                let n = dht.routing_table_size().await;
+                if n >= want || std::time::Instant::now() > deadline {
+                    return n;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        // ---- strict = true (anonymous/proxied session) ----
+        {
+            let done = Arc::new(AtomicBool::new(false));
+            let (node_addr, _) = scripted_node(true, done.clone()).await;
+            let dht = Dht::spawn(0, vec![node_addr.to_string()], None, None, true)
+                .await
+                .unwrap();
+            let size = table_size_after(&dht, 2).await;
+            // Table = fake bootstrap node itself (responders to OUR OWN
+            // queries are inserted unfiltered by design — they are
+            // addresses we chose to dial — plus the PUBLIC ingested
+            // contact; the LAN one must be refused).
+            assert_eq!(
+                size, 2,
+                "strict DHT must ingest the public contact but NOT the LAN one"
+            );
+        }
+
+        // ---- strict = false (clearnet control) ----
+        {
+            let done = Arc::new(AtomicBool::new(false));
+            let (node_addr, _) = scripted_node(true, done.clone()).await;
+            let dht = Dht::spawn(0, vec![node_addr.to_string()], None, None, false)
+                .await
+                .unwrap();
+            let size = table_size_after(&dht, 3).await;
+            assert_eq!(size, 3, "non-strict control keeps bootstrap + public + LAN");
+        }
+    }
+
     /// The coupling pin: under anonymity (strict = true) LAN/ULA targets
     /// from a tampered persist file must ALSO be refused — an anonymous
     /// client probing RFC1918 through its tunnel is exactly the SSRF the
