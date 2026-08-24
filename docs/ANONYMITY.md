@@ -56,6 +56,14 @@ forces remote DNS resolution — no clearnet DNS leak from tracker hostnames.
 UDP trackers cannot be proxied through SOCKS5 CONNECT (which is TCP-only);
 when a proxy is set, UDP trackers in the `announce-list` are silently skipped.
 
+**Credential hygiene:** `--socks5-user` / `--socks5-pass` sit in the process
+argv, which every local user on a multi-user box can read from `ps`. Prefer
+the environment fallbacks — `RUSTYTORRENT_SOCKS5_USER` and
+`RUSTYTORRENT_SOCKS5_PASS` (empty values are treated as unset); an explicit
+flag always wins. Proxy credentials never appear in log lines, error
+messages, or `Debug` output; with `--tor-isolation` the username is rotated
+per connection for stream isolation.
+
 ### `--anonymous`
 
 A bundle flag that:
