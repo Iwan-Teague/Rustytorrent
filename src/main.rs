@@ -1037,7 +1037,15 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
                         peers = resp.peers.len(),
                         "tracker bootstrap"
                     );
-                    pool.extend(resp.peers);
+                    // Same SSRF rule as the engine: never dial martians a
+                    // tracker hands us, and in anonymous/proxied mode do
+                    // not let it aim our proxy at its own LAN either.
+                    let strict = anonymous || !proxies.is_empty();
+                    pool.extend(
+                        resp.peers
+                            .into_iter()
+                            .filter(|a| rustytorrent::util::is_dialable_peer_addr(a, strict)),
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(target: "magnet", tracker = %rustytorrent::tracker::redact_url_query(url), error = %e, "tracker failed");

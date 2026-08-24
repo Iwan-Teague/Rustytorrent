@@ -561,7 +561,15 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
         let mut pool: Vec<SocketAddr> = Vec::new();
         for url in &magnet.trackers {
             match crate::tracker::announce_with_proxy_anon(url, &req, None, false, None).await {
-                Ok(resp) => pool.extend(resp.peers),
+                Ok(resp) => {
+                    // Daemon runs clearnet-only (no anonymous/proxy knobs),
+                    // so the non-strict half applies: refuse the martians a
+                    // tracker can hand us (loopback, link-local metadata
+                    // endpoint, multicast, ...). See util::is_dialable_peer_addr.
+                    pool.extend(resp.peers.into_iter().filter(|a| {
+                        crate::util::is_dialable_peer_addr(a, false)
+                    }));
+                }
                 Err(e) => {
                     tracing::debug!(target: "web", tracker = %crate::tracker::redact_url_query(url), error = %e, "magnet tracker bootstrap failed")
                 }
