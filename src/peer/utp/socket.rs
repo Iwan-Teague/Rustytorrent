@@ -98,6 +98,20 @@ const MAX_CONNS: usize = 1024;
 /// streams' writers together.
 const SEND_BUF_CAP_BYTES: usize = 256 * 1024;
 
+/// Receive-delivery pacing: the driver hands application bytes to the
+/// stream in chunks of at most [`DELIVER_MSG_BYTES`] over a bounded
+/// queue ([`DELIVER_QUEUE_MSGS`] messages ≈ 1 MiB ceiling). When the
+/// queue is full because the application isn't reading, the driver
+/// simply leaves the rest in the connection's `in_buf` — which keeps
+/// the receive window pinned, so the peer is throttled too. Together
+/// with `RECV_WINDOW_BYTES` this hard-bounds undelivered inbound memory
+/// per connection at ~2 MiB no matter how either side behaves; without
+/// it, the unbounded driver→stream channel would let a hostile peer +
+/// stalled reader grow memory via repeated fill→drain→refill cycles
+/// even with the window enforced on `in_buf`.
+const DELIVER_MSG_BYTES: usize = 64 * 1024;
+const DELIVER_QUEUE_MSGS: usize = 16;
+
 /// Shared write-side credit ledger for one connection: how many bytes
 /// the stream side has reserved against [`SEND_BUF_CAP_BYTES`], and the
 /// waker of any writer currently blocked on full credit.
@@ -199,7 +213,7 @@ fn broken_pipe() -> io::Error {
 /// reads delivered bytes from.
 type PendingDial = (
     oneshot::Sender<io::Result<UtpStream>>,
-    mpsc::UnboundedReceiver<Vec<u8>>,
+    mpsc::Receiver<Vec<u8>>,
 );
 
 /// Messages from a [`UtpStream`] to the owning driver.
@@ -240,9 +254,10 @@ struct Entry {
     /// back to the gate — exactly the bytes that left the connection
     /// (acked or pruned) since the previous event.
     last_outstanding: usize,
-    /// Driver → stream: in-order application bytes. Dropping this
-    /// sender signals EOF to the stream's `AsyncRead`.
-    deliver: mpsc::UnboundedSender<Vec<u8>>,
+    /// Driver → stream: in-order application bytes, bounded (see
+    /// [`DELIVER_QUEUE_MSGS`]). Dropping this sender signals EOF to the
+    /// stream's `AsyncRead`.
+    deliver: mpsc::Sender<Vec<u8>>,
     /// For an outgoing dial: the responder that delivers the finished
     /// `UtpStream` once we reach `Connected`, paired with the receive
     /// half the stream will read from. `None` for inbound connections.
@@ -271,7 +286,7 @@ pub struct UtpStream {
     cmd: mpsc::UnboundedSender<Command>,
     /// Write-credit ledger shared with the driver (see [`SendGate`]).
     gate: Arc<SendGate>,
-    incoming: mpsc::UnboundedReceiver<Vec<u8>>,
+    incoming: mpsc::Receiver<Vec<u8>>,
     /// Leftover bytes from a delivered chunk that didn't fit the last
     /// read's buffer.
     read_rem: Vec<u8>,
@@ -283,7 +298,7 @@ impl UtpStream {
     fn new(
         key: ConnKey,
         cmd: mpsc::UnboundedSender<Command>,
-        incoming: mpsc::UnboundedReceiver<Vec<u8>>,
+        incoming: mpsc::Receiver<Vec<u8>>,
         gate: Arc<SendGate>,
     ) -> Self {
         Self {
@@ -560,7 +575,7 @@ impl Driver {
     async fn on_datagram(&mut self, data: &[u8], peer: SocketAddr) {
         let pkt = match Packet::decode(data) {
             Ok(p) => p,
-            Err(_) => return, // garbage / non-µTP datagram — ignore.
+            Err(_) => return,
         };
         let now = Instant::now();
         // One-way delay of this packet (peer clock vs ours, offset and
@@ -622,7 +637,7 @@ impl Driver {
                 // half-open entry may have been reaped.
                 tracing::debug!(target: "utp", %peer, "connection cap reached; dropping inbound SYN");
             } else if let Some((conn, state)) = Connection::new_receiver(&pkt, now) {
-                let (dtx, drx) = mpsc::unbounded_channel();
+                let (dtx, drx) = mpsc::channel(DELIVER_QUEUE_MSGS);
                 let gate = SendGate::new();
                 let stream = UtpStream::new(recv_key, self.cmd_tx.clone(), drx, Arc::clone(&gate));
                 self.conns.insert(
@@ -655,7 +670,7 @@ impl Driver {
                 let recv_id = self.free_recv_id(peer);
                 let key: ConnKey = (peer, recv_id);
                 let (conn, syn) = Connection::new_initiator(recv_id, now);
-                let (dtx, drx) = mpsc::unbounded_channel();
+                let (dtx, drx) = mpsc::channel(DELIVER_QUEUE_MSGS);
                 let gate = SendGate::new();
                 self.conns.insert(
                     key,
@@ -740,9 +755,21 @@ impl Driver {
             None => return,
         };
 
-        let received = entry.conn.take_received(usize::MAX);
-        if !received.is_empty() {
-            let _ = entry.deliver.send(received);
+        // Deliver received bytes upward — but only while the bounded
+        // queue has room. If the application isn't reading, the leftover
+        // bytes STAY in `in_buf`, which keeps the receive window pinned
+        // and throttles the peer (see DELIVER_QUEUE_MSGS). Capacity is
+        // checked before taking because only this driver task sends, so
+        // a positive reading guarantees `try_send` succeeds; a closed
+        // receiver just means nobody wants the bytes anymore.
+        while entry.deliver.capacity() > 0 {
+            let chunk = entry.conn.take_received(DELIVER_MSG_BYTES);
+            if chunk.is_empty() {
+                break;
+            }
+            if entry.deliver.try_send(chunk).is_err() {
+                break;
+            }
         }
 
         outgoing.extend(entry.conn.pending_send_packets(now));
@@ -809,6 +836,8 @@ impl Driver {
 
 #[cfg(test)]
 mod tests {
+    use super::super::connection::RECV_WINDOW_BYTES;
+    use super::super::packet::Payload;
     use super::*;
     use std::collections::HashSet;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1260,6 +1289,174 @@ mod tests {
                          Close did not terminate the send gate"
                     );
                 }
+            }
+        }
+    }
+
+    fn seq_gt_u16(a: u16, b: u16) -> bool {
+        let d = a.wrapping_sub(b);
+        d != 0 && d < 0x8000
+    }
+
+    /// Receive-side backpressure, end to end: a sender that stays within
+    /// one advertised window ahead (semi-conforming) floods a stream
+    /// whose application never reads. Our cumulative acks must PLATEAU
+    /// at roughly RECV_WINDOW_BYTES + the bounded delivery queue — not
+    /// track every arriving packet — because a stalled app stops the
+    /// driver from draining in_buf into the bounded queue, which pins
+    /// the window and throttles the peer. Reading afterwards must resume
+    /// delivery and return byte-exact data.
+    ///
+    /// Mutation target: an unbounded driver-to-stream channel lets acks
+    /// run past the bound via repeated fill-drain-refill cycles, failing
+    /// the plateau assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_reader_pins_sender_at_window_plus_queue() {
+        use super::super::packet::PacketType as PT;
+
+        const PKT: usize = 1200;
+        const TOTAL_PKTS: usize = (3 * 1024 * 1024) / PKT; // > window+queue
+        let pattern_byte = |i: usize| (i % 251 + 1) as u8;
+
+        let server = UtpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let saddr = server.local_addr();
+        // Shared by main + sender task for observing our STATE acks.
+        let fake = Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+                .await
+                .unwrap(),
+        );
+
+        let syn_cid: u16 = 4242;
+        let syn = Packet::new(PT::Syn, syn_cid, 1, 0);
+        fake.send_to(&syn.encode(), saddr).await.unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = fake.recv_from(&mut buf).await.unwrap();
+        let state = Packet::decode(&buf[..n]).expect("STATE decodes");
+        assert_eq!(state.packet_type, PT::State);
+        assert_eq!(state.wnd_size, RECV_WINDOW_BYTES); // nothing delivered yet
+        let token = state.seq_nr;
+
+        // Highest contiguous ack seen so far (shared with the sender task).
+        let frontier = Arc::new(std::sync::atomic::AtomicU16::new(1));
+
+        let sender_fake = Arc::clone(&fake);
+        let sender_frontier = Arc::clone(&frontier);
+        let sender = tokio::spawn(async move {
+            let mut sent_max: u16 = 1; // SYN was seq 1; first DATA is seq 2
+            let mut resend_cursor: u16 = 2;
+            let deadline = Instant::now() + Duration::from_secs(25);
+            while Instant::now() < deadline {
+                // Absorb acks.
+                let mut rbuf = vec![0u8; 2048];
+                while let Ok(Ok((n, _))) =
+                    tokio::time::timeout(Duration::from_millis(2), sender_fake.recv_from(&mut rbuf))
+                        .await
+                {
+                    if let Ok(p) = Packet::decode(&rbuf[..n]) {
+                        if p.packet_type == PT::State {
+                            let f = sender_frontier.load(Ordering::Relaxed);
+                            if seq_gt_u16(p.ack_nr, f) {
+                                sender_frontier.store(p.ack_nr, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                let f = sender_frontier.load(Ordering::Relaxed);
+                if f as usize == TOTAL_PKTS + 1 {
+                    return; // last seq (TOTAL_PKTS+1) acked
+                }
+                // Never more than one window ahead of the frontier.
+                let window_pkts = RECV_WINDOW_BYTES as usize / PKT;
+                let send_seq: Option<u16> = if (sent_max as usize - f as usize) < window_pkts
+                    && (sent_max as usize) < TOTAL_PKTS + 1
+                {
+                    sent_max += 1;
+                    Some(sent_max)
+                } else if sent_max > f {
+                    // Window ahead is full: retransmit the oldest
+                    // still-unacked packet (RTO analogue). Refused
+                    // packets were never buffered, so this is both
+                    // safe and required for recovery once the app
+                    // starts reading.
+                    resend_cursor = resend_cursor.max(f + 1);
+                    let s = resend_cursor;
+                    resend_cursor = if s >= sent_max { f + 1 } else { s + 1 };
+                    Some(s)
+                } else {
+                    None
+                };
+                if let Some(seq) = send_seq {
+                    let idx = seq as usize - 2;
+                    let data: Vec<u8> = (idx * PKT..idx * PKT + PKT).map(pattern_byte).collect();
+                    // As the receiver, our recv_id is syn_cid+1 — what inbound packets carry.
+                    let mut pkt = Packet::new(
+                        PT::Data,
+                        syn_cid.wrapping_add(1),
+                        seq,
+                        token.wrapping_sub(1),
+                    );
+                    pkt.payload = Payload::slice(Arc::from(data), 0, PKT);
+                    sender_fake.send_to(&pkt.encode(), saddr).await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        // Accepted stream on our side; nobody reads it yet. The sender
+        // task spawned above supplies the first non-SYN packet that
+        // confirms the return path and lets accept() surface.
+        // Accepted stream on our side; nobody reads it yet. The sender
+        // task spawned above supplies the first non-SYN packet that
+        // confirms the return path and lets accept() surface.
+        let accepted = tokio::time::timeout(Duration::from_secs(5), server.accept()).await;
+        let Ok(Ok((mut stream, _))) = accepted else {
+            panic!("accept did not surface after the fake acked the token");
+        };
+
+        // Phase 1 — no reader. Wait until the ack frontier stabilises
+        // (two identical samples ~300 ms apart), then bound it.
+        let bound_pkts =
+            RECV_WINDOW_BYTES as usize / PKT + DELIVER_QUEUE_MSGS * (DELIVER_MSG_BYTES / PKT) + 2;
+        let mut prev = frontier.load(Ordering::Relaxed);
+        let pinned;
+        loop {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let cur = frontier.load(Ordering::Relaxed);
+            if cur == prev || cur as usize > bound_pkts {
+                pinned = cur;
+                break;
+            }
+            prev = cur;
+        }
+        assert!(pinned > 1, "no progress at all — test setup broken");
+        assert!(
+            (pinned as usize) <= bound_pkts,
+            "acks ran past window+queue bound: {pinned} pkts > {bound_pkts} — \
+             driver-to-stream queue is not bounded"
+        );
+
+        // Phase 2 — read everything; the pin releases and the transfer
+        // completes byte-exactly.
+        let reader = tokio::spawn(async move {
+            let mut got = vec![0u8; TOTAL_PKTS * PKT];
+            stream.read_exact(&mut got).await.expect("read all bytes");
+            got
+        });
+        let got = tokio::time::timeout(Duration::from_secs(25), reader)
+            .await
+            .expect("full transfer completes once the app reads")
+            .expect("reader ok");
+        tokio::time::timeout(Duration::from_secs(5), sender)
+            .await
+            .expect("sender joins after full ack")
+            .expect("sender ok");
+        for (i, b) in got.iter().enumerate() {
+            if *b != pattern_byte(i) {
+                panic!("byte mismatch at index {i}");
             }
         }
     }
