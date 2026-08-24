@@ -349,7 +349,8 @@ Outstanding gaps:
 
 These tasks apply across all phases:
 
-- [ ] Keep `CHANGELOG.md` updated as features land
+- [x] Keep `CHANGELOG.md` updated as features land (created with the
+      unreleased branch summary; extend per change going forward)
 - [ ] Add `tracing` spans to all major async boundaries
 - [x] Run `clippy` with `--deny warnings` in CI (.github/workflows/ci.yml)
 - [x] Run `cargo fmt` check in CI (.github/workflows/ci.yml)
