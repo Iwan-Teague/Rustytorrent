@@ -526,7 +526,14 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
   storage flush / tracker-stopped isn't truncated by the old fixed
   500 ms. (`remove()`'s detached 10 s reaper is left: it self-completes,
   so it's bounded, not a real leak.)
-- [x] **P1 — production panic audit.** [DONE — clean] Scanned the hot
+- [x] **P1 — production panic audit.** [DONE — clean; RE-RUN 2026-08
+  after ~2k added lines] Re-swept every non-test unwrap/expect/panic!
+  site. Pre-existing classifications all hold. Only NEW entries: the
+  two SendGate waiter-mutex expects (std Mutex poisons only if a panic
+  happens while holding it; those sections are two lines with no
+  fallible ops — and failing loudly there is the desired fail-closed
+  behavior). Also verified this pass: `cargo deny check` — advisories,
+  bans, licenses, sources all ok.
   files' non-test code: there are NO production `.unwrap()`s (the agent's
   `main.rs send().unwrap()` claim was a false positive). The only
   `.expect()`s left (`engine.rs` passphrase/dht, `dht/server.rs` persist)
