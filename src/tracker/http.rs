@@ -185,6 +185,16 @@ fn url_host_is_ipv6_literal(url: &str) -> bool {
     host.starts_with('[')
 }
 
+/// Scrub a reqwest error string of every sensitive URL form. reqwest
+/// embeds the FULL request URL (with the percent-encoded info-hash,
+/// peer-id and any passkey carried by the base) in its Display output, so
+/// both the built announce URL and the bare base URL must be replaced;
+/// scrubbing only the base would miss the query-bearing form entirely.
+fn scrub_announce_error(msg: &str, full_url: &str, base_url: &str) -> String {
+    let once = crate::tracker::scrub_url_from_message(msg, full_url);
+    crate::tracker::scrub_url_from_message(&once, base_url)
+}
+
 async fn announce_inner(
     base_url: &str,
     req: &AnnounceRequest,
@@ -238,7 +248,7 @@ async fn announce_inner(
             // scheme://host/path before it enters our error text.
             Error::Tracker(format!(
                 "http send: {}",
-                crate::tracker::scrub_url_from_message(&e.to_string(), base_url)
+                scrub_announce_error(&e.to_string(), &url, base_url)
             ))
         })?
         .bytes()
@@ -246,7 +256,7 @@ async fn announce_inner(
         .map_err(|e| {
             Error::Tracker(format!(
                 "http recv: {}",
-                crate::tracker::scrub_url_from_message(&e.to_string(), base_url)
+                scrub_announce_error(&e.to_string(), &url, base_url)
             ))
         })?;
     parse_response(&bytes)
@@ -453,6 +463,58 @@ mod tests {
         let url = build_url("http://t.example/announce?key=abc", &req);
         // Should append with '&', not '?'.
         assert!(url.starts_with("http://t.example/announce?key=abc&info_hash="));
+    }
+
+    #[test]
+    fn announce_error_scrub_covers_full_built_url_not_just_base() {
+        let req = AnnounceRequest {
+            info_hash: [0xAB; 20],
+            peer_id: *b"-RT0100-aaaaaaaaaaaa",
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: 1000,
+            event: crate::tracker::Event::Started,
+            num_want: 50,
+        };
+        let base = "http://t.example/announce?passkey=SECRET123";
+        let full = build_url(base, &req);
+        assert!(full.contains("SECRET123"));
+        // What reqwest's Display actually embeds on send/recv failure.
+        let err = format!("error sending request for url ({full})");
+
+        let scrubbed = scrub_announce_error(&err, &full, base);
+
+        assert!(
+            !scrubbed.contains("SECRET123"),
+            "passkey leaked through scrubbed error: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("%AB"),
+            "percent-encoded info-hash leaked through: {scrubbed}"
+        );
+        assert!(scrubbed.contains("t.example"), "host should survive: {scrubbed}");
+    }
+
+    #[test]
+    fn announce_error_scrub_still_catches_bare_base_form() {
+        let req = AnnounceRequest {
+            info_hash: [0; 20],
+            peer_id: [0; 20],
+            port: 0,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            event: crate::tracker::Event::None,
+            num_want: 1,
+        };
+        let base = "http://t.example/announce?key=abc";
+        let full = build_url(base, &req);
+        let err = format!("redirect to {base} failed");
+
+        let scrubbed = scrub_announce_error(&err, &full, base);
+
+        assert!(!scrubbed.contains("key=abc"), "leaked: {scrubbed}");
     }
 
     #[test]
