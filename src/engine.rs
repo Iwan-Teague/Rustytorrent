@@ -319,6 +319,15 @@ pub fn dht_martian_strict(anonymous: bool, proxied: bool) -> bool {
     anonymous || proxied
 }
 
+impl EngineConfig {
+    /// Martian-filter strictness for EVERY peer-ingestion site (tracker
+    /// announces, DHT lookups, PEX). Single source of truth so the
+    /// anonymity inputs can't drift apart between call sites.
+    pub fn martians_strict(&self) -> bool {
+        dht_martian_strict(self.anonymous, !self.proxies.is_empty())
+    }
+}
+
 /// Whether this session may open an inbound peer listener. A direct inbound
 /// TCP connection arrives over the real network path — it exposes the real
 /// IP to whoever connects and ties it to the info-hash via the completed
@@ -945,7 +954,7 @@ impl TorrentEngine {
                         peers = resp.peers.len(),
                         "first announce"
                     );
-                    let strict = self.cfg.anonymous || !self.cfg.proxies.is_empty();
+                    let strict = self.cfg.martians_strict();
                     let (dialable, dropped) = filter_dialable_peers(&resp.peers, strict);
                     if dropped > 0 {
                         tracing::debug!(
@@ -1027,7 +1036,7 @@ impl TorrentEngine {
                 self.cfg.dht_bootstrap.clone()
             };
             let persist = Some(crate::dht::persist::default_path());
-            let dht_strict = dht_martian_strict(self.cfg.anonymous, !self.cfg.proxies.is_empty());
+            let dht_strict = self.cfg.martians_strict();
             match crate::dht::Dht::spawn(
                 self.cfg.listen_port,
                 bootstrap,
@@ -1171,7 +1180,7 @@ impl TorrentEngine {
                                 self.cfg.anonymous,
                             ));
                             tracker_timer.tick().await;
-                            let strict = self.cfg.anonymous || !self.cfg.proxies.is_empty();
+                            let strict = self.cfg.martians_strict();
                             let (dialable, dropped) =
                                 filter_dialable_peers(&resp.peers, strict);
                             if dropped > 0 {
@@ -1326,7 +1335,7 @@ impl TorrentEngine {
                             // martian half of the filter applies even though
                             // strict mode never reaches here (DHT is off
                             // under anonymous/proxied sessions).
-                            let strict = self.cfg.anonymous || !self.cfg.proxies.is_empty();
+                            let strict = self.cfg.martians_strict();
                             let (dialable, dropped) =
                                 filter_dialable_peers(&new_peers, strict);
                             if dropped > 0 {
@@ -1716,7 +1725,7 @@ impl TorrentEngine {
                     // they get the same martian screening as tracker and DHT
                     // ingestion: never dial loopback/link-local/metadata
                     // targets a hostile peer tries to aim us at.
-                    let strict = self.cfg.anonymous || !self.cfg.proxies.is_empty();
+                    let strict = self.cfg.martians_strict();
                     let (dialable, dropped) = filter_dialable_peers(&pex_peers, strict);
                     if dropped > 0 {
                         tracing::debug!(
@@ -2361,6 +2370,28 @@ fn jittered_interval(base: Duration, anonymous: bool) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engineconfig_martians_strict_matches_derivation() {
+        // Pins the EngineConfig wiring of the derivation so no ingestion
+        // site can silently diverge from dht_martian_strict.
+        use crate::socks5::ProxyConfig;
+        assert!(!EngineConfig::default().martians_strict());
+        assert!(EngineConfig {
+            anonymous: true,
+            ..Default::default()
+        }
+        .martians_strict());
+        assert!(EngineConfig {
+            proxies: vec![ProxyConfig {
+                addr: "127.0.0.1:1".parse().unwrap(),
+                credentials: None,
+                isolation: false,
+            }],
+            ..Default::default()
+        }
+        .martians_strict());
+    }
 
     #[test]
     fn dht_martian_strict_truth_table() {

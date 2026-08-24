@@ -1110,7 +1110,8 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
                     // Same SSRF rule as the engine: never dial martians a
                     // tracker hands us, and in anonymous/proxied mode do
                     // not let it aim our proxy at its own LAN either.
-                    let strict = anonymous || !proxies.is_empty();
+                    let strict =
+                        rustytorrent::engine::dht_martian_strict(anonymous, !proxies.is_empty());
                     pool.extend(
                         resp.peers
                             .into_iter()
