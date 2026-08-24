@@ -232,10 +232,23 @@ async fn announce_inner(
     let bytes = builder
         .send()
         .await
-        .map_err(|e| Error::Tracker(format!("http send: {e}")))?
+        .map_err(|e| {
+            // reqwest's error Display embeds the full request URL — which
+            // may carry a passkey query param. Scrub it back to
+            // scheme://host/path before it enters our error text.
+            Error::Tracker(format!(
+                "http send: {}",
+                crate::tracker::scrub_url_from_message(&e.to_string(), base_url)
+            ))
+        })?
         .bytes()
         .await
-        .map_err(|e| Error::Tracker(format!("http recv: {e}")))?;
+        .map_err(|e| {
+            Error::Tracker(format!(
+                "http recv: {}",
+                crate::tracker::scrub_url_from_message(&e.to_string(), base_url)
+            ))
+        })?;
     parse_response(&bytes)
 }
 
