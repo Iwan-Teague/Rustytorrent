@@ -179,12 +179,17 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
             // RFC 4291): ::2 and friends are reserved, and Linux dials them
             // as local addresses just like 0.0.0.0/8 in v4.
             let zeronet6 = segs[..7].iter().all(|&s| s == 0);
+            // RFC 6666 discard-only block (100::/64): packets sent here are
+            // dropped by construction; it exists so networks can blackhole
+            // traffic. Never a swarm peer.
+            let discard_only = segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0;
             !nat64
                 && !nat64_local_use
                 && !six_to_four
                 && !teredo
                 && !doc6
                 && !zeronet6
+                && !discard_only
                 && !v6.is_unicast_link_local()
                 && !(strict && v6.is_unique_local())
         }
@@ -381,6 +386,22 @@ mod tests {
         }
         // Quad-9's real v6 anycast must stay dialable (2001:x but not db8).
         let addr: SocketAddr = "[2620:fe::fe]:51413".parse().unwrap();
+        assert!(is_dialable_peer_addr(&addr, false));
+    }
+
+    #[test]
+    fn discard_only_v6_addrs_are_never_dialable() {
+        // RFC 6666 discard-only block (100::/64): traffic sent there is
+        // dropped by construction; a hostile peer source gains nothing but
+        // we should not waste dials — and the range must never be treated
+        // as a routable contact.
+        for a in ["[100::1]:6881", "[100::abcd:ef12]:51413"] {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert!(!is_dialable_peer_addr(&addr, false), "{a} clearnet");
+            assert!(!is_dialable_peer_addr(&addr, true), "{a} strict");
+        }
+        // Control: 200:: is NOT inside 100::/64 and stays dialable.
+        let addr: SocketAddr = "[200::1]:51413".parse().unwrap();
         assert!(is_dialable_peer_addr(&addr, false));
     }
 
