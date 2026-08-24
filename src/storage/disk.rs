@@ -112,7 +112,11 @@ async fn run_storage(
             continue;
         }
         if let Some(parent) = span.path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            // Data directories carry the torrent's file names — create them
+            // owner-only (0700) so another local user can't list what we are
+            // downloading. Existing directories are left untouched (the same
+            // created-only tightening policy as util::ensure_private_dir).
+            crate::util::ensure_private_dir(parent)?;
         }
         let f = data_open_options().open(&span.path).await?;
         // Sparse-allocate up to the file length.
@@ -472,6 +476,49 @@ mod tests {
             format!("{mode:o}"),
             "600",
             "downloaded file must be created owner-only"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The directories holding download data (torrent name dir and any
+    /// nested subdirs from multi-file paths) must be created owner-only:
+    /// a world-readable listing reveals the torrent's file names — what
+    /// this machine is downloading — to every other local user.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn created_dirs_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir();
+        // A nested path forces run_storage to create pkg/sub/ itself; tmp
+        // already exists wide, which ensure_private_dir deliberately leaves
+        // alone (created-only tightening policy).
+        let t = make_torrent_multi(100, vec![(100, "sub/a.txt")]);
+        let layout = Layout::from_torrent(tmp.clone(), &t);
+        let dir = layout.files[0].path.parent().unwrap().to_path_buf();
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+        let handle = spawn_storage_task(layout.clone(), cmd_rx, ev_tx);
+        cmd_tx
+            .send(StorageCommand::Write {
+                index: 0,
+                data: vec![9u8; 100],
+            })
+            .await
+            .unwrap();
+        match ev_rx.recv().await.unwrap() {
+            StorageEvent::Written { index } => assert_eq!(index, 0),
+            ev => panic!("unexpected event {ev:?}"),
+        }
+        cmd_tx.send(StorageCommand::Shutdown).await.unwrap();
+        let _ = handle.await;
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            format!("{mode:o}"),
+            "700",
+            "download directory must be created owner-only"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }

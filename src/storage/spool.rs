@@ -122,7 +122,10 @@ impl EncryptedSpool {
         total_length: u64,
     ) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            // The spool directory's listing leaks per-torrent activity
+            // (info-hash-named files); create it owner-only like the spool
+            // file itself. Existing dirs are left untouched.
+            crate::util::ensure_private_dir(parent)?;
         }
         let mut file = private_open_options().open(path).await?;
         let existing_len = file.metadata().await?.len();
@@ -533,6 +536,29 @@ mod tests {
             .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(format!("{mode:o}"), "600", "spool must be owner-only");
+    }
+
+    /// The spool's parent directory is created by open_or_create when
+    /// missing and must be owner-only too: its listing (info-hash-named
+    /// spool files) reveals per-torrent activity to other local users.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_spool_parent_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir();
+        let dir = tmp.join("spool-dir");
+        let path = dir.join("spool.bin");
+        let _spool = EncryptedSpool::open_or_create(&path, "pw", 1024, 1, 1024)
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            format!("{mode:o}"),
+            "700",
+            "fresh spool parent dir must be owner-only"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[tokio::test]
