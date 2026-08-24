@@ -83,6 +83,15 @@ pub async fn announce_with_proxy_anon(
     proxy: Option<&crate::socks5::ProxyConfig>,
     anonymous: bool,
 ) -> Result<AnnounceResponse> {
+    if anonymous && proxy.is_none() {
+        // Fail closed: without a proxy an http(s):// announce rides the
+        // real interface (and resolves DNS locally), leaking our IP.
+        // Anonymous mode guarantees a SOCKS5 chain upstream; refuse
+        // outright if a caller ever violates that.
+        return Err(crate::error::Error::Tracker(format!(
+            "anonymous mode requires a SOCKS5 proxy; refusing direct tracker announce: {url}"
+        )));
+    }
     if url.starts_with("udp://") {
         if anonymous || proxy.is_some() {
             // Fail closed: UDP cannot ride the SOCKS5 CONNECT path, so
@@ -177,8 +186,71 @@ mod tests {
             .expect_err("anonymous UDP announce must be refused");
         let msg = format!("{err}");
         assert!(
-            msg.contains("skipping UDP tracker") && msg.contains("anonymous"),
+            msg.contains("refusing direct tracker announce") && msg.contains("anonymous"),
             "expected anonymity refusal, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_announce_refused_while_proxy_configured_even_without_anon() {
+        // UDP cannot ride a SOCKS5 CONNECT: with a proxy configured the
+        // announce would either leak direct or fail — refuse explicitly
+        // (independent of the anonymity guard).
+        let cfg = crate::socks5::ProxyConfig {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            credentials: None,
+            isolation: false,
+        };
+        let err = announce_with_proxy_anon(
+            "udp://proxy-guard-test.invalid:80",
+            &req(),
+            Some(&cfg),
+            false,
+        )
+        .await
+        .expect_err("proxied UDP announce must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("skipping UDP tracker"),
+            "expected UDP-over-proxy refusal, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_announce_refused_in_anonymous_mode_without_proxy() {
+        // Same fail-closed contract for http(s):// trackers: no proxy +
+        // anonymous must refuse before any request/DNS work.
+        let err =
+            announce_with_proxy_anon("https://anon-guard-test.invalid/announce", &req(), None, true)
+                .await
+                .expect_err("anonymous HTTP announce without proxy must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refusing direct tracker announce") && msg.contains("anonymous"),
+            "expected anonymity refusal, got: {msg}"
+        );
+
+        // With a proxy configured the guard passes (request proceeds and
+        // fails on the bogus host instead of being refused). A proxied
+        // client would try to reach the proxy itself; either way it must
+        // NOT be the anonymity refusal.
+        let cfg = crate::socks5::ProxyConfig {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            credentials: None,
+            isolation: false,
+        };
+        let err = announce_with_proxy_anon(
+            "https://anon-guard-test.invalid/announce",
+            &req(),
+            Some(&cfg),
+            true,
+        )
+        .await
+        .expect_err("bogus host via dead proxy should fail somehow");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("refusing direct tracker announce"),
+            "guard over-fired with proxy present: {msg}"
         );
     }
 
