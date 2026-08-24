@@ -97,7 +97,8 @@ pub fn load(path: &Path) -> Option<(NodeId, Vec<Contact>)> {
 /// non-fatal by callers.
 pub fn save(path: &Path, node_id: NodeId, table: &RoutingTable) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        // 0700: routing table exposes which peers we talk to.
+        crate::util::ensure_private_dir(parent)?;
     }
     // `RoutingTable` doesn't expose `iter` directly; `closest` against our
     // own id with `count == len()` returns every contact, sorted nearest-first.
@@ -120,9 +121,10 @@ pub fn save(path: &Path, node_id: NodeId, table: &RoutingTable) -> std::io::Resu
     out.extend_from_slice(&v4_contacts.to_be_bytes());
     out.extend_from_slice(&payload);
     // Write to a temp file then rename, so an interrupted save doesn't
-    // leave a half-written file at the canonical location.
+    // leave a half-written file at the canonical location. The temp file
+    // is written owner-only (0600 on Unix) and the rename preserves that.
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &out)?;
+    crate::util::write_private_file(&tmp, &out)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }

@@ -39,7 +39,8 @@ pub struct DaemonStore {
 impl DaemonStore {
     /// Open (creating if needed) the store at `dir`.
     pub fn open(dir: PathBuf) -> io::Result<Self> {
-        std::fs::create_dir_all(&dir)?;
+        // 0700: the store reveals what the user hosts and where it lands.
+        crate::util::ensure_private_dir(&dir)?;
         Ok(Self { dir })
     }
 
@@ -92,13 +93,14 @@ impl DaemonStore {
         output: &Path,
         enable_dht: bool,
     ) -> io::Result<()> {
-        std::fs::write(self.torrent_path(info_hash), torrent_bytes)?;
+        // 0600: metainfo bytes + local output paths are private state.
+        crate::util::write_private_file(self.torrent_path(info_hash).as_path(), torrent_bytes)?;
         let sidecar = Sidecar {
             output: output.to_path_buf(),
             enable_dht,
         };
         let json = serde_json::to_vec(&sidecar).map_err(io::Error::other)?;
-        std::fs::write(self.sidecar_path(info_hash), json)?;
+        crate::util::write_private_file(self.sidecar_path(info_hash).as_path(), &json)?;
         Ok(())
     }
 
@@ -209,6 +211,44 @@ mod tests {
         // A bare .torrent with no .json sidecar must be skipped, not panic.
         std::fs::write(dir.join("deadbeef.torrent"), b"x").unwrap();
         assert!(store.load_all().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn saved_files_and_dir_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode()
+        }
+
+        // Unique base we may remove afterwards; the store dir itself is
+        // NOT pre-created, matching how open() meets it in production.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rt_dstore_perm_{}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = DaemonStore::open(dir.clone()).unwrap();
+        let ih = [0x11u8; 20];
+        store
+            .save(&ih, b"torrent-bytes", Path::new("/tmp/out"), false)
+            .unwrap();
+
+        assert_eq!(mode(&dir) & 0o777, 0o700, "store dir must be 0700");
+        let stem = crate::util::hex(&ih);
+        let torrent = dir.join(format!("{stem}.torrent"));
+        let sidecar = dir.join(format!("{stem}.json"));
+        assert_eq!(mode(&torrent) & 0o777, 0o600, "metainfo must be 0600");
+        assert_eq!(mode(&sidecar) & 0o777, 0o600, "sidecar must be 0600");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
