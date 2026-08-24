@@ -179,6 +179,8 @@ struct SharedDownloadArgs {
     /// Optional SOCKS5 username. Applied to the LAST hop only
     /// (typically the Tor / VPN endpoint that actually validates
     /// auth). Paired with --socks5-pass for RFC 1929 auth.
+    /// Prefer the RUSTYTORRENT_SOCKS5_USER environment variable instead:
+    /// argv is readable by every local user via `ps`.
     #[arg(long, requires = "socks5")]
     socks5_user: Option<String>,
     /// Optional SOCKS5 password. Required if --socks5-user is set.
@@ -884,6 +886,15 @@ fn effective_socks5_pass(flag: Option<String>, env: Option<String>) -> Option<St
     flag.or_else(|| env.filter(|p| !p.is_empty()))
 }
 
+/// Resolve the SOCKS5 username the same way as [`effective_socks5_pass`]:
+/// an explicit `--socks5-user` flag always wins; otherwise fall back to the
+/// `RUSTYTORRENT_SOCKS5_USER` environment variable (empty = unset). The
+/// username identifies the account with the proxy provider — identity
+/// material that should not have to sit in argv either.
+fn effective_socks5_user(flag: Option<String>, env: Option<String>) -> Option<String> {
+    flag.or_else(|| env.filter(|u| !u.is_empty()))
+}
+
 /// Whether the magnet bootstrap may announce to this tracker URL. Mirrors
 /// the engine's anonymous-mode refusal of cleartext `http://` trackers:
 /// the announce body is plaintext on the proxy→tracker leg, so under
@@ -905,11 +916,14 @@ async fn resolve_proxy_chain(
     socks5_pass: Option<String>,
     tor_isolation: bool,
 ) -> Result<Vec<rustytorrent::socks5::ProxyConfig>> {
-    // Credential hygiene: fall back to RUSTYTORRENT_SOCKS5_PASS so the
-    // password never has to sit in argv (readable from `ps` by every
-    // local user on multi-user boxes). An explicit flag wins.
+    // Credential hygiene: fall back to RUSTYTORRENT_SOCKS5_PASS /
+    // RUSTYTORRENT_SOCKS5_USER so neither credential has to sit in argv
+    // (readable from `ps` by every local user on multi-user boxes). An
+    // explicit flag always wins.
     let socks5_pass =
         effective_socks5_pass(socks5_pass, std::env::var("RUSTYTORRENT_SOCKS5_PASS").ok());
+    let socks5_user =
+        effective_socks5_user(socks5_user, std::env::var("RUSTYTORRENT_SOCKS5_USER").ok());
     if socks5.is_empty() {
         if socks5_user.is_some() || socks5_pass.is_some() || tor_isolation {
             anyhow::bail!("--socks5-user / --socks5-pass / --tor-isolation require --socks5");
@@ -1225,7 +1239,7 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{bootstrap_allows_tracker, effective_socks5_pass};
+    use super::{bootstrap_allows_tracker, effective_socks5_pass, effective_socks5_user};
 
     #[test]
     fn bootstrap_skips_cleartext_http_only_under_anonymous() {
@@ -1269,5 +1283,31 @@ mod tests {
     #[test]
     fn socks5_pass_absent_everywhere_is_none() {
         assert_eq!(effective_socks5_pass(None, None), None);
+    }
+
+    #[test]
+    fn socks5_user_flag_wins_over_env() {
+        assert_eq!(
+            effective_socks5_user(Some("flag".into()), Some("env".into())).as_deref(),
+            Some("flag")
+        );
+    }
+
+    #[test]
+    fn socks5_user_env_used_when_flag_absent() {
+        assert_eq!(
+            effective_socks5_user(None, Some("env-user".into())).as_deref(),
+            Some("env-user")
+        );
+    }
+
+    #[test]
+    fn socks5_user_empty_env_treated_as_unset() {
+        assert_eq!(effective_socks5_user(None, Some(String::new())), None);
+    }
+
+    #[test]
+    fn socks5_user_absent_everywhere_is_none() {
+        assert_eq!(effective_socks5_user(None, None), None);
     }
 }

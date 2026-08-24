@@ -104,7 +104,9 @@ rustytorrent download <file> [OPTIONS]
   --encrypt                 force outgoing MSE/PE (skip plain attempt)
   --socks5 host:port        route through SOCKS5; repeat to chain hops
                             (first = entry, last = exit; last hop sees creds)
-  --socks5-user U           SOCKS5 username for the LAST hop (requires --socks5)
+  --socks5-user U           SOCKS5 username for the LAST hop (requires --socks5);
+                            prefer RUSTYTORRENT_SOCKS5_USER env var — argv is
+                            readable by every local user via `ps`
   --socks5-pass P           SOCKS5 password for the LAST hop (requires --socks5-user);
                             prefer RUSTYTORRENT_SOCKS5_PASS env var — argv is
                             readable by every local user via `ps`
