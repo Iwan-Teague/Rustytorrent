@@ -105,6 +105,25 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P1 — DHT/web martian filters hardcoded strict=false (implicit
+  coupling with anonymity gating).** [review finding] Safe only while
+  `dht_wanted()` forbids DHT under anon/proxy; if that gating ever
+  loosened, the filter would NOT re-tighten to refuse RFC1918/ULA —
+  silently reopening an SSRF/LAN-probe path. DONE: new
+  `dht_martian_strict(anonymous, proxied)` derived beside `dht_wanted`;
+  threaded through `Dht::spawn -> server::spawn -> SharedState` into
+  BOTH wire-contact and warm-contact filtering; engine/magnet call
+  sites derive it, daemon passes false tied to its clearnet-only
+  design; web.rs uses an explicit named const. All four engine
+  ingestion sites consolidated onto
+  `EngineConfig::martians_strict()`. Tests: strict/non-strict filter
+  contrasts (LAN/ULA dropped vs kept), truth tables, wiring pins, and
+  an end-to-end test driving a real `Dht::spawn` against a scripted
+  bootstrap node offering LAN+public contacts — table must hold only
+  public under strict (bootstrap node itself counts: responders to our
+  own queries are inserted unfiltered by design). Mutation-checked at
+  three levels: filters ignoring their flag, derivation severed from
+  EngineConfig method, hand-off hardcoded at spawn.
 - [x] **P0 — forged BEP 6 REJECT_REQUEST: remote panic + cross-peer
   poisoning.** [found by adversarial review this pass] The engine's
   RejectRequest handler removed `outstanding_requests[(index, begin)]`
