@@ -77,6 +77,7 @@ pub(super) async fn spawn(
     persist_path: Option<std::path::PathBuf>,
     cmd_rx: mpsc::Receiver<DhtCommand>,
     bind_iface: Option<String>,
+    strict_martians: bool,
 ) -> Result<(), std::io::Error> {
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port);
     // With a kill-switch interface set, pin the DHT's UDP socket to it so
@@ -88,7 +89,7 @@ pub(super) async fn spawn(
     };
     let sock = Arc::new(sock);
     let local_id = node_id.unwrap_or_else(NodeId::random);
-    let state = Arc::new(SharedState::new(local_id));
+    let state = Arc::new(SharedState::new(local_id, strict_martians));
     // Pre-load warm contacts from disk so the first lookup doesn't have to
     // wait on bootstrap RTT.
     if !warm_contacts.is_empty() {
@@ -117,6 +118,12 @@ pub(super) async fn spawn(
 /// transient per-lookup tasks.
 struct SharedState {
     local_id: NodeId,
+    /// Martian-filter strictness for contacts learned over the wire
+    /// (see `dialable_nodes`). Derived at the spawn site as
+    /// `anonymous || proxied` so that if DHT gating ever loosens, the
+    /// filter re-tightens automatically instead of relying on the
+    /// (former) invariant that DHT only runs on the clearnet.
+    strict_martians: bool,
     routing: Mutex<RoutingTable>,
     /// Outstanding queries we sent: transaction id → reply channel.
     pending: Mutex<HashMap<Vec<u8>, PendingQuery>>,
@@ -157,13 +164,14 @@ enum KrpcReply {
 }
 
 impl SharedState {
-    fn new(local_id: NodeId) -> Self {
+    fn new(local_id: NodeId, strict_martians: bool) -> Self {
         let mut current = [0u8; 8];
         let mut previous = [0u8; 8];
         rand::thread_rng().fill(&mut current);
         rand::thread_rng().fill(&mut previous);
         Self {
             local_id,
+            strict_martians,
             routing: Mutex::new(RoutingTable::new(local_id)),
             pending: Mutex::new(HashMap::new()),
             peer_store: Mutex::new(HashMap::new()),
@@ -383,7 +391,7 @@ async fn ingest_nodes_from(state: &Arc<SharedState>, resp: &Response) {
     };
     if let Some(nodes) = nodes {
         let mut rt = state.routing.lock().await;
-        for c in dialable_nodes(nodes) {
+        for c in dialable_nodes(nodes, state.strict_martians) {
             rt.insert(c);
         }
     }
@@ -392,13 +400,15 @@ async fn ingest_nodes_from(state: &Arc<SharedState>, resp: &Response) {
 /// Contacts decoded from a remote response may point anywhere — including
 /// loopback, link-local or LAN addresses we must never probe. A hostile node
 /// feeding us such contacts turns our DHT traffic into a UDP scan of the
-/// host or its network (SSRF). Keep only globally dialable contacts; the DHT
-/// never runs under a proxy chain or anonymous mode, so the non-strict
-/// martian set is sufficient.
-fn dialable_nodes(nodes: &[Contact]) -> Vec<Contact> {
+/// host or its network (SSRF). Strictness is DERIVED AT SPAWN TIME
+/// (`anonymous || proxied`) and carried in [`SharedState`]: when the DHT
+/// rides an anonymity tunnel, RFC1918/ULA/site-local targets must also be
+/// refused — an anonymous client probing LAN ranges through its tunnel is
+/// precisely the SSRF the martian filter exists to prevent.
+fn dialable_nodes(nodes: &[Contact], strict: bool) -> Vec<Contact> {
     nodes
         .iter()
-        .filter(|c| crate::util::is_dialable_peer_addr(&c.addr, false))
+        .filter(|c| crate::util::is_dialable_peer_addr(&c.addr, strict))
         .cloned()
         .collect()
 }
@@ -642,7 +652,7 @@ async fn lookup_find_node(
             if let Ok(Some(resp)) = t.await {
                 ingest_nodes_from(state, &resp).await;
                 if let Response::Nodes { nodes, .. } = resp {
-                    shortlist.extend(dialable_nodes(&nodes));
+                    shortlist.extend(dialable_nodes(&nodes, state.strict_martians));
                 }
             }
         }
@@ -713,7 +723,7 @@ async fn lookup_get_peers(
                         ..
                     } => {
                         tokens.insert(c.id, (token.clone(), c.addr));
-                        shortlist.extend(dialable_nodes(nodes));
+                        shortlist.extend(dialable_nodes(nodes, state.strict_martians));
                     }
                     _ => {}
                 }
@@ -784,7 +794,7 @@ async fn announce_peer(
                     _ => {}
                 }
                 if let Response::PeersNodes { ref nodes, .. } = resp {
-                    shortlist.extend(dialable_nodes(nodes));
+                    shortlist.extend(dialable_nodes(nodes, state.strict_martians));
                 }
                 ingest_nodes_from(state, &resp).await;
             }
@@ -819,7 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_drops_stale_and_keeps_fresh() {
-        let state = SharedState::new(NodeId([0u8; 20]));
+        let state = SharedState::new(NodeId([0u8; 20]), false);
         let fresh_hash = [1u8; 20];
         let stale_hash = [2u8; 20];
         let peer: SocketAddr = "1.2.3.4:6881".parse().unwrap();
@@ -843,7 +853,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_rate_limit_caps_burst_from_one_ip() {
-        let state = SharedState::new(NodeId([0u8; 20]));
+        let state = SharedState::new(NodeId([0u8; 20]), false);
         let ip: IpAddr = "203.0.113.7".parse().unwrap();
         // The first QUERY_BURST queries are allowed; beyond that, within
         // the same instant (no refill), further queries are dropped.
@@ -869,21 +879,40 @@ mod tests {
             mk("192.168.1.50:6881"),
             mk("93.184.215.14:6881"),
         ];
-        // The DHT only runs on the clearnet (it is force-disabled under
-        // --anonymous / proxy chains), so site-local contacts are allowed
-        // exactly like clearnet peer dialing; true martians are not.
-        let kept = dialable_nodes(&nodes);
+        // Non-strict (clearnet) control: site-local contacts are allowed
+        // exactly like clearnet peer dialing; true martians are not. See
+        // the strict variant below for the anonymity coupling.
+        let kept = dialable_nodes(&nodes, false);
         assert_eq!(kept.len(), 2);
         let addrs: Vec<String> = kept.iter().map(|c| c.addr.to_string()).collect();
         assert!(addrs.contains(&"192.168.1.50:6881".to_string()));
         assert!(addrs.contains(&"93.184.215.14:6881".to_string()));
     }
 
+    /// The coupling pin the review asked for: when the session is
+    /// anonymous or proxied, wire-learned LAN/ULA contacts must be
+    /// refused — not just true martians.
+    #[test]
+    fn dialable_nodes_strict_refuses_lan_and_ula() {
+        let mk = |s: &str| Contact::new(NodeId([1u8; 20]), s.parse().unwrap());
+        let nodes = vec![
+            mk("93.184.215.14:6881"), // public — kept under both modes
+            mk("192.168.1.50:6881"),  // RFC1918
+            mk("10.9.8.7:6881"),      // RFC1918
+            mk("[fd00::5]:6881"),     // ULA
+            mk("[fe80::1]:6881"),     // link-local v6
+            mk("169.254.169.254:80"), // link-local v4 metadata endpoint
+        ];
+        let kept = dialable_nodes(&nodes, true);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].addr.to_string(), "93.184.215.14:6881");
+    }
+
     #[tokio::test]
     async fn ingest_never_routes_martian_contacts() {
         use super::super::krpc::Response;
 
-        let state = Arc::new(SharedState::new(NodeId([7u8; 20])));
+        let state = Arc::new(SharedState::new(NodeId([7u8; 20]), false));
         let resp = Response::Nodes {
             id: NodeId([9u8; 20]),
             nodes: vec![

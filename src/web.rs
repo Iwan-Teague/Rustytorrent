@@ -568,13 +568,17 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
             match crate::tracker::announce_with_proxy_anon(url, &req, None, false, None).await {
                 Ok(resp) => {
                     // Daemon runs clearnet-only (no anonymous/proxy knobs),
-                    // so the non-strict half applies: refuse the martians a
-                    // tracker can hand us (loopback, link-local metadata
-                    // endpoint, multicast, ...). See util::is_dialable_peer_addr.
+                    // so the non-strict half applies TODAY: refuse the
+                    // martians a tracker can hand us (loopback, link-local
+                    // metadata endpoint, multicast, ...). The constant makes
+                    // the implicit coupling explicit and greppable: if the
+                    // daemon ever gains anonymity knobs, replace with
+                    // strict = anonymous || proxied like the engine does.
+                    const DAEMON_MARTIANS_STRICT: bool = false;
                     pool.extend(
-                        resp.peers
-                            .into_iter()
-                            .filter(|a| crate::util::is_dialable_peer_addr(a, false)),
+                        resp.peers.into_iter().filter(|a| {
+                            crate::util::is_dialable_peer_addr(a, DAEMON_MARTIANS_STRICT)
+                        }),
                     );
                 }
                 Err(e) => {

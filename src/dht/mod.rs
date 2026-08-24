@@ -38,13 +38,17 @@ pub const DEFAULT_BOOTSTRAP_NODES: &[&str] = &[
 /// Screen contacts restored from the persist file through the same martian
 /// filter applied to live wire input (`util::is_dialable_peer_addr`): a
 /// tampered or stale state file must not be able to aim our startup DHT
-/// probes at loopback, link-local or NAT64 targets. Site-local ranges stay
-/// allowed (`strict = false`) because the DHT only ever runs on the clearnet.
-fn dialable_warm_contacts(contacts: Vec<routing::Contact>) -> Vec<routing::Contact> {
+/// probes at loopback, link-local or NAT64 targets. Strictness is DERIVED
+/// AT SPAWN TIME (`anonymous || proxied`) and passed in — never hardcoded
+/// here — so if DHT gating ever loosens, this filter re-tightens with it.
+fn dialable_warm_contacts(
+    contacts: Vec<routing::Contact>,
+    strict_martians: bool,
+) -> Vec<routing::Contact> {
     let before = contacts.len();
     let kept: Vec<routing::Contact> = contacts
         .into_iter()
-        .filter(|c| crate::util::is_dialable_peer_addr(&c.addr, false))
+        .filter(|c| crate::util::is_dialable_peer_addr(&c.addr, strict_martians))
         .collect();
     let dropped = before - kept.len();
     if dropped > 0 {
@@ -98,12 +102,17 @@ impl Dht {
         bootstrap: Vec<String>,
         persist_path: Option<PathBuf>,
         bind_iface: Option<String>,
+        // `anonymous || proxied`, derived by the CALLER (engine /
+        // magnet bootstrap / daemon) so the martian filter tightens
+        // exactly when the DHT would be running behind an anonymity
+        // tunnel. Never hardcode `false` here.
+        strict_martians: bool,
     ) -> Result<Self, std::io::Error> {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         // Try loading previously-persisted state. Failure → empty start.
         let (node_id, warm_contacts) = match persist_path.as_deref().and_then(persist::load) {
             Some((id, c)) => {
-                let kept = dialable_warm_contacts(c);
+                let kept = dialable_warm_contacts(c, strict_martians);
                 tracing::info!(
                     target: "dht",
                     contacts = kept.len(),
@@ -121,6 +130,7 @@ impl Dht {
             persist_path,
             cmd_rx,
             bind_iface,
+            strict_martians,
         )
         .await?;
         Ok(Self { cmd_tx })
@@ -194,9 +204,43 @@ mod warm_contacts_tests {
             contact([169, 254, 169, 254], 80), // link-local metadata — dropped
             contact([192, 168, 1, 50], 51413), // site-local — allowed (clearnet DHT)
         ];
-        let kept = dialable_warm_contacts(contacts);
+        let kept = dialable_warm_contacts(contacts, false);
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].addr.to_string(), "93.184.215.14:6881");
         assert_eq!(kept[1].addr.to_string(), "192.168.1.50:51413");
+    }
+
+    /// The coupling pin: under anonymity (strict = true) LAN/ULA targets
+    /// from a tampered persist file must ALSO be refused — an anonymous
+    /// client probing RFC1918 through its tunnel is exactly the SSRF the
+    /// martian filter exists to prevent. The non-strict control case
+    /// above makes any future divergence obvious.
+    #[test]
+    fn persisted_martian_filter_is_strict_when_anonymous_or_proxied() {
+        let public = contact([93, 184, 215, 14], 6881);
+        let lan: Vec<routing::Contact> = [[192, 168, 1, 50], [10, 0, 0, 7], [172, 16, 5, 5]]
+            .iter()
+            .map(|ip| contact(*ip, 6881))
+            .collect();
+
+        // Control: without anonymity, LAN hops stay allowed.
+        let mut list_nonstrict = vec![public.clone()];
+        list_nonstrict.extend(lan.clone());
+        let kept_nonstrict = dialable_warm_contacts(list_nonstrict, false);
+        assert_eq!(kept_nonstrict.len(), 4);
+
+        // Strict: every LAN hop dropped, public kept.
+        let mut list_strict = vec![public];
+        list_strict.extend(lan);
+        let kept_strict = dialable_warm_contacts(list_strict, true);
+        assert_eq!(kept_strict.len(), 1);
+        assert_eq!(kept_strict[0].addr.to_string(), "93.184.215.14:6881");
+
+        // ULA (fd00::/8) must also be refused under strict.
+        let ula = routing::Contact::new(
+            NodeId([7u8; 20]),
+            "[fd00::1]:6881".parse::<std::net::SocketAddr>().unwrap(),
+        );
+        assert!(dialable_warm_contacts(vec![ula], true).is_empty());
     }
 }
