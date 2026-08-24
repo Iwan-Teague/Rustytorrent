@@ -1293,6 +1293,60 @@ mod tests {
         }
     }
 
+    /// Property: any reserve/release interleaving keeps the credit
+    /// ledger sane — never over cap, never stranded, saturating on
+    /// over-release. Guards the CAS loop and the poll_write accounting
+    /// against concurrency-refactor regressions.
+    #[test]
+    fn send_gate_ledger_property() {
+        struct Xs(u64);
+        impl Xs {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545F4914F6CDD1D)
+            }
+        }
+        let cap = SEND_BUF_CAP_BYTES;
+        for seed in 1..=64u64 {
+            let mut xs = Xs(seed | 1);
+            let gate = SendGate::new();
+            let mut open: Vec<usize> = Vec::new();
+
+            for _ in 0..400 {
+                let is_release = xs.next() & 1 == 1;
+                let amount = (xs.next() % 300_000 + 1) as usize;
+                if is_release && !open.is_empty() {
+                    let i = (xs.next() % open.len() as u64) as usize;
+                    let n = open[i].min(amount); // partial release
+                    let rem = open[i] - n;
+                    open.swap_remove(i);
+                    if rem > 0 {
+                        open.push(rem);
+                    }
+                    gate.release(n);
+                } else {
+                    let got = gate.reserve(amount);
+                    assert!(got <= amount);
+                    if got > 0 {
+                        open.push(got);
+                    }
+                }
+                assert!(gate.available() <= cap, "over cap");
+            }
+
+            for r in open.drain(..) {
+                gate.release(r);
+            }
+            assert_eq!(gate.available(), cap, "stranded credit");
+            gate.release(cap * 7); // saturation safety
+            assert_eq!(gate.available(), cap);
+        }
+    }
+
     fn seq_gt_u16(a: u16, b: u16) -> bool {
         let d = a.wrapping_sub(b);
         d != 0 && d < 0x8000
