@@ -7,8 +7,17 @@
 
 Phases 1–6 implemented and verified, plus the MSE/PE encrypted-handshake and
 BEP-5 DHT slices of Phase 7. The build is clean (`cargo clippy -D warnings`
-and `cargo fmt --check` both pass), and **221** unit + integration tests run
-green.
+and `cargo fmt --check` both pass), and **500+** unit + integration tests run
+green across 17 suites.
+
+Status addendum (2026-08 security & anonymity passes): martian-filter
+strictness is derived from session anonymity at every peer/DHT/tracker
+ingestion site; BEP 6 REJECT_REQUESTs are range- and ownership-validated
+(remote-panic + cross-peer-poison fix); the MSE SKEY match is
+constant-time; SOCKS5 refuses hostname hops under `--anonymous`;
+anonymous-mode UDP-tracker refusal is proven at the kernel socket level;
+µTP has bounded send/receive/delivery memory with property coverage.
+See docs/TODO.md §1–2 for details.
 
 End-to-end download is verified by:
 
@@ -249,7 +258,10 @@ Outstanding gaps:
 
 ### Stability & Polish
 - [x] Stable `peer_id`: persisted to `$XDG_CONFIG_HOME/rustytorrent/peer_id` (or `~/.config/rustytorrent/peer_id`); regenerated on missing/bad file
-- [ ] Rate limiter: configurable max download/upload speed — not implemented
+- [x] Rate limiter: configurable max download/upload speed — `--max-down`
+      / `--max-up` (KiB/s) feed engine-wide token buckets (2 s burst);
+      download gated at Request issuance, upload at `serve_request`
+      (over-quota requests dropped silently; peers re-request).
 - [x] Bandwidth stats: bytes downloaded/uploaded per torrent (engine `downloaded` / `uploaded` counters; logged at progress tick)
 - [x] Audit all code paths for `unwrap()` / `expect()` — non-test code has zero `unwrap()`s; `clippy -D warnings` is clean
 - [x] Integration test: self-test (seeder ↔ leecher over localhost) downloads 32 MiB torrent end-to-end with MD5 verified vs source
@@ -308,6 +320,13 @@ Outstanding gaps:
 
 **Total estimate: ~24h**
 
+> **Status note (2026-08):** a monitoring API + minimal UI shipped with
+> somewhat different endpoints than the spec below: `GET /api/status`,
+> `GET /api/peers`, `GET /api/files`, `GET /metrics` (Prometheus),
+> `POST /api/pause|resume|shutdown`, daemon-scoped `POST /api/add`,
+> `POST /api/add_magnet`, plus loopback-only binding, Host-header and
+> CSRF checks. The per-torrent REST surface below remains future work.
+
 ### REST API (`src/api/`)
 - [ ] Add `axum` to dependencies — 15m
 - [ ] `GET /api/torrents` — list all active torrents with status — 2h
@@ -332,6 +351,6 @@ These tasks apply across all phases:
 
 - [ ] Keep `CHANGELOG.md` updated as features land
 - [ ] Add `tracing` spans to all major async boundaries
-- [ ] Run `clippy` with `--deny warnings` in CI
-- [ ] Run `cargo fmt` check in CI
+- [x] Run `clippy` with `--deny warnings` in CI (.github/workflows/ci.yml)
+- [x] Run `cargo fmt` check in CI (.github/workflows/ci.yml)
 - [ ] Keep dependency count lean — evaluate each new crate
