@@ -177,6 +177,8 @@ struct SharedDownloadArgs {
     #[arg(long, requires = "socks5")]
     socks5_user: Option<String>,
     /// Optional SOCKS5 password. Required if --socks5-user is set.
+    /// Prefer the RUSTYTORRENT_SOCKS5_PASS environment variable instead:
+    /// argv is readable by every local user via `ps`.
     #[arg(long, requires = "socks5_user")]
     socks5_pass: Option<String>,
     /// "Anonymous mode" bundle. Requires --socks5. Disables the inbound
@@ -863,15 +865,31 @@ async fn cmd_decrypt(
 /// `cmd_magnet`.
 ///
 /// Credentials and Tor stream isolation are applied to the LAST hop
+/// Resolve the SOCKS5 password: an explicit `--socks5-pass` flag always
+/// wins; otherwise fall back to the `RUSTYTORRENT_SOCKS5_PASS` environment
+/// variable. An empty env value is treated as unset so a leftover empty
+/// export never silently authenticates with a blank password.
+fn effective_socks5_pass(flag: Option<String>, env: Option<String>) -> Option<String> {
+    flag.or_else(|| env.filter(|p| !p.is_empty()))
+}
+
 /// only — typically the Tor / VPN endpoint that actually enforces
 /// auth or where circuit isolation is meaningful. Earlier hops are
 /// usually just transit (e.g. a corporate VPN) that doesn't need auth.
+///
+/// Password resolution order: `--socks5-pass` flag first, then the
+/// `RUSTYTORRENT_SOCKS5_PASS` environment variable (empty value treated
+/// as unset). See [`effective_socks5_pass`].
 async fn resolve_proxy_chain(
     socks5: Vec<String>,
     socks5_user: Option<String>,
     socks5_pass: Option<String>,
     tor_isolation: bool,
 ) -> Result<Vec<rustytorrent::socks5::ProxyConfig>> {
+    // Credential hygiene: fall back to RUSTYTORRENT_SOCKS5_PASS so the
+    // password never has to sit in argv (readable from `ps` by every
+    // local user on multi-user boxes). An explicit flag wins.
+    let socks5_pass = effective_socks5_pass(socks5_pass, std::env::var("RUSTYTORRENT_SOCKS5_PASS").ok());
     if socks5.is_empty() {
         if socks5_user.is_some() || socks5_pass.is_some() || tor_isolation {
             anyhow::bail!("--socks5-user / --socks5-pass / --tor-isolation require --socks5");
@@ -1161,4 +1179,35 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
     engine.run().await?;
     println!("Done.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_socks5_pass;
+
+    #[test]
+    fn socks5_pass_flag_wins_over_env() {
+        assert_eq!(
+            effective_socks5_pass(Some("flag".into()), Some("env".into())).as_deref(),
+            Some("flag")
+        );
+    }
+
+    #[test]
+    fn socks5_pass_env_used_when_flag_absent() {
+        assert_eq!(
+            effective_socks5_pass(None, Some("env-secret".into())).as_deref(),
+            Some("env-secret")
+        );
+    }
+
+    #[test]
+    fn socks5_pass_empty_env_treated_as_unset() {
+        assert_eq!(effective_socks5_pass(None, Some(String::new())), None);
+    }
+
+    #[test]
+    fn socks5_pass_absent_everywhere_is_none() {
+        assert_eq!(effective_socks5_pass(None, None), None);
+    }
 }

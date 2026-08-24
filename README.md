@@ -104,7 +104,9 @@ rustytorrent download <file> [OPTIONS]
   --socks5 host:port        route through SOCKS5; repeat to chain hops
                             (first = entry, last = exit; last hop sees creds)
   --socks5-user U           SOCKS5 username for the LAST hop (requires --socks5)
-  --socks5-pass P           SOCKS5 password for the LAST hop (requires --socks5-user)
+  --socks5-pass P           SOCKS5 password for the LAST hop (requires --socks5-user);
+                            prefer RUSTYTORRENT_SOCKS5_PASS env var — argv is
+                            readable by every local user via `ps`
   --anonymous               strict bundle (requires --socks5; DHT/listener off)
   --bind-iface IFACE        VPN kill switch — bind outgoing sockets to IFACE
   --tor-isolation           per-peer SOCKS5 username so each dial gets its own Tor circuit
