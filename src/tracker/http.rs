@@ -239,7 +239,7 @@ async fn announce_inner(
         // user_agent setting, so we don't have to rebuild the client.
         builder = builder.header(reqwest::header::USER_AGENT, ua);
     }
-    let bytes = builder
+    let resp = builder
         .send()
         .await
         .map_err(|e| {
@@ -250,16 +250,50 @@ async fn announce_inner(
                 "http send: {}",
                 scrub_announce_error(&e.to_string(), &url, base_url)
             ))
-        })?
-        .bytes()
-        .await
-        .map_err(|e| {
-            Error::Tracker(format!(
-                "http recv: {}",
-                scrub_announce_error(&e.to_string(), &url, base_url)
-            ))
         })?;
+    let bytes = read_bounded_body(resp, &url, base_url).await?;
     parse_response(&bytes)
+}
+
+/// A hostile or MITM'd `http://` tracker can return an arbitrarily large
+/// body — an enormous `Content-Length`, or an endless close-delimited /
+/// chunked stream. Buffering it unchecked is a remote memory-exhaustion
+/// DoS. Real announce responses are tiny bencoded peer lists, so a
+/// generous cap costs legitimate trackers nothing.
+const MAX_ANNOUNCE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+async fn read_bounded_body(
+    mut resp: reqwest::Response,
+    url: &str,
+    base_url: &str,
+) -> Result<Vec<u8>> {
+    // Cheap early refusal when the tracker declares its intent up front;
+    // the streaming check below is what actually bounds chunked and
+    // close-delimited bodies, where Content-Length is absent.
+    if let Some(n) = resp.content_length() {
+        if n > MAX_ANNOUNCE_RESPONSE_BYTES as u64 {
+            return Err(Error::Tracker(format!(
+                "announce response too large: Content-Length {n} exceeds cap {MAX_ANNOUNCE_RESPONSE_BYTES}"
+            )));
+        }
+    }
+    let recv_err = |e: reqwest::Error| {
+        // Same passkey-in-URL scrubbing as the send path.
+        Error::Tracker(format!(
+            "http recv: {}",
+            scrub_announce_error(&e.to_string(), url, base_url)
+        ))
+    };
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(recv_err)? {
+        if out.len().saturating_add(chunk.len()) > MAX_ANNOUNCE_RESPONSE_BYTES {
+            return Err(Error::Tracker(format!(
+                "announce response exceeded {MAX_ANNOUNCE_RESPONSE_BYTES} byte cap"
+            )));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// Clamp tracker-supplied announce intervals to a sane ceiling (24 h). A
@@ -677,6 +711,67 @@ mod tests {
         assert!(
             ua.starts_with("rustytorrent/"),
             "expected default rustytorrent UA, got {ua:?}"
+        );
+    }
+
+    /// A hostile tracker declaring a huge Content-Length must be refused
+    /// up front instead of being buffered into memory.
+    #[tokio::test]
+    async fn announce_response_huge_content_length_is_refused() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            // Lie about the size; send a couple of bytes and close.
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\n\r\n";
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(b"be").await;
+            let _ = sock.shutdown().await;
+        });
+        let url = format!("http://{addr}/announce");
+        let err = announce_with_proxy_anon(&url, &dummy_req(), None, false, None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too large"),
+            "expected Content-Length refusal, got {msg:?}"
+        );
+    }
+
+    /// A close-delimited body with no Content-Length must still be bounded
+    /// by the streaming cap, not read to EOF unchecked.
+    #[tokio::test]
+    async fn announce_response_body_over_cap_without_length_is_refused() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            // No Content-Length: body runs until we close. One byte over cap.
+            let head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+            let _ = sock.write_all(head.as_bytes()).await;
+            let body = vec![b'x'; MAX_ANNOUNCE_RESPONSE_BYTES + 1];
+            let _ = sock.write_all(&body).await;
+            let _ = sock.shutdown().await;
+        });
+        let url = format!("http://{addr}/announce");
+        let err = announce_with_proxy_anon(&url, &dummy_req(), None, false, None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeded") && msg.contains("byte cap"),
+            "expected streaming-cap refusal, got {msg:?}"
         );
     }
 }
