@@ -561,15 +561,40 @@ impl Connection {
     /// later sliced into packet payloads that share its single
     /// allocation. An empty block is ignored so it can't wedge the
     /// front-of-queue cursor.
-    pub fn enqueue_send_block(&mut self, block: Arc<[u8]>) {
+    ///
+    /// Returns `true` if the block was buffered, `false` if it was
+    /// refused (connection already closing/closed, or an empty block).
+    /// The driver's send-credit accounting ([`SendGate`] in `socket`)
+    /// relies on this to release the writer's reservation for refused
+    /// blocks instead of stranding the credit forever.
+    ///
+    /// [`SendGate`]: super::socket
+    pub fn enqueue_send_block(&mut self, block: Arc<[u8]>) -> bool {
         if matches!(self.state, State::FinSent | State::Closed | State::Reset) {
-            return;
+            return false;
         }
         if block.is_empty() {
-            return;
+            return false;
         }
         self.out_len += block.len();
         self.out_blocks.push_back(block);
+        true
+    }
+
+    /// Total application bytes this connection holds on the sender's
+    /// behalf but the peer hasn't acked yet: unsent queue (`out_len`)
+    /// plus every in-flight (sent, unacked) DATA payload. The driver's
+    /// send-credit gate tracks exactly this quantity so a blocked
+    /// [`UtpStream`] writer resumes when bytes actually leave the
+    /// connection — either because they were acked, or because the
+    /// connection was reaped and its buffers dropped.
+    ///
+    /// O(in_flight); called once per driver event for the affected
+    /// connection, and `in_flight` is window-bounded, so this stays
+    /// cheap.
+    pub fn outstanding_send_bytes(&self) -> usize {
+        let inflight: usize = self.in_flight.iter().map(|e| e.packet.payload.len()).sum();
+        self.out_len + inflight
     }
 
     /// Pull whatever the application can read right now.

@@ -64,12 +64,22 @@ Deferred (real, but larger or lower-value — left for a focused pass):
   `REQUEST_TIMEOUT = 30 s`. For each stale entry: `release_block` un-marks
   the block so another peer can reserve it, `inflight` is decremented, and the
   idle peer's request pump is kicked so it can pick up other work.
-- [ ] **P2 — µTP `UtpStream::poll_write` has no backpressure.** It hands every
-  write to the driver over an unbounded channel and always reports the whole
-  buffer accepted, so an app writing faster than the LEDBAT window drains
-  grows driver-side memory unbounded. Low severity (the upload path is
-  rate-limited and bounded by peer-count × pipeline depth in practice). Bound
-  the in-flight send buffer and return `Pending` when full.
+- [x] **P2 — µTP `UtpStream::poll_write` has no backpressure.** DONE:
+  added a per-connection `SendGate` credit ledger shared between the
+  stream and the driver (`socket.rs`, cap `SEND_BUF_CAP_BYTES` =
+  256 KiB). `poll_write` reserves `min(len, available)` credit before
+  enqueueing (partial writes keep accounting exact) and parks the
+  caller's waker at zero credit; the driver releases credit exactly
+  when bytes *leave* the connection (`outstanding_send_bytes()` delta:
+  acks/SACK prunes) or drops it wholesale on reap/close (blocked
+  writers get `BrokenPipe`, never a hang). Race-free by ordering:
+  register waker, then re-check availability. Driver-held outbound
+  memory is now bounded per connection regardless of write rate.
+  Tested: 5 gate unit tests + a scripted raw-UDP peer proving
+  block-at-cap under silence and byte-exact completion once acks
+  resume; both mutations (no-reserve, no-wake) fail the suite — the
+  no-wake run stalls at exactly 262144/302144 bytes, pinning the cap
+  math.
 - [x] **P2 — `num_pieces` vs `total_length` never reconciled.** DONE
   (commit fa79720): `Info::from_value` now validates that
   `piece_hashes.len() == ceil(total_length / piece_length)` and rejects
