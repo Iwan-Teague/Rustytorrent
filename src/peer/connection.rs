@@ -27,6 +27,12 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 /// BEP 3 keepalive convention is ~2 minutes; 5 minutes of total silence
 /// means the peer (or its NAT mapping) is gone.
 pub const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Liveness bound on the WRITE side. A peer that stops reading (full TCP
+/// receive window) blocks every write forever; if it keeps OUR read side
+/// fed with periodic keepalives, neither the read-idle timeout nor our
+/// own keepalive timer can fire and the slot is occupied permanently.
+/// Bound each individual write so a stalled peer is disconnected instead.
+pub const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// B3 — per-peer rate limit on inbound `Request` messages. A misbehaving peer
 /// can otherwise hammer us with Requests faster than we can read pieces off
@@ -355,6 +361,17 @@ async fn read_frame_with_idle<R: AsyncRead + Unpin>(
             idle.as_secs()
         ))),
     }
+}
+
+/// The error for a write that made no progress within
+/// [`WRITE_STALL_TIMEOUT`]. Like the read-idle error, the text matches
+/// nothing in `is_protocol_violation` — a stalled peer gets disconnected,
+/// not banned.
+fn write_stall_error() -> Error {
+    Error::Network(format!(
+        "peer write stalled: no progress within {}s",
+        WRITE_STALL_TIMEOUT.as_secs()
+    ))
 }
 
 /// Classify a disconnect cause as a BEP 3 protocol violation that
@@ -971,11 +988,15 @@ where
                         // single pass. Going via encode() here would copy the
                         // (up to 16 KiB) block twice (payload scratch + tag).
                         PeerCommand::Piece { index, begin, data } => {
-                            crate::peer::message::write_message(
-                                &mut writer,
-                                &Message::Piece { index, begin, data },
+                            timeout(
+                                WRITE_STALL_TIMEOUT,
+                                crate::peer::message::write_message(
+                                    &mut writer,
+                                    &Message::Piece { index, begin, data },
+                                ),
                             )
-                            .await?;
+                            .await
+                            .map_err(|_| write_stall_error())??;
                         }
                         other => {
                             let bytes = match other {
@@ -996,14 +1017,18 @@ where
                                 PeerCommand::HaveAll => Message::HaveAll.encode(),
                                 PeerCommand::HaveNone => Message::HaveNone.encode(),
                             };
-                            writer.write_all(&bytes).await
+                            timeout(WRITE_STALL_TIMEOUT, writer.write_all(&bytes))
+                                .await
+                                .map_err(|_| write_stall_error())?
                                 .map_err(|e| Error::Network(format!("write: {e}")))?;
                         }
                     }
                     last_send = Instant::now();
                 }
                 _ = tokio::time::sleep(until_next_keepalive) => {
-                    write_frame(&mut writer, &[]).await?;
+                    timeout(WRITE_STALL_TIMEOUT, write_frame(&mut writer, &[]))
+                        .await
+                        .map_err(|_| write_stall_error())??;
                     last_send = Instant::now();
                 }
                 read_result = &mut read_done_rx => {
@@ -1179,6 +1204,36 @@ mod tests {
         );
         let msg = res.err().unwrap().to_string();
         assert!(msg.contains("peer idle"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn stalled_peer_write_is_benign_not_violation() {
+        let e = write_stall_error();
+        assert!(e.to_string().contains("stalled"));
+        assert!(!is_protocol_violation(&e));
+    }
+
+    #[tokio::test]
+    async fn write_to_unread_socket_times_out() {
+        // 64-byte buffer: writing more than that to an unread duplex
+        // half stalls the writer, exactly like a peer that stops reading.
+        let (mut client, _reader) = tokio::io::duplex(64);
+        let started = std::time::Instant::now();
+        let res: Result<()> = timeout(
+            Duration::from_millis(80),
+            client.write_all(&vec![0u8; 4096]),
+        )
+        .await
+        .map_err(|_| write_stall_error())
+        .and_then(|r| r.map_err(|e| Error::Network(format!("write: {e}"))));
+        assert!(res.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stall bound must fire promptly, took {:?}",
+            started.elapsed()
+        );
+        let msg = res.err().unwrap().to_string();
+        assert!(msg.contains("stalled"), "unexpected error: {msg}");
     }
 
     #[test]
