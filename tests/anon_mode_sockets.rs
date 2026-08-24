@@ -81,6 +81,50 @@ fn all_bound_ports() -> HashSet<u16> {
     all
 }
 
+/// `socket:[<inode>]` symlinks currently held open by THIS process.
+fn self_socket_fds() -> HashSet<String> {
+    std::fs::read_dir("/proc/self/fd")
+        .expect("read /proc/self/fd")
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .map(|l| l.to_string_lossy().into_owned())
+        .filter(|s| s.starts_with("socket:["))
+        .collect()
+}
+
+/// /proc table rows for sockets this process owns, as
+/// `(local_port, state)` pairs. The inode column is matched against our
+/// fd set so unrelated processes' sockets are ignored. TCP state is the
+/// hex code (0A = LISTEN); UDP rows have no meaningful state.
+fn self_owned_sockets(table: &str) -> Vec<(u16, String)> {
+    let fds = self_socket_fds();
+    let raw = match std::fs::read_to_string(table) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for line in raw.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // sl local rem st ... tx:rx ... tr:tm retrnsmt uid timeout inode
+        if cols.len() < 10 {
+            continue;
+        }
+        // The table lists the bare inode number; our fd symlinks read
+        // `socket:[<inode>]`.
+        let fd_ref = format!("socket:[{}]", cols[9]);
+        if !fds.contains(&fd_ref) {
+            continue;
+        }
+        let port = cols[1]
+            .rsplit_once(':')
+            .and_then(|(_, p)| u16::from_str_radix(p, 16).ok());
+        if let Some(port) = port {
+            out.push((port, cols[3].to_string()));
+        }
+    }
+    out
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn anonymous_engine_opens_no_direct_socket_even_with_dht_requested() {
     // A port we know is free *right now* (bind-and-drop). Re-checked below
@@ -127,11 +171,45 @@ async fn anonymous_engine_opens_no_direct_socket_even_with_dht_requested() {
     // ungated paths all bind at the very top of run().
     tokio::time::sleep(Duration::from_millis(800)).await;
 
+    // Assertion 1 (port-scoped): nothing bound on the configured session
+    // port, by anyone on the host.
     let bound = all_bound_ports();
     assert!(
         !bound.contains(&port),
         "anonymous engine opened a direct socket on port {port} \
          (DHT/µTP/listener gate regression)"
+    );
+
+    // Assertion 2 (process-wide, stronger): the engine process owns NO UDP
+    // sockets at all — not on the session port, not ephemeral. A regression
+    // that binds the DHT or µTP socket to port 0 / a shifted port would
+    // pass assertion 1 but fail here. The proxy is an IP literal and
+    // reqwest uses socks5h (remote DNS), so a correct anonymous engine has
+    // no legitimate local UDP use whatsoever.
+    let mut owned_udp: Vec<(u16, String)> = Vec::new();
+    for suffix in ["", "6"] {
+        owned_udp.extend(self_owned_sockets(&format!("/proc/net/udp{suffix}")));
+    }
+    assert!(
+        owned_udp.is_empty(),
+        "anonymous engine process owns UDP sockets (DHT/µTP egress leak): {owned_udp:?}"
+    );
+
+    // Assertion 3: no listening TCP anywhere in the process — the inbound
+    // listener must be off in anonymous mode (`inbound_wanted`), and any
+    // *other* listen socket would accept direct connections that bypass
+    // the proxy chain entirely.
+    let mut owned_listen: Vec<(u16, String)> = Vec::new();
+    for suffix in ["", "6"] {
+        owned_listen.extend(
+            self_owned_sockets(&format!("/proc/net/tcp{suffix}"))
+                .into_iter()
+                .filter(|(_, st)| st == "0A"), // LISTEN
+        );
+    }
+    assert!(
+        owned_listen.is_empty(),
+        "anonymous engine process has LISTENING TCP sockets (direct-inbound leak): {owned_listen:?}"
     );
 
     task.abort();
