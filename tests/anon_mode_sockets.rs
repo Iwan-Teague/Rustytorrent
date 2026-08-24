@@ -32,11 +32,20 @@ fn sha1(bytes: &[u8]) -> [u8; 20] {
 }
 
 fn make_torrent(name: &str) -> TorrentFile {
+    make_torrent_with_trackers(name, &[])
+}
+
+/// `trackers`: announce URLs baked into the metainfo. The anonymous-mode
+/// test bakes a `udp://` tracker pointing at a discard port — if the UDP
+/// refusal ever regresses to "attempt then fail", the attempt itself
+/// would open a direct socket and the process-wide assertions below
+/// would catch it.
+fn make_torrent_with_trackers(name: &str, trackers: &[String]) -> TorrentFile {
     let data = vec![0xABu8; 4096];
     TorrentFile {
         info_hash: sha1(&data),
         announce: None,
-        announce_list: vec![],
+        announce_list: trackers.iter().map(|u| vec![u.clone()]).collect(),
         info: Info {
             name: name.to_string(),
             piece_length: PIECE_LEN,
@@ -125,8 +134,15 @@ fn self_owned_sockets(table: &str) -> Vec<(u16, String)> {
     out
 }
 
+/// The two audits run in the SAME process (one test binary) but cargo
+/// runs test fns concurrently; each audit's own helper sockets (probe,
+/// silent sink) would otherwise show up in the other's process-wide
+/// snapshot. Serialize them.
+static AUDIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn anonymous_engine_opens_no_direct_socket_even_with_dht_requested() {
+    let _audit = AUDIT_LOCK.lock().await;
     // A port we know is free *right now* (bind-and-drop). Re-checked below
     // before the assertions so an unlucky collision fails as "port already
     // taken by something else", not as a gate regression.
@@ -210,6 +226,109 @@ async fn anonymous_engine_opens_no_direct_socket_even_with_dht_requested() {
     assert!(
         owned_listen.is_empty(),
         "anonymous engine process has LISTENING TCP sockets (direct-inbound leak): {owned_listen:?}"
+    );
+
+    task.abort();
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+}
+
+/// Tracker-privacy variant of the audit: the metainfo itself carries a
+/// `udp://` tracker (the scheme that CANNOT ride SOCKS5 and would leak
+/// the real IP if ever attempted). In anonymous mode the dispatcher must
+/// refuse it before any DNS or socket work — so even though trackers are
+/// ENABLED here (`no_tracker = false`) and an announce is attempted, the
+/// process must still own zero UDP sockets and zero listening TCP
+/// sockets. This is the kernel-level proof behind "UDP announces never
+/// open a direct socket in anon mode"; the dispatcher unit tests prove
+/// the refusal by error text, this one proves it by socket absence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anonymous_engine_with_udp_tracker_opens_no_direct_socket() {
+    let _audit = AUDIT_LOCK.lock().await;
+    // A SILENT sink socket plays the tracker: it receives our (never
+    // sent) announce and never replies, so if a real attempt were made,
+    // its socket would stay open through the 15 s retry backoff — long
+    // before our 800 ms snapshot. A discard-port target is useless here:
+    // loopback ICMP-unreachable fails such attempts within microseconds,
+    // faster than any /proc sample could catch the leaked socket.
+    let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sink_port = sink.local_addr().unwrap().port();
+    let udp_tracker = format!("udp://127.0.0.1:{sink_port}/announce");
+    let torrent = make_torrent_with_trackers("anon-tracker.bin", &[udp_tracker]);
+
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    if all_bound_ports().contains(&port) {
+        return; // port collision pre-flight, as in the DHT variant
+    }
+
+    let tmp = std::env::temp_dir().join(format!("rt_anon_trk_{}", std::process::id()));
+    tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+    let cfg = EngineConfig {
+        output_dir: tmp.clone(),
+        listen_port: port,
+        // Trackers ENABLED — the whole point is that an announce IS
+        // attempted against the udp:// URL.
+        no_tracker: false,
+        enable_dht: false,
+        anonymous: true,
+        proxies: vec![ProxyConfig {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            credentials: None,
+            isolation: false,
+        }],
+        ..Default::default()
+    };
+
+    let engine = TorrentEngine::new(torrent, [9u8; 20], cfg);
+    let task = tokio::spawn(async move {
+        let _ = engine.run().await;
+    });
+
+    // The initial announce fires at the top of run(); give any wrongly-
+    // opened tracker socket time to appear in /proc.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // No direct socket bound anywhere on our session port...
+    let bound = all_bound_ports();
+    assert!(
+        !bound.contains(&port),
+        "anonymous engine with udp:// tracker opened a socket on port {port}"
+    );
+
+    // ...and crucially, the process owns NO UDP sockets at all: the UDP
+    // tracker announce must have been refused before socket creation.
+    let mut owned_udp: Vec<(u16, String)> = Vec::new();
+    for suffix in ["", "6"] {
+        owned_udp.extend(self_owned_sockets(&format!("/proc/net/udp{suffix}")));
+    }
+    // Scanner sanity: the sink MUST show up, or the audit is broken.
+    assert!(
+        owned_udp.iter().any(|(p, _)| *p == sink_port),
+        "self-audit broken: sink socket {sink_port} not visible"
+    );
+    // The real assertion: NOTHING besides the sink itself. An attempted
+    // udp:// announce would bind its own ephemeral socket and be visible
+    // here for the whole retry backoff.
+    let leaked: Vec<_> = owned_udp.iter().filter(|(p, _)| *p != sink_port).collect();
+    assert!(
+        leaked.is_empty(),
+        "udp:// tracker announce opened a direct UDP socket in anonymous mode: {leaked:?}"
+    );
+
+    // Listener stays off too (inbound would bypass the proxy chain).
+    let mut owned_listen: Vec<(u16, String)> = Vec::new();
+    for suffix in ["", "6"] {
+        owned_listen.extend(
+            self_owned_sockets(&format!("/proc/net/tcp{suffix}"))
+                .into_iter()
+                .filter(|(_, st)| st == "0A"),
+        );
+    }
+    assert!(
+        owned_listen.is_empty(),
+        "anonymous engine has LISTENING TCP sockets: {owned_listen:?}"
     );
 
     task.abort();
