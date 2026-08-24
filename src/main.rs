@@ -93,6 +93,7 @@ enum Commands {
         web: u16,
         /// Single shared listen port for all hosted torrents (one
         /// acceptor demuxes inbound connections by info_hash).
+        /// 0 = OS-assigned free port, resolved before any announce.
         #[arg(long, default_value_t = 6881)]
         port: u16,
         /// Disable the shared DHT. By default the daemon runs one DHT
@@ -158,6 +159,8 @@ enum Commands {
 struct SharedDownloadArgs {
     #[arg(short, long, default_value = ".")]
     output: PathBuf,
+    /// Listen port for peer connections. 0 = let the OS assign a free
+    /// port; the resolved port is what tracker announces advertise.
     #[arg(long, default_value_t = 6881)]
     port: u16,
     /// Skip the tracker and dial these peers directly (host:port). Useful for local tests.

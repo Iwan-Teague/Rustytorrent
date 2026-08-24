@@ -97,7 +97,8 @@ See [docs/ANONYMITY.md](docs/ANONYMITY.md) for the threat model — what
 rustytorrent download <file> [OPTIONS]
 
   --output DIR              destination directory (default: ".")
-  --port N                  listen port (default: 6881)
+  --port N                  listen port (default: 6881); 0 = OS-assigned
+                            free port (announces use the resolved port)
   --peer host:port          extra peer to dial directly (repeatable)
   --no-tracker              skip the .torrent's tracker list
   --dht                     enable BEP 5 DHT
@@ -139,7 +140,8 @@ rustytorrent decrypt <file> [OPTIONS]      # extract a --paranoid spool afterwar
 rustytorrent magnet <URI> [OPTIONS]        # download from a magnet link
 
   --output DIR              destination directory (default: ".")
-  --port N                  listen port (default: 6881)
+  --port N                  listen port (default: 6881); 0 = OS-assigned
+                            free port (announces use the resolved port)
   --peer host:port          extra bootstrap peer (repeatable)
   --dht                     enable DHT (default: true for magnets)
   --encrypt                 force outgoing MSE/PE post-bootstrap
