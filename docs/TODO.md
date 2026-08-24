@@ -105,6 +105,20 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P2 — MSE SKEY match was not constant-time.** [verified] The
+  receiver's `perform_incoming` compared `HASH('req2', SKEY)` candidates
+  with plain `==` inside a short-circuiting `find` — timing could
+  distinguish "SKEY guess hit" and leak the candidate INDEX (which
+  hosted torrent) to an active prober. Inconsistent with the repo's own
+  convention (`subtle::ConstantTimeEq` already guards piece-hash and
+  handshake comparisons). DONE: full sweep over all hosted info-hashes
+  with `ct_eq`, no early exit — timing-uniform in the candidate set;
+  last-match-wins is semantically identical since info-hashes are
+  unique per torrent. Behavioral coverage added: multi-candidate
+  selection picks the right torrent when it is NOT first in the list.
+  Honest limitation: constant-time properties can't be asserted by CI
+  timing tests; the guarantee lives in the sweep structure (no early
+  exit possible) plus this behavioral pin.
 - [x] **P1 — Daemon `POST /api/add` path read is unconstrained.** [verified]
   `web.rs daemon_add` does `tokio::fs::read(body.trim())` on any
   server-side path. DONE: added `resolve_under(dir, requested)` which
