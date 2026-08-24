@@ -144,9 +144,11 @@ pub struct EngineConfig {
     /// **µTP** (BEP 29) transport. When on, the engine binds a µTP
     /// socket on `listen_port` (UDP), accepts inbound µTP peers, and
     /// races TCP+µTP on every outgoing dial. Gated off automatically
-    /// under `anonymous`, an active SOCKS5 chain, or `bind_iface` —
-    /// UDP can't ride SOCKS5 and our µTP socket isn't interface-bound,
-    /// so allowing it there would leak past the proxy / kill switch.
+    /// under `anonymous` or an active SOCKS5 chain — UDP can't ride
+    /// SOCKS5 and anonymous mode wants no UDP egress at all. Under
+    /// `bind_iface` the socket IS created, pinned to that interface
+    /// (kill-switch safe) and used for inbound µTP, but outgoing dials
+    /// stay TCP-only (`should_use_utp` keeps the race off).
     pub utp_enabled: bool,
     /// **Phase 8 web monitoring UI.** When `Some(port)`, the engine
     /// serves a read-only status page + JSON + Prometheus metrics on
