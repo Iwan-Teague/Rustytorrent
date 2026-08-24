@@ -105,6 +105,24 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P0 — forged BEP 6 REJECT_REQUEST: remote panic + cross-peer
+  poisoning.** [found by adversarial review this pass] The engine's
+  RejectRequest handler removed `outstanding_requests[(index, begin)]`
+  and called `PieceManager::release_block` UNCONDITIONALLY: (a) a
+  single inbound REJECT with index=0xFFFFFFFF panicked the engine on
+  unchecked `states[index]` indexing (remote DoS, one message); (b) any
+  connected peer could erase ANOTHER peer's outstanding entry, causing
+  that peer's honest Block to fail the solicitation check and be
+  dropped (~30 s stall per forged message). DONE: the handler now
+  requires the index to be in range AND the outstanding entry to belong
+  to the rejecting peer before removing/releasing; anything else is
+  logged and ignored (inflight decrement stays — it only affects the
+  sender's own pipeline budget). New `tests/hostile_reject.rs`: an
+  attacker peer floods forged/out-of-range REJECTs across the whole
+  transfer while an honest seeder serves the leecher; download must
+  complete byte-identical. Mutation-checked: reverting to the old
+  unguarded handler panics with "index out of bounds: the len is 3 but
+  the index is 4294967295" and fails the test.
 - [x] **P2 — hostile-SOCKS5-proxy reply parsing untested.** DONE: six
   scripted-proxy tests drive malformed replies a broken or malicious
   proxy could produce: bad VER in method reply / CONNECT reply, proxy
