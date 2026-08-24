@@ -96,7 +96,8 @@ async fn connect(sock: &UdpSocket) -> Result<(u64, Instant)> {
                     continue;
                 }
                 if action == ACTION_ERROR {
-                    let msg = std::str::from_utf8(&buf[8..n]).unwrap_or("<non-utf8>");
+                    let msg =
+                        crate::tracker::sanitize_tracker_text(std::str::from_utf8(&buf[8..n]).unwrap_or("<non-utf8>"));
                     return Err(Error::Tracker(format!("connect error: {msg}")));
                 }
                 if action != ACTION_CONNECT {
@@ -165,7 +166,8 @@ async fn do_announce(
                     continue;
                 }
                 if action == ACTION_ERROR {
-                    let msg = std::str::from_utf8(&buf[8..n]).unwrap_or("<non-utf8>");
+                    let msg =
+                        crate::tracker::sanitize_tracker_text(std::str::from_utf8(&buf[8..n]).unwrap_or("<non-utf8>"));
                     // Trackers commonly respond with "Connection ID missmatch"
                     // (sic) when the id was retired early (clock drift, restart).
                     // Force a fresh connect on the next iteration rather than

@@ -20,6 +20,14 @@ pub fn redact_url_query(url: &str) -> String {
     base.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// Sanitize tracker-supplied free text (HTTP `failure reason`, BEP 15 error
+/// messages) before it reaches logs or error strings. The tracker is a
+/// remote party; control characters in its reply would let it forge log
+/// lines exactly like a crafted announce URL could.
+pub fn sanitize_tracker_text(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Remove any occurrence of `url` (e.g. one embedded by reqwest's error
 /// Display, which prints "… for url (https://host/a?passkey=…)") from a
 /// rendered error string, replacing it with its redacted form.
@@ -351,6 +359,17 @@ mod tests {
         assert_eq!(out, "http://t.example/xINFO spoofed line");
         // Host and path survive; DEL (0x7F) is also a control char.
         assert_eq!(redact_url_query("http://h/p\u{7f}q"), "http://h/pq");
+    }
+
+    #[test]
+    fn sanitize_tracker_text_strips_control_chars_but_keeps_printable() {
+        let hostile = "not authorized\r\nFAKE LOG LINE\u{0}\u{7f}";
+        let out = sanitize_tracker_text(hostile);
+        assert!(!out.contains('\r') && !out.contains('\n'));
+        assert!(!out.contains('\u{0}') && !out.contains('\u{7f}'));
+        assert_eq!(out, "not authorizedFAKE LOG LINE");
+        // Printable text (including spaces and UTF-8) survives untouched.
+        assert_eq!(sanitize_tracker_text("Connection ID missmatch: id 42 ✓"), "Connection ID missmatch: id 42 ✓");
     }
 
     #[test]
