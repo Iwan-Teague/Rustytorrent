@@ -848,6 +848,7 @@ impl TorrentEngine {
                 &req,
                 self.cfg.proxies.first(),
                 self.cfg.anonymous,
+                self.cfg.bind_iface.as_deref(),
             )
             .await
             {
@@ -1045,6 +1046,7 @@ impl TorrentEngine {
                         &req,
                         self.cfg.proxies.first(),
                         self.cfg.anonymous,
+                        self.cfg.bind_iface.as_deref(),
                     ).await;
                     match res {
                         Ok((_, resp)) => {
@@ -1240,6 +1242,7 @@ impl TorrentEngine {
                 &req,
                 self.cfg.proxies.first(),
                 self.cfg.anonymous,
+                self.cfg.bind_iface.as_deref(),
             )
             .await;
         }

@@ -1007,6 +1007,7 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
                 &req,
                 proxies.first(),
                 anonymous,
+                bind_iface.as_deref(),
             )
             .await
             {

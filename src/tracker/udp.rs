@@ -21,7 +21,7 @@ const BASE_TIMEOUT_SECS: u64 = 15;
 /// older than 45 s as stale and re-do the connect step before announcing.
 const CONNECTION_ID_MAX_AGE: Duration = Duration::from_secs(45);
 
-pub async fn announce(url: &str, req: &AnnounceRequest) -> Result<AnnounceResponse> {
+pub async fn announce(url: &str, req: &AnnounceRequest, bind_iface: Option<&str>) -> Result<AnnounceResponse> {
     let host_port = url
         .strip_prefix("udp://")
         .ok_or_else(|| Error::Tracker(format!("not a udp URL: {url}")))?;
@@ -39,9 +39,16 @@ pub async fn announce(url: &str, req: &AnnounceRequest) -> Result<AnnounceRespon
     } else {
         SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
     };
-    let sock = UdpSocket::bind(bind_addr)
-        .await
-        .map_err(|e| Error::Tracker(format!("udp bind: {e}")))?;
+    // With --bind-iface (the VPN kill switch) the announce socket must be
+    // pinned to that interface: if the tunnel drops we fail closed instead
+    // of egressing the default route with our real IP.
+    let sock = match bind_iface {
+        Some(iface) => crate::netbind::bind_udp_to_interface(bind_addr, iface)
+            .map_err(|e| Error::Tracker(format!("udp bind via {iface}: {e}")))?,
+        None => UdpSocket::bind(bind_addr)
+            .await
+            .map_err(|e| Error::Tracker(format!("udp bind: {e}")))?,
+    };
     sock.connect(addr)
         .await
         .map_err(|e| Error::Tracker(format!("udp connect: {e}")))?;

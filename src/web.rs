@@ -495,7 +495,7 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
         };
         let mut pool: Vec<SocketAddr> = Vec::new();
         for url in &magnet.trackers {
-            match crate::tracker::announce_with_proxy_anon(url, &req, None, false).await {
+            match crate::tracker::announce_with_proxy_anon(url, &req, None, false, None).await {
                 Ok(resp) => pool.extend(resp.peers),
                 Err(e) => {
                     tracing::debug!(target: "web", tracker = %url, error = %e, "magnet tracker bootstrap failed")
