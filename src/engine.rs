@@ -1553,7 +1553,14 @@ impl TorrentEngine {
                 self.maybe_request_blocks(addr, peers);
             }
             PeerEvent::Have { addr, index } => {
+                if std::env::var("RT_H").is_ok() {
+                    eprintln!("DBG Have idx={index} from {addr}");
+                }
                 self.picker.add_have(addr, index as usize);
+                if std::env::var("RT_H").is_ok() {
+                    let missing: Vec<usize> = self.pm.missing_pieces().collect();
+                    eprintln!("DBG missing={:?} peer_has1={}", missing, self.picker.peer_has(&addr, 1));
+                }
                 self.maybe_express_interest(addr, peers);
                 self.maybe_request_blocks(addr, peers);
             }
@@ -1591,6 +1598,9 @@ impl TorrentEngine {
                 begin,
                 data,
             } => {
+                if std::env::var("RT_H").is_ok() {
+                    eprintln!("DBG Block idx={index} begin={begin} len={} from {addr}", data.len());
+                }
                 let data_len = data.len() as u64;
                 // The block counts toward our pipeline regardless of dup/error —
                 // a Piece message did come back so an in-flight slot is freed.
@@ -2001,6 +2011,9 @@ impl TorrentEngine {
             .pm
             .missing_pieces()
             .any(|i| self.picker.peer_has(&addr, i));
+        if std::env::var("RT_H").is_ok() {
+            eprintln!("DBG express_interest useful={useful} already={already} handle={}", peers.handle(&addr).is_some());
+        }
         if useful && !already {
             if let Some(h) = peers.handle(&addr) {
                 let _ = h.try_send(PeerCommand::Interested);
@@ -2094,6 +2107,9 @@ impl TorrentEngine {
                     } else {
                         self.outstanding_requests
                             .insert((piece_idx as u32, block.0), (addr, Instant::now()));
+                        if std::env::var("RT_H").is_ok() {
+                            eprintln!("DBG outstanding insert ({piece_idx},{}) for {addr}", block.0);
+                        }
                     }
                 } else {
                     if !endgame {
