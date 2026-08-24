@@ -105,6 +105,15 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P2 — DHT anti-reflection gate had no datagram-path test.** The
+  per-IP token bucket was unit-tested at `allow_query_from` level, but
+  nothing proved the datagram path consults it (deleting the check in
+  handle_datagram would pass every existing test, silently reopening a
+  reflection-amplification gain). DONE: end-to-end test drives the REAL
+  recv loop — 45 pings from one socket answered <= burst cap (~20), a
+  second source keeps its full budget of 5 (per-IP isolation, no global
+  throttle collateral). Mutation-checked: removing the gate answers all
+  45 and fails.
 - [x] **P2 — no martian re-check at the dial syscall (defense in
   depth).** [review finding] Screening lived only at peer INGESTION
   (tracker/DHT/PEX); anything reaching a dial through a future

@@ -851,6 +851,89 @@ mod tests {
         );
     }
 
+    /// END-TO-END pin of the anti-reflection gate: the DATAGRAM path
+    /// must actually consult the per-IP bucket — a ping flood from one
+    /// socket gets at most ~QUERY_BURST replies while a second source
+    /// keeps its own budget (no global throttle, no collateral drop).
+    ///
+    /// Mutation target: deleting the allow_query_from check in
+    /// handle_datagram makes the flood fully answered and fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn datagram_flood_from_one_ip_is_capped_per_ip() {
+        use std::sync::Arc;
+
+        let server = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let state = Arc::new(SharedState::new(NodeId([0u8; 20]), false));
+
+        // Drive the REAL recv loop so the rate-limit check in
+        // handle_datagram is on the tested path.
+        let recv_sock = server.clone();
+        let recv_state = state.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 1500];
+            loop {
+                if let Ok((n, from)) = recv_sock.recv_from(&mut buf).await {
+                    handle_datagram(&recv_state, &recv_sock, from, &buf[..n]).await;
+                }
+            }
+        });
+
+        let ping = |tid: u8| {
+            super::super::krpc::Message::Query {
+                transaction_id: vec![tid],
+                query: super::super::krpc::Query::Ping {
+                    id: NodeId([1u8; 20]),
+                },
+            }
+            .encode()
+        };
+
+        let flooder = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bystander = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        const FLOOD: usize = QUERY_BURST as usize + 25;
+        for i in 0..FLOOD {
+            flooder.send_to(&ping(i as u8), server_addr).await.unwrap();
+            if i < 5 {
+                bystander
+                    .send_to(&ping(200 + i as u8), server_addr)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Count replies per source until things go quiet.
+        let count_replies = |sock: tokio::net::UdpSocket| async move {
+            let mut n = 0usize;
+            let mut buf = vec![0u8; 1500];
+            let deadline = std::time::Instant::now() + Duration::from_millis(800);
+            while std::time::Instant::now() < deadline {
+                if let Ok(Ok(_)) =
+                    tokio::time::timeout(Duration::from_millis(100), sock.recv(&mut buf)).await
+                {
+                    n += 1;
+                }
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+            }
+            n
+        };
+        let (flooded_replies, bystander_replies) =
+            tokio::join!(count_replies(flooder), count_replies(bystander));
+
+        assert!(flooded_replies > 0, "legit burst must be partly answered");
+        assert!(
+            flooded_replies <= QUERY_BURST as usize + 5,
+            "flood exceeded burst cap: {flooded_replies} answered (cap ~{QUERY_BURST})"
+        );
+        assert_eq!(
+            bystander_replies, 5,
+            "second IP must keep its own full budget (per-IP isolation)"
+        );
+    }
+
     #[tokio::test]
     async fn query_rate_limit_caps_burst_from_one_ip() {
         let state = SharedState::new(NodeId([0u8; 20]), false);
