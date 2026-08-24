@@ -105,6 +105,16 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P2 — hostile-SOCKS5-proxy reply parsing untested.** DONE: six
+  scripted-proxy tests drive malformed replies a broken or malicious
+  proxy could produce: bad VER in method reply / CONNECT reply, proxy
+  picking an UNOFFERED method (0x01 GSSAPI), unknown ATYP 0x07 in the
+  connect reply (rejected naming the value; mutation-checked — treating
+  it as IPv4 fails the test), maximum-length DOMAIN bind address
+  (drains all 257 bytes without hanging and leaves the stream
+  byte-aligned for application traffic), and truncated-then-dropped
+  reply (surfaces IO error promptly instead of riding out the
+  handshake timeout). All wrapped in explicit timeouts proving no hang.
 - [x] **P2 — MSE SKEY match was not constant-time.** [verified] The
   receiver's `perform_incoming` compared `HASH('req2', SKEY)` candidates
   with plain `==` inside a short-circuiting `find` — timing could
