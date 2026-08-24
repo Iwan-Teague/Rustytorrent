@@ -692,6 +692,14 @@ impl Driver {
             Command::Close { key } => {
                 if let Some(entry) = self.conns.get_mut(&key) {
                     entry.conn.close();
+                    // Local shutdown is terminal for writers — the TCP
+                    // EPIPE analogue. Close the gate so a write issued
+                    // after `shutdown()` fails fast instead of being
+                    // silently refused by the closing connection (which
+                    // would report `Ok` while dropping the bytes), and
+                    // so a writer parked on credit is unblocked now
+                    // rather than at the HARD_TIMEOUT reap.
+                    entry.gate.close();
                 }
                 let mut outgoing = Vec::new();
                 self.collect_after(&key, now, &mut outgoing);
@@ -1140,5 +1148,119 @@ mod tests {
             .expect("done channel open");
         assert_eq!(written, TOTAL);
         writer.abort();
+    }
+
+    /// A peer RESET must unblock a writer parked on full credit: the
+    /// reaped connection closes its gate, so `write_all` surfaces
+    /// `BrokenPipe` promptly instead of hanging until the 60 s
+    /// HARD_TIMEOUT reap would (never) free the credit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_reset_unblocks_parked_writer() {
+        use super::super::packet::PacketType as PT;
+
+        let fake = tokio::net::UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let client_sock = UtpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+
+        let dial = tokio::spawn(async move { client_sock.connect(fake_addr).await });
+        let mut buf = vec![0u8; 2048];
+        let (n, client_addr) = fake.recv_from(&mut buf).await.unwrap();
+        let syn = Packet::decode(&buf[..n]).expect("SYN decodes");
+        let state = Packet::new(PT::State, syn.connection_id, 7, syn.seq_nr);
+        fake.send_to(&state.encode(), client_addr).await.unwrap();
+        let mut stream = tokio::time::timeout(Duration::from_secs(3), dial)
+            .await
+            .expect("handshake within 3s")
+            .expect("dial task ok")
+            .expect("handshake succeeds");
+
+        // Park a writer beyond the cap against a silent peer.
+        const TOTAL: usize = SEND_BUF_CAP_BYTES + 40_000;
+        let payload = vec![0x5Au8; TOTAL];
+        let writer = tokio::spawn(async move { stream.write_all(&payload).await });
+
+        // Let it enqueue and stall.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !writer.is_finished(),
+            "writer should be parked while the peer is silent"
+        );
+
+        // RESET from the peer — same connection_id our incoming packets
+        // carry (the initiator's recv_id, i.e. the SYN's).
+        let rst = Packet::new(PT::Reset, syn.connection_id, 9, 0);
+        fake.send_to(&rst.encode(), client_addr).await.unwrap();
+
+        let res = tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("reset must unblock the parked writer quickly")
+            .expect("writer task ok");
+        match res {
+            Err(e) => assert_eq!(
+                e.kind(),
+                io::ErrorKind::BrokenPipe,
+                "parked write must fail with BrokenPipe after reset"
+            ),
+            Ok(()) => panic!("write_all completed after peer reset"),
+        }
+    }
+
+    /// A local `shutdown()` is terminal for writers (the TCP EPIPE
+    /// analogue): writes issued afterwards must error promptly instead of
+    /// being silently refused by the closing connection while reporting
+    /// `Ok`. Polls until the driver has processed the Close, so the test
+    /// is scheduling-independent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_shutdown_makes_subsequent_writes_fail() {
+        use super::super::packet::PacketType as PT;
+
+        let fake = tokio::net::UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let client_sock = UtpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+
+        let dial = tokio::spawn(async move { client_sock.connect(fake_addr).await });
+        let mut buf = vec![0u8; 2048];
+        let (n, _client_addr) = fake.recv_from(&mut buf).await.unwrap();
+        let syn = Packet::decode(&buf[..n]).expect("SYN decodes");
+        let state = Packet::new(PT::State, syn.connection_id, 7, syn.seq_nr);
+        fake.send_to(&state.encode(), _client_addr).await.unwrap();
+        let mut stream = tokio::time::timeout(Duration::from_secs(3), dial)
+            .await
+            .expect("handshake within 3s")
+            .expect("dial task ok")
+            .expect("handshake succeeds");
+
+        stream.shutdown().await.expect("shutdown ok");
+
+        // The gate closes when the driver processes the Close command —
+        // retry briefly so channel scheduling can't flake the test.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match stream.write_all(b"post-shutdown").await {
+                Err(e) => {
+                    assert_eq!(
+                        e.kind(),
+                        io::ErrorKind::BrokenPipe,
+                        "post-shutdown write must be BrokenPipe"
+                    );
+                    break;
+                }
+                Ok(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "writes still succeeding 2s after shutdown — \
+                         Close did not terminate the send gate"
+                    );
+                }
+            }
+        }
     }
 }
