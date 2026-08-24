@@ -154,6 +154,28 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 2. Privacy & anonymity
 
+- [x] **P1 — DHT direct-UDP leak audit: every spawn site fail-closed.**
+  [DONE] Audited all three `Dht::spawn` call sites for anon/proxy gating.
+  (1) Engine: gated by `dht_wanted(enable_dht, anonymous, proxied,
+  private)` (UDP can't ride SOCKS5; direct DHT would leak + link the real
+  IP per info-hash). (2) Magnet bootstrap warm-up: had a correct but
+  *duplicated inline* predicate — consolidated onto the same `dht_wanted`
+  (now `pub`, single source of truth) so the fail-closed rules can't
+  drift apart. (3) Daemon shared DHT: N/A — the daemon has no
+  anonymity/proxy flags at all (clearnet by design, documented).
+  Added `tests/anon_mode_sockets.rs`: runs a REAL engine with
+  `anonymous=true, enable_dht=true` (the hostile combination), then reads
+  `/proc/net/{udp,udp6,tcp,tcp6}` and asserts nothing is bound on the
+  session port. Mutation-tested: reverting the gate makes the DHT socket
+  appear and the test fail. Linux-only (`#![cfg(target_os = "linux")]`).
+- [x] **P2 — `local_ip_loopback_resolves` fails on hosts whose network
+  stack doesn't honour SO_BINDTODEVICE route constraints.** [verified:
+  user-space netstacks accept the setsockopt but answer a `lo`-pinned
+  TEST-NET connect with another iface's source] DONE: the test now has a
+  raw-syscall oracle repeating the helper's exact sequence — it fails
+  only when the helper *diverges from the kernel*, and skips when the
+  kernel itself ignores device pinning (environment limitation,
+  documented in-test).
 - [x] **P1 — verify `--anonymous` covers ALL egress, end to end.** Spot
   checks pass (listener off, DHT off, MSE forced, UDP trackers rejected,
   cleartext `http://` trackers rejected, port=0, ephemeral peer_id

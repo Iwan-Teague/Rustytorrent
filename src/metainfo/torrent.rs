@@ -201,14 +201,8 @@ impl Info {
                 pieces_raw.len()
             )));
         }
-        let piece_hashes: Vec<[u8; 20]> = pieces_raw
-            .chunks_exact(20)
-            .map(|c| {
-                let mut h = [0u8; 20];
-                h.copy_from_slice(c);
-                h
-            })
-            .collect();
+        // Multiplicity checked above, so no trailing partial hash exists.
+        let piece_hashes: Vec<[u8; 20]> = pieces_raw.as_chunks::<20>().0.to_vec();
 
         let private = d
             .get(&b"private".to_vec())

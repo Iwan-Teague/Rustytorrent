@@ -235,7 +235,7 @@ pub fn parse_announce_response(buf: &[u8]) -> Result<AnnounceResponse> {
         )));
     }
     let mut peers = Vec::with_capacity(peers_bytes.len() / 6);
-    for c in peers_bytes.chunks_exact(6) {
+    for c in peers_bytes.as_chunks::<6>().0 {
         let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
         let port = u16::from_be_bytes([c[4], c[5]]);
         peers.push(SocketAddr::new(IpAddr::V4(ip), port));

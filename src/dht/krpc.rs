@@ -158,7 +158,8 @@ pub fn parse_nodes_bytes(buf: &[u8]) -> Result<Vec<Contact>> {
         )));
     }
     let mut out = Vec::with_capacity(buf.len() / 26);
-    for chunk in buf.chunks_exact(26) {
+    // Length validated as a multiple of 26 above, so the remainder is empty.
+    for chunk in buf.as_chunks::<26>().0 {
         let mut id = [0u8; 20];
         id.copy_from_slice(&chunk[..20]);
         let ip = Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);

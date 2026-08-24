@@ -356,7 +356,7 @@ pub fn parse_pex(payload: &[u8]) -> Result<PexMessage> {
     let mut added: Vec<std::net::SocketAddr> = Vec::new();
     // IPv4: 6-byte entries (4 addr + 2 port BE).
     if let Some(BencodeValue::Bytes(bytes)) = d.get(b"added".as_slice()) {
-        for chunk in bytes.chunks_exact(6) {
+        for chunk in bytes.as_chunks::<6>().0 {
             let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
             let port = u16::from_be_bytes([chunk[4], chunk[5]]);
             if port == 0 {
@@ -367,7 +367,7 @@ pub fn parse_pex(payload: &[u8]) -> Result<PexMessage> {
     }
     // IPv6: 18-byte entries (16 addr + 2 port BE).
     if let Some(BencodeValue::Bytes(bytes)) = d.get(b"added6".as_slice()) {
-        for chunk in bytes.chunks_exact(18) {
+        for chunk in bytes.as_chunks::<18>().0 {
             let mut addr = [0u8; 16];
             addr.copy_from_slice(&chunk[..16]);
             let ip = std::net::Ipv6Addr::from(addr);
