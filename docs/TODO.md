@@ -178,6 +178,14 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
   `/proc/net/{udp,udp6,tcp,tcp6}` and asserts nothing is bound on the
   session port. Mutation-tested: reverting the gate makes the DHT socket
   appear and the test fail. Linux-only (`#![cfg(target_os = "linux")]`).
+  Hardened this pass: two process-wide assertions added via
+  /proc/self/fd ↔ /proc/net inode matching — (a) the engine process must
+  own ZERO UDP sockets (catches a regression that binds DHT/µTP to an
+  ephemeral or shifted port, which the port-scoped check misses), and
+  (b) zero LISTENING TCP sockets. The first version of the inode match
+  compared bare numbers against `socket:[N]` strings and matched nothing
+  — caught by mutation-testing with gate-revert + ephemeral-port DHT,
+  fixed, re-mutation-tested to failure.
 - [x] **P2 — `local_ip_loopback_resolves` fails on hosts whose network
   stack doesn't honour SO_BINDTODEVICE route constraints.** [verified:
   user-space netstacks accept the setsockopt but answer a `lo`-pinned
@@ -210,10 +218,12 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
   to the same interface as the TCP path. Still gated off under
   `--anonymous`/`--socks5` (UDP can't ride SOCKS5). CLI help + gating
   comments updated.
-- [ ] **P2 — tracker HTTP is not interface-bindable** (reqwest
-  limitation) — documented residual of `--bind-iface`. Investigate a
-  reqwest connector that binds to the interface, or route the tracker
-  through the SOCKS5 path uniformly.
+- [x] **P2 — tracker HTTP is not interface-bindable** (reqwest
+  limitation). RESOLVED — stale: commit 4d52933 already binds tracker
+  sockets to the interface by resolving its IP once via
+  `netbind::interface_local_ip` and passing it to reqwest's
+  `local_address()` (`tracker/http.rs`, both proxied and direct client
+  builders). Verified in code this pass; nothing left to do.
 - [x] **P2 — MSE reserved-byte fingerprint** (roadmap B5 remaining gap).
   DONE (commit 28c7d23, BEP 6): the last fingerprinting gap was byte 7.
   Libtorrent 2.x sets byte 7 = 0x04 (BEP 6 fast extensions); we emitted
@@ -375,9 +385,12 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
   re-parses through our own loader AND that an independent Python bencode
   parser computes the identical info-hash (interop). Unit tests cover
   single-file, multi-file, private, and zero-piece-length rejection.
-- [ ] **P2 — single-download queue / resume-list.** Without the daemon,
-  one torrent per process and no persisted queue. Either document "use
-  `daemon`" or add a simple resume-list the daemon restores on startup.
+- [x] **P2 — single-download queue / resume-list.** RESOLVED on the
+  daemon path: `daemon_store.rs` persists every hosted torrent
+  (`.torrent` + sidecar) and `cmd_daemon` restores the set on startup;
+  magnet adds persist too. The no-daemon CLI remains one torrent per
+  process by design — documented here rather than duplicating queue
+  machinery. Verified in code this pass.
 - [x] **P2 — print the selected files after `--select` resolves.**
   DONE: added `Layout::selected_paths(selectors)` and the engine now
   prints each matched file (relative to the torrent root) after the piece
