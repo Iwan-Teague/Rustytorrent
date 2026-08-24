@@ -221,7 +221,12 @@ fn host_part(value: &str) -> Option<&str> {
     if let Some(end) = authority.rfind(']') {
         return Some(&authority[..=end]);
     }
-    Some(authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority))
+    Some(
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority),
+    )
 }
 
 /// True for the loopback names a legitimate local client sends in
@@ -566,9 +571,11 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
                     // so the non-strict half applies: refuse the martians a
                     // tracker can hand us (loopback, link-local metadata
                     // endpoint, multicast, ...). See util::is_dialable_peer_addr.
-                    pool.extend(resp.peers.into_iter().filter(|a| {
-                        crate::util::is_dialable_peer_addr(a, false)
-                    }));
+                    pool.extend(
+                        resp.peers
+                            .into_iter()
+                            .filter(|a| crate::util::is_dialable_peer_addr(a, false)),
+                    );
                 }
                 Err(e) => {
                     tracing::debug!(target: "web", tracker = %crate::tracker::redact_url_query(url), error = %e, "magnet tracker bootstrap failed")

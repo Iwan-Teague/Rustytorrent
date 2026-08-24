@@ -888,10 +888,7 @@ mod tests {
             id: NodeId([9u8; 20]),
             nodes: vec![
                 Contact::new(NodeId([1u8; 20]), "127.0.0.1:6881".parse().unwrap()),
-                Contact::new(
-                    NodeId([2u8; 20]),
-                    "93.184.215.14:6881".parse().unwrap(),
-                ),
+                Contact::new(NodeId([2u8; 20]), "93.184.215.14:6881".parse().unwrap()),
             ],
         };
         ingest_nodes_from(&state, &resp).await;
@@ -899,9 +896,6 @@ mod tests {
         assert_eq!(rt.len(), 1, "martian contact must not enter the table");
         let got = rt.closest(&NodeId([2u8; 20]), 8);
         assert_eq!(got.len(), 1);
-        assert_eq!(
-            got[0].addr.to_string(),
-            "93.184.215.14:6881"
-        );
+        assert_eq!(got[0].addr.to_string(), "93.184.215.14:6881");
     }
 }

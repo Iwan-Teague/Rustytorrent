@@ -42,7 +42,12 @@ fn same_host_redirect_policy() -> reqwest::redirect::Policy {
             return attempt.follow();
         };
         let origin = || (first.host_str(), first.port_or_known_default());
-        let next = || (attempt.url().host_str(), attempt.url().port_or_known_default());
+        let next = || {
+            (
+                attempt.url().host_str(),
+                attempt.url().port_or_known_default(),
+            )
+        };
         if origin() == next() {
             attempt.follow()
         } else {
@@ -269,18 +274,15 @@ async fn announce_inner(
         // user_agent setting, so we don't have to rebuild the client.
         builder = builder.header(reqwest::header::USER_AGENT, ua);
     }
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| {
-            // reqwest's error Display embeds the full request URL — which
-            // may carry a passkey query param. Scrub it back to
-            // scheme://host/path before it enters our error text.
-            Error::Tracker(format!(
-                "http send: {}",
-                scrub_announce_error(&e.to_string(), &url, base_url)
-            ))
-        })?;
+    let resp = builder.send().await.map_err(|e| {
+        // reqwest's error Display embeds the full request URL — which
+        // may carry a passkey query param. Scrub it back to
+        // scheme://host/path before it enters our error text.
+        Error::Tracker(format!(
+            "http send: {}",
+            scrub_announce_error(&e.to_string(), &url, base_url)
+        ))
+    })?;
     let bytes = read_bounded_body(resp, &url, base_url).await?;
     parse_response(&bytes)
 }
@@ -451,7 +453,10 @@ mod tests {
         };
         let (url_a, cacheable_a) = proxied_url_for_announce(&cfg);
         let (url_b, cacheable_b) = proxied_url_for_announce(&cfg);
-        assert!(!cacheable_a && !cacheable_b, "isolated announces must not be cached");
+        assert!(
+            !cacheable_a && !cacheable_b,
+            "isolated announces must not be cached"
+        );
         assert_ne!(
             url_a, url_b,
             "isolation must rotate the SOCKS5 username per announce"
@@ -467,9 +472,15 @@ mod tests {
         };
         let (url_a, cacheable) = proxied_url_for_announce(&cfg);
         let (url_b, _) = proxied_url_for_announce(&cfg);
-        assert!(cacheable, "non-isolated announces should reuse the pooled client");
+        assert!(
+            cacheable,
+            "non-isolated announces should reuse the pooled client"
+        );
         assert_eq!(url_a, url_b);
-        assert!(url_a.starts_with("socks5h://"), "must force remote DNS: {url_a}");
+        assert!(
+            url_a.starts_with("socks5h://"),
+            "must force remote DNS: {url_a}"
+        );
     }
 
     #[test]
@@ -557,7 +568,10 @@ mod tests {
             !scrubbed.contains("%AB"),
             "percent-encoded info-hash leaked through: {scrubbed}"
         );
-        assert!(scrubbed.contains("t.example"), "host should survive: {scrubbed}");
+        assert!(
+            scrubbed.contains("t.example"),
+            "host should survive: {scrubbed}"
+        );
     }
 
     #[test]
@@ -598,7 +612,9 @@ mod tests {
 
     #[test]
     fn url_host_is_ipv6_literal_parses_authority_only() {
-        assert!(url_host_is_ipv6_literal("http://[2001:db8::1]:8080/announce"));
+        assert!(url_host_is_ipv6_literal(
+            "http://[2001:db8::1]:8080/announce"
+        ));
         // A bracket in the query must NOT flip the family decision.
         assert!(!url_host_is_ipv6_literal(
             "http://tracker.example/announce?key=[abc"
@@ -771,12 +787,7 @@ mod tests {
     #[tokio::test]
     async fn announce_follows_same_host_redirect() {
         let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let addr = spawn_path_server(
-            "/redirect-me",
-            "/announce".to_string(),
-            hits.clone(),
-        )
-        .await;
+        let addr = spawn_path_server("/redirect-me", "/announce".to_string(), hits.clone()).await;
         let url = format!("http://{addr}/redirect-me");
         announce_with_proxy_anon(&url, &dummy_req(), None, false, None)
             .await

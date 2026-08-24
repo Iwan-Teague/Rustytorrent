@@ -515,16 +515,22 @@ async fn dial(
         // escape onto the default route if the tunnel drops — same
         // contract as the engine's peer dials.
         let effective: Vec<ProxyConfig> = proxies.iter().map(|p| p.for_dial()).collect();
-        return timeout(DIAL_TIMEOUT, socks5::connect_chain(&effective, addr, bind_iface))
-            .await
-            .map_err(|_| Error::Network(format!("socks5 dial {addr}: timeout")))?
-            .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}")));
+        return timeout(
+            DIAL_TIMEOUT,
+            socks5::connect_chain(&effective, addr, bind_iface),
+        )
+        .await
+        .map_err(|_| Error::Network(format!("socks5 dial {addr}: timeout")))?
+        .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}")));
     }
     match bind_iface {
-        Some(iface) => timeout(DIAL_TIMEOUT, crate::netbind::connect_via_interface(addr, iface))
-            .await
-            .map_err(|_| Error::Network(format!("connect {addr} via {iface}: timeout")))?
-            .map_err(|e| Error::Network(format!("connect {addr} via {iface}: {e}"))),
+        Some(iface) => timeout(
+            DIAL_TIMEOUT,
+            crate::netbind::connect_via_interface(addr, iface),
+        )
+        .await
+        .map_err(|_| Error::Network(format!("connect {addr} via {iface}: timeout")))?
+        .map_err(|e| Error::Network(format!("connect {addr} via {iface}: {e}"))),
         None => timeout(DIAL_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| Error::Network(format!("connect {addr}: timeout")))?

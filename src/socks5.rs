@@ -913,7 +913,10 @@ mod tests {
         };
 
         let cfg_dbg = format!("{cfg:?}");
-        assert!(!cfg_dbg.contains(&secret_pass), "password leaked: {cfg_dbg}");
+        assert!(
+            !cfg_dbg.contains(&secret_pass),
+            "password leaked: {cfg_dbg}"
+        );
         assert!(
             !cfg_dbg.contains(&secret_user),
             "username leaked: {cfg_dbg}"

@@ -125,7 +125,8 @@ pub async fn announce_with_proxy_anon(
         // Anonymous mode guarantees a SOCKS5 chain upstream; refuse
         // outright if a caller ever violates that.
         return Err(crate::error::Error::Tracker(format!(
-            "anonymous mode requires a SOCKS5 proxy; refusing direct tracker announce: {}", redact_url_query(url)
+            "anonymous mode requires a SOCKS5 proxy; refusing direct tracker announce: {}",
+            redact_url_query(url)
         )));
     }
     if url.starts_with("udp://") {
@@ -136,7 +137,8 @@ pub async fn announce_with_proxy_anon(
             // when no proxy is configured (an upstream gate could be
             // bypassed; this is the last line of defense).
             return Err(crate::error::Error::Tracker(format!(
-                "skipping UDP tracker while proxy is configured or anonymous mode is on: {}", redact_url_query(url)
+                "skipping UDP tracker while proxy is configured or anonymous mode is on: {}",
+                redact_url_query(url)
             )));
         }
         udp::announce(url, req, bind_iface).await
@@ -144,7 +146,8 @@ pub async fn announce_with_proxy_anon(
         http::announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await
     } else {
         Err(crate::error::Error::Tracker(format!(
-            "unsupported tracker scheme: {}", redact_url_query(url)
+            "unsupported tracker scheme: {}",
+            redact_url_query(url)
         )))
     }
 }
@@ -218,9 +221,10 @@ mod tests {
         // Host is deliberately unresolvable (.invalid TLD): the guard
         // must fire BEFORE any DNS or socket work, so the error is the
         // anonymity refusal — not a dns failure.
-        let err = announce_with_proxy_anon("udp://anon-guard-test.invalid:80", &req(), None, true, None)
-            .await
-            .expect_err("anonymous UDP announce must be refused");
+        let err =
+            announce_with_proxy_anon("udp://anon-guard-test.invalid:80", &req(), None, true, None)
+                .await
+                .expect_err("anonymous UDP announce must be refused");
         let msg = format!("{err}");
         assert!(
             msg.contains("refusing direct tracker announce") && msg.contains("anonymous"),
@@ -327,10 +331,15 @@ mod tests {
     /// is the interface bind.
     #[tokio::test]
     async fn udp_announce_honors_bind_iface_fail_closed() {
-        let err =
-            announce_with_proxy_anon("udp://127.0.0.1:9/announce", &req(), None, false, Some("rt_nonexistent_iface_xyz123"))
-                .await
-                .expect_err("missing bind iface must fail closed");
+        let err = announce_with_proxy_anon(
+            "udp://127.0.0.1:9/announce",
+            &req(),
+            None,
+            false,
+            Some("rt_nonexistent_iface_xyz123"),
+        )
+        .await
+        .expect_err("missing bind iface must fail closed");
         let msg = format!("{err}");
         assert!(
             msg.contains("udp bind via rt_nonexistent_iface_xyz123"),
@@ -344,9 +353,15 @@ mod tests {
             redact_url_query("https://t.example/a.php?passkey=SECRET&k=X"),
             "https://t.example/a.php"
         );
-        assert_eq!(redact_url_query("http://t.example/an#frag"), "http://t.example/an");
+        assert_eq!(
+            redact_url_query("http://t.example/an#frag"),
+            "http://t.example/an"
+        );
         // No query/fragment: unchanged.
-        assert_eq!(redact_url_query("udp://t.example:6969/announce"), "udp://t.example:6969/announce");
+        assert_eq!(
+            redact_url_query("udp://t.example:6969/announce"),
+            "udp://t.example:6969/announce"
+        );
     }
 
     #[test]
@@ -369,7 +384,10 @@ mod tests {
         assert!(!out.contains('\u{0}') && !out.contains('\u{7f}'));
         assert_eq!(out, "not authorizedFAKE LOG LINE");
         // Printable text (including spaces and UTF-8) survives untouched.
-        assert_eq!(sanitize_tracker_text("Connection ID missmatch: id 42 ✓"), "Connection ID missmatch: id 42 ✓");
+        assert_eq!(
+            sanitize_tracker_text("Connection ID missmatch: id 42 ✓"),
+            "Connection ID missmatch: id 42 ✓"
+        );
     }
 
     #[test]
@@ -378,7 +396,10 @@ mod tests {
         let msg = format!("http send: error sending request for url ({url})");
         let scrubbed = scrub_url_from_message(&msg, url);
         assert!(scrubbed.contains("https://t.example/a.php"));
-        assert!(!scrubbed.contains("SECRET"), "passkey survived scrub: {scrubbed}");
+        assert!(
+            !scrubbed.contains("SECRET"),
+            "passkey survived scrub: {scrubbed}"
+        );
         // URL without query: nothing to scrub, message unchanged.
         let plain = "http://x.example/a";
         assert_eq!(scrub_url_from_message("boom", plain), "boom");
