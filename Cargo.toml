@@ -36,3 +36,4 @@ libc         = "0.2"                                        # if_nametoindex for
 tokio-test   = "0.4"
 sha1         = "0.10"  # build piece hashes in the end-to-end download test
 proptest     = "1"     # property/fuzz tests for the untrusted-input parsers
+tower        = { version = "0.5", features = ["util"] }  # oneshot requests against the web routers
