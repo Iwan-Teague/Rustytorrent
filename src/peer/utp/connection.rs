@@ -601,6 +601,15 @@ impl Connection {
         self.out_len + inflight
     }
 
+    /// Undelivered RECEIVE-side bytes: delivered-but-not-yet-taken
+    /// (`in_buf`) plus stashed out-of-order payloads. This is the
+    /// quantity the advertised window bounds; exposed for the flow-control
+    /// property tests and driver diagnostics.
+    pub fn undelivered_receive_bytes(&self) -> usize {
+        let stashed: usize = self.pending_in.values().map(|p| p.len()).sum();
+        self.in_buf.len() + stashed
+    }
+
     /// Pull whatever the application can read right now.
     pub fn take_received(&mut self, max: usize) -> Vec<u8> {
         let n = self.in_buf.len().min(max);

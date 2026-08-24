@@ -495,6 +495,19 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 7. Testing
 
+- [x] **P1 — property coverage for the µTP flow-control core.** DONE:
+  `tests/utp_flow_props.rs` — (1) chaos-integrity: any interleaving of
+  in-order/duplicate/gap-opening DATA delivers an exact prefix of the
+  sender's byte stream (192 cases × random sizes/orderings); (2)
+  no-drain flood: with the app not reading, the frontier freezes at the
+  window bound, undelivered bytes stay ≤ window + stash ceiling for
+  every packet-size split, and a frontier+1 retransmit after a drain
+  resumes delivery intact. Plus `SendGate` ledger property in
+  socket.rs: arbitrary reserve/partial-release sequences never exceed
+  cap, strand credit, or survive over-release corruptly (64 seeds ×
+  400 ops). Mutation-checked: removing the receive-window guard fails
+  the flood property ("undelivered 2098624 exceeds bound").
+
 - [x] **P0 — end-to-end seeder↔leecher download test.** [DONE]
   `tests/download_e2e.rs`: a seeder engine (started complete) serves a
   leecher over loopback (no tracker, direct `--peer`); asserts
