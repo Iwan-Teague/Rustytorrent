@@ -143,6 +143,9 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
             // anycast relays and similar protocol endpoints live here — a
             // dial reaches infrastructure gateways, never a swarm peer.
             let ietf_protocols = o[0] == 192 && o[1] == 0 && o[2] == 0;
+            // Deprecated 6to4 relay anycast (RFC 7526): dialing it hands the
+            // announcer-chosen v4-in-v6 translation to a gateway operator.
+            let six_to_four_relay = o[0] == 192 && o[1] == 88 && o[2] == 99;
             !(v4.is_broadcast()
                 || v4.is_link_local()
                 || cgnat
@@ -151,6 +154,7 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
                 || reserved
                 || this_network
                 || ietf_protocols
+                || six_to_four_relay
                 || (strict && v4.is_private()))
         }
         IpAddr::V6(v6) => {
@@ -392,6 +396,20 @@ mod tests {
         }
         // Public control: outside every special-purpose block.
         let addr: SocketAddr = "8.8.8.8:51413".parse().unwrap();
+        assert!(is_dialable_peer_addr(&addr, false));
+    }
+
+    #[test]
+    fn six_to_four_relay_anycast_addrs_are_never_dialable() {
+        // Deprecated 6to4 relay anycast (192.88.99.0/24, RFC 7526): a dial
+        // reaches an announcer-chosen translation gateway, never a peer.
+        for a in ["192.88.99.1:6881", "192.88.99.9:51413"] {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert!(!is_dialable_peer_addr(&addr, false), "{a} clearnet");
+            assert!(!is_dialable_peer_addr(&addr, true), "{a} strict");
+        }
+        // Public control.
+        let addr: SocketAddr = "93.184.215.14:51413".parse().unwrap();
         assert!(is_dialable_peer_addr(&addr, false));
     }
 
