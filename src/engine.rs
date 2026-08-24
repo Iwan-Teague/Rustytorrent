@@ -2145,10 +2145,11 @@ impl TorrentEngine {
             "done".to_string()
         } else if self.paused {
             "paused".to_string()
-        } else if down_rate_bps > 0 {
-            fmt_duration(remaining / down_rate_bps)
         } else {
-            "—".to_string()
+            match down_rate_bps {
+                0 => "—".to_string(),
+                rate => fmt_duration(remaining / rate),
+            }
         };
         tracing::info!(
             target: "engine",

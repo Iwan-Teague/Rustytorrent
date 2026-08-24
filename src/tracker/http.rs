@@ -724,9 +724,10 @@ mod tests {
     }
 
     /// Raw-TCP fake tracker that answers each request based on its path:
+    ///
     /// - `redirect_from` gets "HTTP/1.1 302 Found" pointing at `location`
     ///   (and bumps `hits`), everything else gets a valid bencode reply.
-    /// Accepts in a loop so redirect chains can hit it repeatedly.
+    /// - Accepts in a loop so redirect chains can hit it repeatedly.
     async fn spawn_path_server(
         redirect_from: &'static str,
         location: String,
@@ -772,7 +773,7 @@ mod tests {
         let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let addr = spawn_path_server(
             "/redirect-me",
-            format!("/announce"),
+            "/announce".to_string(),
             hits.clone(),
         )
         .await;
@@ -791,7 +792,7 @@ mod tests {
     async fn announce_cross_host_redirect_not_followed() {
         let evil_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let evil_addr =
-            spawn_path_server("/announce", format!("/stolen"), evil_hits.clone()).await;
+            spawn_path_server("/announce", "/stolen".to_string(), evil_hits.clone()).await;
         let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let addr = spawn_path_server(
             "/announce",
