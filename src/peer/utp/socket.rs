@@ -20,22 +20,28 @@
 //! unbounded channel. The driver is the single owner of every
 //! `Connection`, so the state machine never needs locking.
 //!
-//! ## Deliberate gaps (carried over from the state machine)
+//! ## Write backpressure
 //!
-//! - Fixed send window, no LEDBAT — see [`Connection`].
-//! - Selective-ack is parsed by the codec but not acted on.
-//! - The application→driver data path is unbounded: a producer that
-//!   writes far faster than the network drains will grow the driver's
-//!   per-connection `out_buf`. BitTorrent block exchange is naturally
-//!   paced by the request/piece protocol, so this isn't a problem in
-//!   practice, but it is not a general-purpose backpressured stream.
+//! The command channel is unbounded, so backpressure is enforced one
+//! level up, at [`UtpStream::poll_write`], via a per-connection
+//! [`SendGate`] credit ledger shared between the stream and the
+//! driver. A write first reserves `min(len, available)` bytes of
+//! credit; if none is available it parks the caller's waker and
+//! returns `Poll::Pending`. The driver releases credit exactly when
+//! bytes *leave* the connection — acked by the peer (dropped from
+//! `out_blocks`/`in_flight`), or dropped wholesale when the connection
+//! closes/reaps — and wakes the parked writer. Total driver-held
+//! outbound memory per connection is therefore bounded at
+//! [`SEND_BUF_CAP_BYTES`] regardless of how fast the application
+//! writes.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as SyncMutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -74,11 +80,119 @@ const RECV_BUF: usize = 65_535;
 /// above any legitimate peer set + in-flight dial races.
 const MAX_CONNS: usize = 1024;
 
+/// Per-connection cap, in bytes, on outbound data the driver holds for
+/// the peer — the unsent queue plus every sent-but-unacked packet
+/// (`Connection::outstanding_send_bytes`). [`UtpStream::poll_write`]
+/// refuses to enqueue past this: it accepts a partial write up to the
+/// remaining credit and returns `Poll::Pending` when none is left,
+/// parking the writer until the driver releases acked bytes.
+///
+/// Sizing: the engine's upload path is paced by peer `Request`s at
+/// `PIPELINE_DEPTH` × 16 KiB ≈ 80 KiB per peer in flight, so 256 KiB is
+/// ~3× legitimate headroom — a well-behaved upload never blocks. The
+/// bound turns the previously unbounded app→driver queue into a fixed
+/// worst case of cap × live connections (≈ 12 MiB at the engine's 50-peer
+/// cap; the forged-SYN `MAX_CONNS` ceiling can't reach it because remote
+/// peers can't make *us* write). Chosen over tokio's bounded-channel
+/// backpressure because one shared bounded channel would couple unrelated
+/// streams' writers together.
+const SEND_BUF_CAP_BYTES: usize = 256 * 1024;
+
+/// Shared write-side credit ledger for one connection: how many bytes
+/// the stream side has reserved against [`SEND_BUF_CAP_BYTES`], and the
+/// waker of any writer currently blocked on full credit.
+///
+/// The stream reserves atomically before enqueueing a `Send`; the driver
+/// releases exactly what leaves the connection and wakes the parked
+/// writer. Single-reserver (one `poll_write` at a time per stream, &mut),
+/// single-releaser (the driver), so plain atomics + one waker slot are
+/// sufficient — no unbounded waiter queues.
+struct SendGate {
+    /// Bytes currently reserved by the stream (mirrors what the driver
+    /// holds once the `Send` command lands; transiently over-counts
+    /// while the command is still in the channel, which is the safe
+    /// direction).
+    used: AtomicUsize,
+    closed: AtomicBool,
+    /// Waker of the writer blocked in `poll_write`, if any. Taken and
+    /// woken on release/close.
+    waiter: SyncMutex<Option<Waker>>,
+}
+
+impl SendGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            used: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            waiter: SyncMutex::new(None),
+        })
+    }
+
+    fn available(&self) -> usize {
+        SEND_BUF_CAP_BYTES.saturating_sub(self.used.load(Ordering::SeqCst))
+    }
+
+    fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Reserve up to `want` bytes. Returns what was actually reserved
+    /// (≥ 1 whenever `available() > 0`).
+    fn reserve(&self, want: usize) -> usize {
+        let n = want.min(self.available());
+        if n > 0 {
+            self.used.fetch_add(n, Ordering::SeqCst);
+        }
+        n
+    }
+
+    /// Give back `n` reserved bytes and wake a blocked writer, if any.
+    fn release(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        // Saturating CAS loop: a concurrent reserve may bump `used`
+        // between our load and the swap; retry until one subtraction
+        // lands. Never goes below zero.
+        loop {
+            let cur = self.used.load(Ordering::SeqCst);
+            let next = cur.saturating_sub(n);
+            match self
+                .used
+                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+        self.wake();
+    }
+
+    /// Mark the connection dead: blocked (and all future) writes fail
+    /// with `BrokenPipe` instead of waiting forever.
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        if let Some(w) = self.waiter.lock().expect("waiter mutex").take() {
+            w.wake();
+        }
+    }
+}
+
 /// `(peer address, our recv_id)` — the key every connection is stored
 /// under. Inbound packets for an established connection always carry
 /// our `recv_id` as their `connection_id`, so this is also the lookup
 /// key for routing a datagram.
 type ConnKey = (SocketAddr, u16);
+
+/// The error surfaced to a writer when its connection died while it was
+/// blocked on (or holding) send credit.
+fn broken_pipe() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "utp connection closed")
+}
 
 /// An in-flight outgoing dial: the responder that hands the finished
 /// stream back to `connect`, paired with the receive half the stream
@@ -99,8 +213,16 @@ enum Command {
     /// Application bytes to send on `key`. Carried as a shared
     /// `Arc<[u8]>` block so the driver can hand it to the connection
     /// without a copy, and so splitting it into N packets shares the one
-    /// allocation (see `Connection::enqueue_send_block`).
-    Send { key: ConnKey, data: Arc<[u8]> },
+    /// allocation (see `Connection::enqueue_send_block`). The writer's
+    /// `gate` rides along so credit is released even when the connection
+    /// has already been reaped (or refuses the block because it's
+    /// closing) — otherwise a raced write would strand its reservation
+    /// and eventually wedge every writer at the cap.
+    Send {
+        key: ConnKey,
+        data: Arc<[u8]>,
+        gate: Arc<SendGate>,
+    },
     /// Application requested a clean close of `key`.
     Close { key: ConnKey },
 }
@@ -108,6 +230,16 @@ enum Command {
 /// One driver-owned connection plus its plumbing to the stream half.
 struct Entry {
     conn: Connection,
+    /// Write-credit ledger shared with the stream half. The driver
+    /// releases acked/dropped bytes against it and closes it when the
+    /// connection is reaped, so a blocked writer never waits on a dead
+    /// connection.
+    gate: Arc<SendGate>,
+    /// Last value of `conn.outstanding_send_bytes()` the driver has
+    /// accounted for. Each sync releases `last_outstanding - current`
+    /// back to the gate — exactly the bytes that left the connection
+    /// (acked or pruned) since the previous event.
+    last_outstanding: usize,
     /// Driver → stream: in-order application bytes. Dropping this
     /// sender signals EOF to the stream's `AsyncRead`.
     deliver: mpsc::UnboundedSender<Vec<u8>>,
@@ -137,6 +269,8 @@ struct Entry {
 pub struct UtpStream {
     key: ConnKey,
     cmd: mpsc::UnboundedSender<Command>,
+    /// Write-credit ledger shared with the driver (see [`SendGate`]).
+    gate: Arc<SendGate>,
     incoming: mpsc::UnboundedReceiver<Vec<u8>>,
     /// Leftover bytes from a delivered chunk that didn't fit the last
     /// read's buffer.
@@ -150,10 +284,12 @@ impl UtpStream {
         key: ConnKey,
         cmd: mpsc::UnboundedSender<Command>,
         incoming: mpsc::UnboundedReceiver<Vec<u8>>,
+        gate: Arc<SendGate>,
     ) -> Self {
         Self {
             key,
             cmd,
+            gate,
             incoming,
             read_rem: Vec::new(),
             read_pos: 0,
@@ -219,22 +355,53 @@ impl AsyncRead for UtpStream {
 impl AsyncWrite for UtpStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let me = self.get_mut();
-        // One allocation per write: copy the caller's bytes into a shared
-        // `Arc<[u8]>` block. The connection then slices this block into N
-        // packet payloads that share it, instead of allocating per packet.
-        match me.cmd.send(Command::Send {
-            key: me.key,
-            data: Arc::from(buf),
-        }) {
-            Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(_) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "utp driver gone",
-            ))),
+        if me.gate.closed() {
+            return Poll::Ready(Err(broken_pipe()));
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        loop {
+            // Reserve credit up front so concurrent writes can never
+            // overshoot SEND_BUF_CAP_BYTES, then hand the bytes to the
+            // driver. Partial acceptance keeps the accounting exact: a
+            // write larger than the remaining credit is split across
+            // polls (write_all callers handle this transparently).
+            let n = me.gate.reserve(buf.len());
+            if n > 0 {
+                // One allocation per accepted chunk: the connection
+                // slices this shared block into packet payloads that
+                // all reference it (no per-packet copies).
+                match me.cmd.send(Command::Send {
+                    key: me.key,
+                    data: Arc::from(&buf[..n]),
+                    gate: Arc::clone(&me.gate),
+                }) {
+                    Ok(()) => return Poll::Ready(Ok(n)),
+                    Err(_) => {
+                        me.gate.release(n);
+                        return Poll::Ready(Err(broken_pipe()));
+                    }
+                }
+            }
+            // Credit exhausted — park until the driver releases acked
+            // bytes or closes the connection. Register the waker FIRST,
+            // then re-check availability: a release that raced us
+            // between the check above and registration would otherwise
+            // strand us with no future notification. Spurious wakeups
+            // just re-run the loop.
+            *me.gate.waiter.lock().expect("send-gate waiter mutex") = Some(cx.waker().clone());
+            if me.gate.closed() {
+                return Poll::Ready(Err(broken_pipe()));
+            }
+            if me.gate.available() > 0 {
+                continue; // credit freed while we registered — retry now
+            }
+            return Poll::Pending;
         }
     }
 
@@ -456,11 +623,14 @@ impl Driver {
                 tracing::debug!(target: "utp", %peer, "connection cap reached; dropping inbound SYN");
             } else if let Some((conn, state)) = Connection::new_receiver(&pkt, now) {
                 let (dtx, drx) = mpsc::unbounded_channel();
-                let stream = UtpStream::new(recv_key, self.cmd_tx.clone(), drx);
+                let gate = SendGate::new();
+                let stream = UtpStream::new(recv_key, self.cmd_tx.clone(), drx, Arc::clone(&gate));
                 self.conns.insert(
                     recv_key,
                     Entry {
                         conn,
+                        gate,
+                        last_outstanding: 0,
                         deliver: dtx,
                         pending: None,
                         // Hold the stream until the peer's first non-SYN
@@ -486,10 +656,13 @@ impl Driver {
                 let key: ConnKey = (peer, recv_id);
                 let (conn, syn) = Connection::new_initiator(recv_id, now);
                 let (dtx, drx) = mpsc::unbounded_channel();
+                let gate = SendGate::new();
                 self.conns.insert(
                     key,
                     Entry {
                         conn,
+                        gate,
+                        last_outstanding: 0,
                         deliver: dtx,
                         pending: Some((resp, drx)),
                         pending_accept: None,
@@ -499,10 +672,17 @@ impl Driver {
                 // No packet received yet → no delay measurement to echo.
                 self.flush(peer, 0, vec![syn]).await;
             }
-            Command::Send { key, data } => {
-                if let Some(entry) = self.conns.get_mut(&key) {
-                    // Hand over the shared block with no copy.
-                    entry.conn.enqueue_send_block(data);
+            Command::Send { key, data, gate } => {
+                let len = data.len();
+                let accepted = match self.conns.get_mut(&key) {
+                    // Hand over the shared block with no copy. `false`
+                    // means the connection is closing and dropped the
+                    // block — the writer's reservation must be returned.
+                    Some(entry) => entry.conn.enqueue_send_block(data),
+                    None => false,
+                };
+                if !accepted {
+                    gate.release(len);
                 }
                 let mut outgoing = Vec::new();
                 self.collect_after(&key, now, &mut outgoing);
@@ -559,9 +739,25 @@ impl Driver {
 
         outgoing.extend(entry.conn.pending_send_packets(now));
 
+        // Write-credit accounting: whatever left the connection since the
+        // last event — DATA payloads the peer acked (or selectively
+        // acked), pruned from `in_flight` — is released back to the gate,
+        // waking a parked writer if one exists. Packetization itself
+        // (queue → in-flight) only moves bytes between the two counters,
+        // leaving their sum unchanged, so it never triggers a release.
+        let outstanding = entry.conn.outstanding_send_bytes();
+        if outstanding < entry.last_outstanding {
+            let freed = entry.last_outstanding - outstanding;
+            entry.gate.release(freed);
+            entry.last_outstanding = outstanding;
+        } else {
+            entry.last_outstanding = outstanding;
+        }
+
         if entry.conn.state() == State::Connected {
             if let Some((resp, drx)) = entry.pending.take() {
-                let stream = UtpStream::new(*key, self.cmd_tx.clone(), drx);
+                let stream =
+                    UtpStream::new(*key, self.cmd_tx.clone(), drx, Arc::clone(&entry.gate));
                 let _ = resp.send(Ok(stream));
             }
         }
@@ -574,6 +770,15 @@ impl Driver {
                     "utp connection reset before handshake completed",
                 )));
             }
+            // Return any remaining credit (the buffers just dropped with
+            // the connection) and mark the gate closed so a writer parked
+            // on it errors instead of waiting forever. Writes already in
+            // the command channel are handled by their miss path.
+            let remaining = entry.conn.outstanding_send_bytes();
+            if remaining > 0 {
+                entry.gate.release(remaining);
+            }
+            entry.gate.close();
             // Dropping the entry drops `deliver` → stream sees EOF.
             self.conns.remove(key);
         }
@@ -597,6 +802,7 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn pair() -> (UtpSocket, UtpSocket, SocketAddr) {
@@ -712,5 +918,227 @@ mod tests {
             Ok(inner) => assert!(inner.is_err(), "dial to dead peer must error"),
             Err(_) => panic!("connect() did not honour its own timeout"),
         }
+    }
+
+    // ---- SendGate units ----
+
+    #[test]
+    fn send_gate_reserve_release_roundtrip() {
+        let g = SendGate::new();
+        assert_eq!(g.available(), SEND_BUF_CAP_BYTES);
+        assert_eq!(g.reserve(1000), 1000);
+        assert_eq!(g.available(), SEND_BUF_CAP_BYTES - 1000);
+        // Over-reserve is capped at the remaining credit.
+        assert_eq!(g.reserve(SEND_BUF_CAP_BYTES), SEND_BUF_CAP_BYTES - 1000);
+        assert_eq!(g.available(), 0);
+        // Zero credit reserves nothing — the caller must park.
+        assert_eq!(g.reserve(1), 0);
+        g.release(400);
+        assert_eq!(g.available(), 400);
+        // Partial writes: reserve less than asked when partially free.
+        assert_eq!(g.reserve(4000), 400);
+    }
+
+    #[test]
+    fn send_gate_release_saturates_at_zero() {
+        let g = SendGate::new();
+        // Releasing more than ever reserved must not wrap `used` into a
+        // huge value (which would permanently wedge all writers).
+        g.release(SEND_BUF_CAP_BYTES + 5);
+        assert_eq!(g.available(), SEND_BUF_CAP_BYTES);
+    }
+
+    #[test]
+    fn send_gate_close_sets_flag() {
+        let g = SendGate::new();
+        assert!(!g.closed());
+        g.close();
+        assert!(g.closed());
+    }
+
+    /// Mirrors `poll_write`'s registration order exactly (register waker,
+    /// then re-check) so the test proves the race-free ordering wakes.
+    #[tokio::test]
+    async fn send_gate_wakes_registered_waiter_on_release() {
+        let g = SendGate::new();
+        assert_eq!(g.reserve(SEND_BUF_CAP_BYTES), SEND_BUF_CAP_BYTES);
+        let g2 = Arc::clone(&g);
+        let waiter = tokio::spawn(async move {
+            std::future::poll_fn(|cx| {
+                loop {
+                    if g2.closed() || g2.available() > 0 {
+                        return Poll::Ready(g2.available());
+                    }
+                    *g2.waiter.lock().expect("waiter mutex") = Some(cx.waker().clone());
+                    if g2.available() > 0 {
+                        continue; // release raced us before registration
+                    }
+                    return Poll::Pending;
+                }
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        g.release(1234);
+        let avail = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("release must wake the registered waiter")
+            .expect("task ok");
+        assert_eq!(avail, 1234);
+    }
+
+    #[tokio::test]
+    async fn send_gate_close_wakes_waiter_with_closed_flag() {
+        let g = SendGate::new();
+        assert_eq!(g.reserve(SEND_BUF_CAP_BYTES), SEND_BUF_CAP_BYTES);
+        let g2 = Arc::clone(&g);
+        let waiter = tokio::spawn(async move {
+            std::future::poll_fn(|cx| {
+                if g2.closed() {
+                    return Poll::Ready(true);
+                }
+                *g2.waiter.lock().expect("waiter mutex") = Some(cx.waker().clone());
+                Poll::Pending
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        g.release(SEND_BUF_CAP_BYTES); // credit alone must NOT satisfy close-waiters
+        assert!(!g.closed());
+        g.close();
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("close must wake the registered waiter")
+            .expect("task ok");
+    }
+
+    // ---- End-to-end backpressure against a scripted peer ----
+
+    /// A raw-UDP fake peer that completes the µTP handshake and then
+    /// follows a script: stay silent (no acks) until told to start acking
+    /// everything it receives. This gives deterministic control of the
+    /// sender's credit — silence pins `in_flight`, acks release it.
+    ///
+    /// Proves both halves of the backpressure contract:
+    /// 1. `write_all` beyond `SEND_BUF_CAP_BYTES` stalls while unacked,
+    /// 2. it completes once the peer acks, with every byte on the wire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poll_write_blocks_at_cap_until_peer_acks() {
+        use super::super::packet::PacketType as PT;
+
+        let fake = tokio::net::UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let client_sock = UtpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+
+        // Handshake: connect() sends the SYN; we answer STATE so the dial
+        // resolves and the stream enters Connected (DATA may flow).
+        let dial = tokio::spawn(async move { client_sock.connect(fake_addr).await });
+        let mut buf = vec![0u8; 2048];
+        let (n, client_addr) = fake.recv_from(&mut buf).await.unwrap();
+        let syn = Packet::decode(&buf[..n]).expect("SYN decodes");
+        assert_eq!(syn.packet_type, PT::Syn);
+        // Receiver STATE per BEP 29: connection_id = SYN's id (our send
+        // id), seq_nr = our initial (arbitrary), ack_nr = the SYN's seq.
+        let state = Packet::new(PT::State, syn.connection_id, 7, syn.seq_nr);
+        fake.send_to(&state.encode(), client_addr).await.unwrap();
+        let mut stream = tokio::time::timeout(Duration::from_secs(3), dial)
+            .await
+            .expect("handshake within 3s")
+            .expect("dial task ok")
+            .expect("handshake succeeds");
+
+        // Writer: CAP + 40 KiB. The extra 40 KiB can only leave after
+        // credits free up via acks — proof the writer actually blocked.
+        const TOTAL: usize = SEND_BUF_CAP_BYTES + 40_000;
+        let payload = vec![0x5Au8; TOTAL];
+        let (done_tx, mut done_rx) = mpsc::channel::<usize>(1);
+        let writer = tokio::spawn(async move {
+            stream
+                .write_all(&payload)
+                .await
+                .expect("write_all succeeds once acks resume");
+            let _ = done_tx.send(TOTAL).await;
+            stream
+        });
+
+        // Phase 1 — silence. Collect the initial window's DATA (a few
+        // packets arrive immediately) but ack NOTHING. The writer must
+        // stall with its remaining ~CAP bytes queued.
+        let mut seen: HashSet<u16> = HashSet::new();
+        let mut received = 0usize;
+        let quiet_end = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < quiet_end {
+            if let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_millis(50), fake.recv_from(&mut buf)).await
+            {
+                if let Ok(p) = Packet::decode(&buf[..n]) {
+                    if p.packet_type == PT::Data && seen.insert(p.seq_nr) {
+                        received += p.payload.len();
+                    }
+                }
+            }
+        }
+        assert!(received > 0, "initial-window DATA never reached the wire");
+        match tokio::time::timeout(Duration::from_millis(500), done_rx.recv()).await {
+            Err(_) => {} // still blocked — correct
+            Ok(_) => panic!("write_all finished although the peer acked nothing"),
+        }
+
+        // Phase 2 — cumulative acks. Ack only the *contiguous* frontier:
+        // a lost packet keeps the ack pinned and forces an RTO retransmit,
+        // which our dedup set counts once. DATA seqs start right after
+        // the SYN's.
+        let mut contiguous = syn.seq_nr;
+        while seen.contains(&contiguous.wrapping_add(1)) {
+            contiguous = contiguous.wrapping_add(1);
+        }
+        let ack_deadline = Instant::now() + Duration::from_secs(15);
+        while received < TOTAL {
+            if Instant::now() > ack_deadline {
+                panic!("ack phase stalled: {received}/{TOTAL} bytes delivered");
+            }
+            let pkt =
+                match tokio::time::timeout(Duration::from_millis(500), fake.recv_from(&mut buf))
+                    .await
+                {
+                    Ok(Ok((n, _))) => Packet::decode(&buf[..n]).ok(),
+                    _ => {
+                        // Idle stretch — re-ack current frontier in case ours
+                        // was lost, then keep waiting.
+                        let ack = Packet::new(PT::State, syn.connection_id, 7, contiguous);
+                        fake.send_to(&ack.encode(), client_addr).await.unwrap();
+                        continue;
+                    }
+                };
+            let Some(pkt) = pkt else { continue };
+            if pkt.packet_type != PT::Data {
+                continue;
+            }
+            let seq = pkt.seq_nr;
+            if seen.insert(seq) {
+                received += pkt.payload.len();
+            }
+            if seq == contiguous.wrapping_add(1) {
+                contiguous = seq;
+                while seen.contains(&contiguous.wrapping_add(1)) {
+                    contiguous = contiguous.wrapping_add(1);
+                }
+            }
+            let ack = Packet::new(PT::State, syn.connection_id, 7, contiguous);
+            fake.send_to(&ack.encode(), client_addr).await.unwrap();
+        }
+        assert_eq!(received, TOTAL, "every byte must reach the wire");
+
+        // The writer finishes only because acks freed its credit.
+        let written = tokio::time::timeout(Duration::from_secs(3), done_rx.recv())
+            .await
+            .expect("writer completes after acks resume")
+            .expect("done channel open");
+        assert_eq!(written, TOTAL);
+        writer.abort();
     }
 }
