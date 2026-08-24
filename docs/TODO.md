@@ -105,6 +105,13 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P2 — B4 inbound connect-flood limiter had no wiring test.** The
+  accept-loop per-IP token bucket (burst 10, refill 1/s) was untested
+  end to end; deleting the drop branch would pass everything. New
+  tests/connect_flood.rs: 16 rapid valid handshakes from one IP against
+  a live engine — early ones answered, total bounded below all 16,
+  engine survives. Mutation-checked: bypassing the bucket answers all
+  16 and fails.
 - [x] **P2 — sub-8 KiB/s rate caps silently stalled all transfers.**
   [found by adversarial review] Throttle buckets sized capacity at 2 s
   of burst (rate x 2), but request charges are up to BLOCK_SIZE
