@@ -108,12 +108,19 @@ the default route and leaking your real IP.
   over `netbind::bind_udp_to_interface`), so `--utp` works under
   `--bind-iface` and fails closed with the rest of the kill switch if the
   tunnel drops.
-- ⚠️ **Tracker HTTP is NOT interface-bound.** The HTTP client (`reqwest`)
-  doesn't expose per-interface binding, so tracker announces ride the OS's
-  normal routing. For a complete kill switch, **pair `--bind-iface` with
-  `--socks5`** so the tracker rides the proxy (and point the proxy at the
-  tunnel), or use `--no-tracker`. `--anonymous` (which requires `--socks5`)
-  gives the strongest posture.
+- ✅ **Tracker announces are interface-bound too**: HTTP announces pin
+  reqwest's outbound sockets via `local_address` resolved from the interface,
+  and UDP tracker announces bind their socket with
+  `netbind::bind_udp_to_interface`. If the interface disappears, the announce
+  fails instead of re-routing.
+- ⚠️ **DNS is NOT interface-scoped.** Resolving a tracker's hostname still
+  uses the system resolver, which answers over normal routing — so under
+  `--bind-iface` alone, whatever resolver serves your default route sees you
+  look up each tracker hostname (a metadata leak, not an IP leak: the
+  announce traffic itself stays pinned). For full containment, pair
+  `--bind-iface` with `--socks5` (HTTP trackers then resolve remotely via
+  socks5h; UDP trackers are refused outright under a proxy) or use
+  IP-literal tracker URLs.
 
 ---
 
