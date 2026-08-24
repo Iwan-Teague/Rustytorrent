@@ -314,6 +314,22 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 4. Correctness & robustness
 
+- [x] **P1 — µTP driver→stream delivery queue unbounded (window
+  bypass).** [verified] The receive window bounds `in_buf`, but the
+  driver drained it into an *unbounded* channel every event, so a
+  hostile peer + non-reading application could still grow memory via
+  repeated fill→drain→refill cycles: window reopens as in_buf drains,
+  peer resends, driver re-drains — the app never has to read. DONE:
+  delivery now moves at most `DELIVER_MSG_BYTES` (64 KiB) per message
+  over a bounded queue (`DELIVER_QUEUE_MSGS` = 16); when the queue is
+  full the bytes STAY in `in_buf`, keeping the window pinned. Combined
+  bound: ~2 MiB undelivered inbound per connection regardless of either
+  side's behavior; zero data loss (bytes left behind, never dropped).
+  End-to-end test: semi-conforming scripted sender + never-reading app →
+  acks plateau within window+queue; reading resumes byte-exact transfer.
+  Mutation-checked: an effectively-unbounded queue lets acks run one
+  extra window past the bound ("1755 pkts > 1739").
+
 - [x] **P1 — µTP receive path had no window enforcement (remote OOM).**
   [verified] We advertise a fixed `RECV_WINDOW_BYTES` (1 MiB) but never
   enforced it on receive: the in-order accept path extended `in_buf`
