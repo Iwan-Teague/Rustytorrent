@@ -190,7 +190,7 @@ pub async fn run_outgoing(
     let outcome = async {
         // Establish a transport (TCP, or a TCP+µTP race when µTP is
         // enabled on a clearnet direct path), then try plain BT.
-        let transport = connect_transport(addr, utp.as_ref(), &proxies, iface).await?;
+        let transport = connect_transport(addr, utp.as_ref(), &proxies, iface, anonymous).await?;
         match plain_handshake_outgoing(transport, info_hash, peer_id).await {
             Ok((reader, writer, theirs)) => {
                 run_after_handshake(reader, writer, addr, &theirs, event_tx.clone(), cmd_rx, anonymous)
@@ -199,7 +199,7 @@ pub async fn run_outgoing(
             Err(e) if is_likely_mse_signal(&e) => {
                 tracing::debug!(target: "peer", %addr, reason = %e, "plain failed, retrying with MSE");
                 // Redial (racing again if µTP is on) and force MSE.
-                let transport = connect_transport(addr, utp.as_ref(), &proxies, iface).await?;
+                let transport = connect_transport(addr, utp.as_ref(), &proxies, iface, anonymous).await?;
                 let (reader, writer, theirs) =
                     mse_handshake_outgoing(transport, info_hash, peer_id).await?;
                 run_after_handshake(reader, writer, addr, &theirs, event_tx.clone(), cmd_rx, anonymous)
@@ -286,7 +286,7 @@ pub async fn run_outgoing_mse_only(
     tracing::debug!(target: "peer", %addr, hops = proxies.len(), bind = ?bind_iface, utp = utp.is_some(), "dialing (MSE-only)");
     let iface = bind_iface.as_deref();
     let outcome = async {
-        let transport = connect_transport(addr, utp.as_ref(), &proxies, iface).await?;
+        let transport = connect_transport(addr, utp.as_ref(), &proxies, iface, anonymous).await?;
         let (reader, writer, theirs) =
             mse_handshake_outgoing(transport, info_hash, peer_id).await?;
         run_after_handshake(
@@ -377,11 +377,12 @@ async fn connect_transport(
     utp: Option<&Arc<UtpSocket>>,
     proxies: &[ProxyConfig],
     bind_iface: Option<&str>,
+    anonymous: bool,
 ) -> Result<Transport> {
     let use_utp = proxies.is_empty() && bind_iface.is_none();
     let transport = match (use_utp, utp) {
-        (true, Some(utp)) => race_tcp_utp(addr, utp, proxies, bind_iface).await?,
-        _ => Transport::Tcp(dial_tcp(addr, proxies, bind_iface).await?),
+        (true, Some(utp)) => race_tcp_utp(addr, utp, proxies, bind_iface, anonymous).await?,
+        _ => Transport::Tcp(dial_tcp(addr, proxies, bind_iface, anonymous).await?),
     };
     transport.set_nodelay();
     Ok(transport)
@@ -396,8 +397,9 @@ async fn race_tcp_utp(
     utp: &Arc<UtpSocket>,
     proxies: &[ProxyConfig],
     bind_iface: Option<&str>,
+    anonymous: bool,
 ) -> Result<Transport> {
-    let tcp_fut = dial_tcp(addr, proxies, bind_iface);
+    let tcp_fut = dial_tcp(addr, proxies, bind_iface, anonymous);
     let utp_fut = utp.connect(addr);
     tokio::pin!(tcp_fut);
     tokio::pin!(utp_fut);
@@ -452,7 +454,16 @@ async fn dial_tcp(
     addr: SocketAddr,
     proxies: &[ProxyConfig],
     bind_iface: Option<&str>,
+    anonymous: bool,
 ) -> Result<TcpStream> {
+    if anonymous && proxies.is_empty() {
+        // Fail closed: a direct dial here would put the real IP on the
+        // wire. Anonymous mode must never fall back to clearnet, even
+        // if an upstream config gate is bypassed.
+        return Err(Error::Network(
+            "anonymous mode requires a SOCKS5 proxy; refusing direct dial".into(),
+        ));
+    }
     if !proxies.is_empty() {
         // Through a SOCKS5 chain: we connect to the first hop's IP, not
         // the peer's. With --bind-iface set, the FIRST hop's TCP dial
@@ -1108,5 +1119,28 @@ mod tests {
         let (reason, violation) = classify_outcome(&outcome);
         assert!(!violation);
         assert_eq!(reason, "closed");
+    }
+
+    #[tokio::test]
+    async fn dial_tcp_refuses_direct_socket_when_anonymous_without_proxies() {
+        // A live listener proves the target is connectable — the only
+        // reason `dial_tcp` may not reach it is the anonymous fail-closed
+        // guard, not an unreachable peer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let err = dial_tcp(addr, &[], None, true)
+            .await
+            .expect_err("anonymous dial without proxies must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refusing direct dial") && msg.contains("anonymous"),
+            "unexpected refusal message: {msg}"
+        );
+
+        // Control: without anonymous mode the same dial connects. If a
+        // regression removes the anon guard, the first assertion above
+        // fails instead of silently passing.
+        let _stream = dial_tcp(addr, &[], None, false).await.unwrap();
     }
 }
