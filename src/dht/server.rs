@@ -1,5 +1,5 @@
 //! The DHT background task: owns the UDP socket, the routing table, and a
-//! map of in-flight transactions. Receives [`DhtCommand`]s from clients
+//! map of in-flight transactions. Receives `DhtCommand`s from clients
 //! and inbound KRPC packets from the network.
 //!
 //! Outgoing queries are correlated with responses by a per-request

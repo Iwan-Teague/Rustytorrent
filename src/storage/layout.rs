@@ -104,7 +104,7 @@ impl Layout {
     /// the unwanted file just receives the spillover bytes, which is
     /// standard BitTorrent behaviour.
     /// The file paths that match `selectors` (same substring rule as
-    /// [`wanted_pieces`]). Used to show the user exactly which files a
+    /// `wanted_pieces`]). Used to show the user exactly which files a
     /// `--select` resolved to — an empty result means every selector was
     /// a typo / matched nothing, which is worth surfacing loudly before a
     /// download silently fetches zero bytes. An empty `selectors` returns
@@ -152,7 +152,7 @@ impl Layout {
     /// [`Layout::files`] (index `i` true ⇒ file `i` must exist on disk).
     ///
     /// This is intentionally derived from the **same** piece→file span
-    /// mapping the write path uses ([`slices_for_piece`]): a file is marked
+    /// mapping the write path uses (`slices_for_piece`): a file is marked
     /// wanted-for-allocation exactly when some wanted piece's byte range
     /// overlaps it. That makes it correct for boundary/straddle pieces by
     /// construction — a piece that spans a wanted file and an otherwise
