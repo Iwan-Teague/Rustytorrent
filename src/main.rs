@@ -1009,9 +1009,14 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
         let req = rustytorrent::tracker::AnnounceRequest {
             info_hash: magnet.info_hash,
             peer_id,
-            // BEP 27 hint: port=0 in anonymous mode so we don't
-            // advertise a listen socket we aren't running.
-            port: if anonymous { 0 } else { port },
+            // BEP 27 hint: port=0 whenever no inbound listener answers —
+            // anonymous mode, or a proxy chain (which disables the
+            // listener). Same rule as the engine's advertised_port.
+            port: rustytorrent::engine::advertised_port(
+                anonymous,
+                !proxies.is_empty(),
+                port,
+            ),
             uploaded: 0,
             downloaded: 0,
             // We don't know `left` yet — magnet stage. Use 0 (the

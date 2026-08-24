@@ -317,7 +317,10 @@ fn inbound_wanted(anonymous: bool, proxied: bool) -> bool {
 /// running (`inbound_wanted` == false) we must not promise one: announcing a
 /// port that will never answer is both a lie to the swarm and a stable
 /// fingerprint the tracker can correlate across announces.
-fn advertised_port(anonymous: bool, proxied: bool, listen_port: u16) -> u16 {
+///
+/// Public so the CLI paths that announce outside the engine (magnet
+/// bootstrap) advertise the exact same port under the exact same rules.
+pub fn advertised_port(anonymous: bool, proxied: bool, listen_port: u16) -> u16 {
     if anonymous || proxied {
         0
     } else {
