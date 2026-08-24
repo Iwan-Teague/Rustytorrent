@@ -33,7 +33,7 @@ every peer from your real IP.
 | Cross-session correlation by stable `peer_id` | ❌ same `-RT0100-…` prefix + 12 stable random bytes every run | ❌ peer_id still persisted | ✅ peer_id is freshly generated every run with a libtorrent-style `-LT2090-` prefix; rotated at every reannounce |
 | Client-name fingerprint in BEP 10 extension handshake | ❌ `v = "rustytorrent <ver>"` and `reqq = 0` distinguish us | ❌ same | ✅ both keys omitted under `--anonymous`; only `m` dict emitted |
 | Tracker User-Agent fingerprint | ❌ `rustytorrent/<ver>` | ❌ same | ✅ libtorrent-style UA sent per-announce |
-| Cleartext HTTP tracker announce body inside the proxy tunnel | ❌ exposed | ❌ tracker IP masked but announce body still readable to observers between us and the proxy | ✅ `http://` trackers refused at startup; only `https://` and (where applicable) `udp://` allowed |
+| Cleartext HTTP tracker announce body inside the proxy tunnel | ❌ exposed | ❌ tracker IP masked but announce body still readable to observers between us and the proxy | ✅ `http://` and `udp://` trackers refused outright (UDP can't ride SOCKS5 CONNECT; attempting it would leak the real IP); only `https://` announces proceed, through the proxy |
 | Compromised proxy | n/a | ❌ proxy operator sees everything | ❌ proxy operator sees everything |
 | Compromised proxy + correlation with tracker IP-allocation records | n/a | ❌ deanonymizable | ❌ deanonymizable (need a different transport, e.g. I2P) |
 
@@ -81,6 +81,13 @@ A bundle flag that:
    citizenship, worse anonymity.
 5. **Sets `port=0` in tracker announces.** We don't run a public listener, so
    advertising a port is both a lie and a unique-fingerprint risk.
+6. **Refuses `udp://` tracker URLs** before any DNS or socket work — UDP
+   cannot ride the SOCKS5 tunnel, so an attempt would egress the real
+   interface (kernel-socket-level proof in `tests/anon_mode_sockets.rs`).
+7. **Requires every `--socks5` hop to be an IP literal** (`127.0.0.1:9050`,
+   `[::1]:1080`, …). Resolving a proxy hostname would query the clearnet
+   system resolver BEFORE the tunnel exists — leaking your IP to the
+   resolver and correlating you with that VPN/Tor endpoint's name.
 
 Items 2, 3, and 5 are not exclusive to `--anonymous`: the same gating is
 applied whenever **any** proxy chain is configured (a proxied session must
