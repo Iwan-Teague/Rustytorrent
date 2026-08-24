@@ -164,6 +164,19 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 2. Privacy & anonymity
 
+- [x] **P1 — anonymous-mode startup DNS leak: proxy hostnames.**
+  [verified] `resolve_proxy_chain` resolved every `--socks5` hop via the
+  clearnet system resolver at startup — BEFORE any proxy exists —
+  leaking our IP to the resolver plus the hop's hostname (correlating us
+  with that VPN/Tor endpoint) whenever the user passed a name instead of
+  an IP. Previously documented as "unavoidable; use an IP literal"; now
+  FAIL-CLOSED instead: under `--anonymous` every hop must parse as an
+  IP literal (v4 or bracketed v6, multi-hop chains checked per-hop), and
+  the refusal names the offending spec with remediation. Clearnet proxied
+  use keeps hostname resolution (over-fire control tested). Tests:
+  refusal fires pre-resolver, literals accepted (v4/v6/chain),
+  clearnet path unchanged. Mutation-checked: disabling the gate fails
+  the refusal test.
 - [x] **P1 — tracker-privacy audit: UDP announce + peer_id in anon
   mode.** [verified this pass] (1) `udp://` announces are refused
   BEFORE any DNS/socket work whenever anonymous OR a proxy is
