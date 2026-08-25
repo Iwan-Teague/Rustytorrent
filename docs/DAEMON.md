@@ -26,7 +26,8 @@ risky change.
 
 ## Non-goals (for the first cut)
 
-- Persisting the torrent set across restarts (resume list). Follow-up.
+- ~~Persisting the torrent set across restarts (resume list).~~ **Done**:
+  DaemonStore persists each hosted torrent + sidecar; restore on startup.
 - Auth on the control API — it stays **loopback-only**, same as now.
 - Scheduling / queueing / per-torrent rate caps. Follow-up.
 
