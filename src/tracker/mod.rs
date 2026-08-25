@@ -195,6 +195,24 @@ pub async fn announce_with_fallback(
 /// Anonymous-aware variant of `announce_with_fallback`: forwards the
 /// `anonymous` flag down to the per-URL announce so HTTP requests
 /// adopt the libtorrent-style User-Agent when set.
+/// Same martian policy as peer ingestion, applied to announce URLs: a
+/// hostile magnet's `tr=` entry pointing at loopback or link-local (think
+/// cloud metadata `169.254.169.254`) must not be announced to — the GET
+/// carries our info-hash and peer_id. Strictness matches
+/// [`crate::engine::dht_martian_strict`]: LAN/ULA tracker hosts are also
+/// refused whenever the session is anonymous or proxied.
+fn tracker_url_dialable(url: &str, strict: bool) -> bool {
+    match reqwest::Url::parse(url) {
+        Ok(u) => match u.host_str() {
+            Some(h) => crate::util::is_dialable_url_host(h, strict),
+            None => false,
+        },
+        // Unparseable URL would fail at dial time anyway; refuse here so
+        // it never becomes a socket attempt.
+        Err(_) => false,
+    }
+}
+
 pub async fn announce_with_fallback_anon(
     tiers: &[Vec<String>],
     fallback_single: Option<&str>,
@@ -203,9 +221,22 @@ pub async fn announce_with_fallback_anon(
     anonymous: bool,
     bind_iface: Option<&str>,
 ) -> Result<(String, AnnounceResponse)> {
+    let strict = anonymous || proxy.is_some();
     let mut last_err: Option<crate::error::Error> = None;
     for tier in tiers {
         for url in tier {
+            if !tracker_url_dialable(url, strict) {
+                tracing::warn!(
+                    target: "tracker",
+                    url = %redact_url_query(url),
+                    "tracker host refused by martian screen"
+                );
+                last_err = Some(crate::error::Error::Tracker(format!(
+                    "tracker host refused by martian screen: {}",
+                    redact_url_query(url)
+                )));
+                continue;
+            }
             match announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await {
                 Ok(r) => return Ok((url.clone(), r)),
                 Err(e) => {
@@ -216,6 +247,17 @@ pub async fn announce_with_fallback_anon(
         }
     }
     if let Some(url) = fallback_single {
+        if !tracker_url_dialable(url, strict) {
+            tracing::warn!(
+                target: "tracker",
+                url = %redact_url_query(url),
+                "tracker host refused by martian screen"
+            );
+            return Err(crate::error::Error::Tracker(format!(
+                "tracker host refused by martian screen: {}",
+                redact_url_query(url)
+            )));
+        }
         match announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await {
             Ok(r) => return Ok((url.to_string(), r)),
             Err(e) => {
@@ -492,5 +534,75 @@ mod tests {
         // URL without query: nothing to scrub, message unchanged.
         let plain = "http://x.example/a";
         assert_eq!(scrub_url_from_message("boom", plain), "boom");
+    }
+
+    #[test]
+    fn tracker_url_dialable_mirrors_peer_ingestion_policy() {
+        // Loopback ALLOWED (explicit session config — same exception as
+        // is_safe_dial_target for seed_peers; local trackers are a
+        // supported workflow), including through a v4-mapped v6 wrapper.
+        assert!(tracker_url_dialable(
+            "http://127.0.0.1:6969/announce",
+            false
+        ));
+        assert!(tracker_url_dialable("udp://[::1]:6969/announce", true));
+        assert!(tracker_url_dialable(
+            "http://[::ffff:127.0.0.1]/announce",
+            false
+        ));
+        // Link-local = cloud metadata endpoint: refused in EVERY posture.
+        assert!(!tracker_url_dialable(
+            "http://169.254.169.254/latest/meta-data",
+            false
+        ));
+        assert!(!tracker_url_dialable("http://169.254.169.254/x", true));
+        // Unparseable URLs are refused before they become socket attempts.
+        assert!(!tracker_url_dialable("not a url at all", false));
+        // LAN hosts: fine on clearnet, refused under the strict posture.
+        assert!(tracker_url_dialable("udp://10.0.0.5:6969/announce", false));
+        assert!(!tracker_url_dialable("udp://10.0.0.5:6969/announce", true));
+        assert!(!tracker_url_dialable("http://[fc00::1]:6969/an", true));
+        // Public IP and domain names pass in every posture.
+        assert!(tracker_url_dialable("http://93.184.215.14/announce", true));
+        assert!(tracker_url_dialable(
+            "https://tracker.example.com/a.php?k=x",
+            true
+        ));
+    }
+
+    #[tokio::test]
+    async fn fallback_walk_refuses_martian_tracker_hosts_before_any_dial() {
+        // Link-local + ULA-under-strict are martians. If the screen did
+        // NOT run, each URL would produce a real dial/socket error instead
+        // of the fast martian refusal — the error text proves which path
+        // ran. Passkey-style query must never be echoed.
+        let tiers = vec![vec![
+            "http://169.254.169.254/a.php?passkey=SECRET7".to_string(),
+            "http://[fc00::1]:6969/announce".to_string(),
+        ]];
+        let err = announce_with_fallback_anon(&tiers, None, &req(), None, true, None)
+            .await
+            .expect_err("martian-only tiers must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("martian screen"), "wrong error: {msg}");
+        assert!(
+            !msg.contains("SECRET7"),
+            "passkey leaked through refusal: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_single_refused_when_host_is_link_local_metadata() {
+        let err = announce_with_fallback_anon(
+            &[],
+            Some("http://169.254.169.254/announce"),
+            &req(),
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("metadata endpoint must be refused");
+        assert!(format!("{err}").contains("martian screen"));
     }
 }

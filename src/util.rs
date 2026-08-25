@@ -204,6 +204,44 @@ pub fn is_dialable_peer_addr(addr: &SocketAddr, strict: bool) -> bool {
     is_dialable_ip(&addr.ip(), strict)
 }
 
+/// Judge a URL host string by the martian policy for ANNOUNCE targets.
+/// `host` comes from `Url::host_str()` — IPv6 arrives bracketed. Domain
+/// names cannot be judged without DNS resolution and pass; the dial-side
+/// netbind screen still covers whatever they resolve to. This is the SSRF
+/// gate for tracker URLs: a hostile magnet's `tr=` parameter pointing at
+/// a cloud-metadata endpoint (`169.254.169.254`) must never turn our
+/// announce (which carries info-hash + peer_id) into an intranet pivot.
+///
+/// One deliberate divergence from peer ingestion
+/// ([`is_dialable_peer_addr`]): LOOPBACK hosts are allowed here. Tracker
+/// URLs are explicit session configuration — the torrent the user chose —
+/// the same trust class as engine `seed_peers`, whose dial-side screen
+/// ([`is_safe_dial_target`]) makes the identical exception: a local
+/// tracker (opentracker on 127.0.0.1) is a supported workflow and dialing
+/// our own machine exposes nothing a remote actor doesn't already have.
+/// Link-local, multicast, unspecified and — under `strict` — LAN/ULA
+/// hosts remain refused. IPv4-mapped IPv6 wrappers are judged by the
+/// IPv4 rules so `::ffff:127.0.0.1` gets the same treatment as `127.0.0.1`.
+pub fn is_dialable_url_host(host: &str, strict: bool) -> bool {
+    let bare = host.trim_matches(|c| c == '[' || c == ']');
+    let parsed = match bare.parse::<IpAddr>() {
+        Ok(ip) => ip,
+        // Domains cannot be judged without DNS; pass.
+        Err(_) => return true,
+    };
+    let ip = match parsed {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    };
+    if ip.is_loopback() {
+        return true;
+    }
+    is_dialable_ip(&ip, strict)
+}
+
 /// Last-line-of-defense screen applied AT THE DIAL SYSCALL, independent
 /// of which source produced the address. Peer ingestion (tracker/DHT/PEX
 /// responses) applies this policy per-source with session-derived
