@@ -234,6 +234,56 @@ pub async fn announce_with_fallback_anon(
     anonymous: bool,
     bind_iface: Option<&str>,
 ) -> Result<(String, AnnounceResponse)> {
+    announce_walk(
+        tiers,
+        fallback_single,
+        req,
+        proxy,
+        anonymous,
+        bind_iface,
+        ANNOUNCE_WALK_DEADLINE,
+    )
+    .await
+}
+
+/// Overall deadline for ONE full announce walk across every tier. Each
+/// individual request already carries a 30s client timeout, but the tier
+/// list comes from the torrent (i.e. possibly from a hostile magnet) and
+/// can carry hundreds of URLs: unbounded, the engine's select! reannounce
+/// arm would await them sequentially — freezing ALL event processing
+/// (peer messages, DHT) for minutes-to-hours per cycle. Real announces
+/// finish in seconds; this cap only bites on abuse.
+const ANNOUNCE_WALK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn announce_walk(
+    tiers: &[Vec<String>],
+    fallback_single: Option<&str>,
+    req: &AnnounceRequest,
+    proxy: Option<&crate::socks5::ProxyConfig>,
+    anonymous: bool,
+    bind_iface: Option<&str>,
+    deadline: std::time::Duration,
+) -> Result<(String, AnnounceResponse)> {
+    tokio::time::timeout(deadline, async {
+        walk_tiers(tiers, fallback_single, req, proxy, anonymous, bind_iface).await
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(crate::error::Error::Tracker(format!(
+            "announce walk exceeded its {}s deadline",
+            deadline.as_secs()
+        )))
+    })
+}
+
+async fn walk_tiers(
+    tiers: &[Vec<String>],
+    fallback_single: Option<&str>,
+    req: &AnnounceRequest,
+    proxy: Option<&crate::socks5::ProxyConfig>,
+    anonymous: bool,
+    bind_iface: Option<&str>,
+) -> Result<(String, AnnounceResponse)> {
     let strict = anonymous || proxy.is_some();
     let mut last_err: Option<crate::error::Error> = None;
     for tier in tiers {
@@ -297,6 +347,86 @@ mod tests {
             event: Event::Started,
             num_want: 50,
         }
+    }
+
+    /// A hostile magnet can carry hundreds of slow tracker URLs; the
+    /// engine awaits the whole walk INLINE in its reannounce select! arm,
+    /// so unbounded it freezes all session event processing. The walk
+    /// must therefore finish within its overall deadline even when every
+    /// URL hangs (each individually would burn the 30s client timeout).
+    #[tokio::test]
+    async fn announce_walk_deadline_bounds_hanging_tier_list() {
+        // Accept and hold connections forever: never read, never reply.
+        let mk_hanging = || async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    if let Ok((s, _)) = l.accept().await {
+                        std::mem::forget(s);
+                    }
+                }
+            });
+            format!("http://{addr}/announce")
+        };
+        let u1 = mk_hanging().await;
+        let u2 = mk_hanging().await;
+
+        let start = std::time::Instant::now();
+        let res = announce_walk(
+            &[vec![u1], vec![u2]],
+            None,
+            &req(),
+            None,
+            false,
+            None,
+            std::time::Duration::from_millis(250),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        let err = match res {
+            Ok(_) => panic!("hanging tier list must not succeed"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("deadline"), "{err}");
+        // Two hanging URLs would cost ~60s of client timeouts without the
+        // cap; with it we must return promptly.
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "walk took {elapsed:?} — deadline not enforced"
+        );
+    }
+
+    /// Control: the deadline must not disturb a healthy announce — a
+    /// responsive tracker answers well within the production window via
+    /// the public entry point.
+    #[tokio::test]
+    async fn announce_walk_still_succeeds_for_responsive_tracker() {
+        let body = b"d8:completei1e10:incompletei2e8:intervali60e5:peers0:e";
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = l.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let mut buf = [0u8; 2048];
+                let _ = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.write_all(body).await;
+                let _ = s.shutdown().await;
+            }
+        });
+        let url = format!("http://{addr}/announce");
+        let (used, parsed) =
+            announce_with_fallback_anon(&[vec![url.clone()]], None, &req(), None, false, None)
+                .await
+                .expect("responsive tracker must announce fine");
+        assert_eq!(used, url);
+        assert_eq!(parsed.interval, Duration::from_secs(60));
     }
 
     #[tokio::test]
