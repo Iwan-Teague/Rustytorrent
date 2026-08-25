@@ -529,6 +529,31 @@ mod tests {
     /// class, mirrors the URL gate), link-local/multicast/unspecified are
     /// always refused, LAN/ULA only under strict — and a host resolving
     /// ONLY to refused ranges must fail closed instead of dialing.
+    /// Behavioral test of the resolver GLUE itself: `Name` construction,
+    /// the async `Resolving` future, error mapping and the `Addrs` box all
+    /// work end-to-end, and every address that comes out passes the
+    /// martian screen. (The screen's DECISIONS are pinned by
+    /// `filter_resolved_enforces_martian_policy_and_fails_closed`; the
+    /// hermetic loopback announce tests pin that the client actually
+    /// consults this resolver.)
+    #[tokio::test]
+    async fn screened_resolver_resolves_localhost_through_the_screen() {
+        use reqwest::dns::Resolve as _;
+        let name: reqwest::dns::Name = "localhost".parse().expect("localhost is a valid DNS name");
+        let resolving = ScreenedResolver { strict: true }.resolve(name);
+        let addrs = resolving
+            .await
+            .expect("localhost must resolve offline via /etc/hosts");
+        let got: Vec<SocketAddr> = addrs.collect();
+        assert!(!got.is_empty(), "resolver returned no addresses");
+        for a in &got {
+            assert!(
+                crate::util::is_dialable_resolved_ip(&a.ip(), true),
+                "resolver emitted refused address {a}"
+            );
+        }
+    }
+
     #[test]
     fn filter_resolved_enforces_martian_policy_and_fails_closed() {
         let parse = |s: &str| -> SocketAddr { s.parse().expect("test addr must parse") };
