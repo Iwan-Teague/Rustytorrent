@@ -145,7 +145,10 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
   publishes its read-task AbortHandle via a OnceCell stored in PeerSlot,
   and drop_peer aborts BOTH tasks — banned sockets close promptly
   instead of lingering half-open for READ_IDLE_TIMEOUT, and no further
-  events flow from the banned address.
+  events flow from the banned address. The inner-abort half is now ALSO
+  e2e-mutation-verified: tests/poisoned_have.rs fails with 'connection
+  stayed open 6s after poisoning' when drop_peer skips the child abort,
+  closing the loop between the plumbing and its behavioral guarantee.
 - [x] **P2 — `create` accepted zero-length inputs, writing unloadable
   torrents.** Empty files (or directories containing only empty files)
   produced zero piece hashes — metainfo our own loader rejects
