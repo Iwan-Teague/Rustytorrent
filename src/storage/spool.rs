@@ -93,6 +93,15 @@ fn slot_offset(piece_length: u64, index: u32) -> u64 {
     HEADER_LEN + (index as u64) * slot_size(piece_length)
 }
 
+/// Associated data binding a piece ciphertext to its slot index. GCM's
+/// tag covers the AAD without encrypting it, so the on-disk layout is
+/// unchanged while a blob transplanted to another slot fails to decrypt.
+fn piece_aad(index: u32) -> [u8; 10] {
+    let mut aad = *b"piece\0\0\0\0\0";
+    aad[6..].copy_from_slice(&index.to_be_bytes());
+    aad
+}
+
 /// Owns the spool file handle plus the derived key. Methods are async
 /// because the file I/O is.
 pub struct EncryptedSpool {
@@ -208,7 +217,10 @@ impl EncryptedSpool {
         buf.clear();
         buf.extend_from_slice(data);
         buf.resize(self.piece_length as usize, 0);
-        let (nonce, ct) = crypt::encrypt(&self.key, buf)?;
+        // Bind the slot identity into the tag: a ciphertext blob moved to
+        // another slot (or replayed at a different index) must fail its
+        // authenticity check instead of decrypting to foreign piece data.
+        let (nonce, ct) = crypt::encrypt_with_aad(&self.key, buf, &piece_aad(index))?;
         debug_assert_eq!(ct.len() as u64, self.piece_length + TAG_LEN as u64);
 
         let offset = slot_offset(self.piece_length, index);
@@ -243,7 +255,7 @@ impl EncryptedSpool {
         let ct_len = (self.piece_length + TAG_LEN as u64) as usize;
         let mut ct = vec![0u8; ct_len];
         self.file.read_exact(&mut ct).await?;
-        let mut plaintext = crypt::decrypt(&self.key, &nonce_buf, &ct)?;
+        let mut plaintext = crypt::decrypt_with_aad(&self.key, &nonce_buf, &ct, &piece_aad(index))?;
         // Strip the padding back down to the actual piece size before
         // slicing — pieces beyond the last are zero-padded on encrypt.
         plaintext.truncate(actual as usize);
@@ -647,5 +659,43 @@ mod tests {
             .unwrap();
         let back = spool.read_range(0, 0, data.len() as u32).await.unwrap();
         assert_eq!(back, data);
+    }
+
+    #[tokio::test]
+    async fn transplanted_slot_ciphertext_fails_its_new_slot() {
+        // Slot-transplant attack: copy slot 0's on-disk bytes (nonce+ct)
+        // into slot 1. Without index-bound AAD the blob would decrypt
+        // cleanly and silently hand back piece 0's plaintext as piece 1.
+        let dir = tempdir();
+        let path = dir.join("spool.bin");
+        let pl = 256u64;
+        let np = 3u32;
+        let d0: Vec<u8> = (0..pl as usize).map(|i| i as u8).collect();
+        let mut spool = EncryptedSpool::open_or_create(&path, "kw", pl, np, pl * u64::from(np))
+            .await
+            .unwrap();
+        spool.write_piece(0, &d0).await.unwrap();
+        drop(spool);
+
+        // Raw byte surgery on the file: clone slot0 → slot1.
+        let slot = slot_size(pl) as usize;
+        let base = HEADER_LEN as usize;
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.splice(
+            base + slot..base + 2 * slot,
+            raw[base..base + slot].to_vec(),
+        );
+        std::fs::write(&path, &raw).unwrap();
+
+        let mut spool = EncryptedSpool::open_or_create(&path, "kw", pl, np, pl * u64::from(np))
+            .await
+            .unwrap();
+        // Slot 0 untouched — must still read fine.
+        assert!(spool.read_range(0, 0, 32).await.is_ok());
+        // Slot 1 now holds a ciphertext bound to index 0 — must refuse.
+        assert!(
+            spool.read_range(1, 0, 32).await.is_err(),
+            "transplanted ciphertext must not authenticate at another index"
+        );
     }
 }

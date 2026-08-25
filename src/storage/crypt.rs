@@ -17,7 +17,7 @@
 //!   `aes-gcm` appends the 16-byte authentication tag to the
 //!   ciphertext for us.
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::RngCore;
@@ -76,11 +76,30 @@ pub fn random_nonce() -> [u8; NONCE_LEN] {
 /// nonce alongside the ciphertext (we never derive it from a counter so
 /// the spool layout doesn't carry implicit ordering state).
 pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<([u8; NONCE_LEN], Vec<u8>)> {
+    encrypt_with_aad(key, plaintext, &[])
+}
+
+/// Like `encrypt`, but binds `aad` (associated data) into the tag: the
+/// ciphertext only decrypts under the SAME key AND the same `aad`. Spool
+/// pieces pass their slot identity here so a blob copied between slots —
+/// or replayed at another index — fails its authenticity check instead of
+/// silently decrypting to the wrong piece's plaintext.
+pub fn encrypt_with_aad(
+    key: &[u8; KEY_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<([u8; NONCE_LEN], Vec<u8>)> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce_bytes = random_nonce();
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| Error::Crypto(format!("aes-gcm encrypt: {e}")))?;
     Ok((nonce_bytes, ct))
 }
@@ -90,13 +109,33 @@ pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<([u8; NONCE_LEN]
 /// tag check fails — typically meaning either the passphrase is wrong
 /// or the spool was tampered with.
 pub fn decrypt(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    decrypt_with_aad(key, nonce, ciphertext, &[])
+}
+
+/// Like `decrypt`, but verifies the tag against the same `aad` that was
+/// bound at encryption time. A mismatched `aad` fails exactly like a
+/// wrong key — there is no way to tell them apart (by design).
+pub fn decrypt_with_aad(
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Nonce::from_slice(nonce);
-    cipher.decrypt(nonce, ciphertext).map_err(|e| {
-        Error::Crypto(format!(
-            "aes-gcm decrypt (wrong passphrase or tampered data?): {e}"
-        ))
-    })
+    cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|e| {
+            Error::Crypto(format!(
+                "aes-gcm decrypt (wrong passphrase or tampered data?): {e}"
+            ))
+        })
 }
 
 /// A wiped-on-drop wrapper around the 32-byte AES key. Use this rather
@@ -163,6 +202,25 @@ mod tests {
         let (nonce, mut ct) = encrypt(&key, b"important").unwrap();
         // Flip one bit in the ciphertext — GCM tag check must catch it.
         ct[0] ^= 0x01;
+        assert!(decrypt(&key, &nonce, &ct).is_err());
+    }
+
+    #[test]
+    fn aad_binds_ciphertext_to_its_context() {
+        let salt = random_salt();
+        let key = derive_key("k", &salt).unwrap();
+        let (nonce, ct) = encrypt_with_aad(&key, b"piece data", b"slot 7").unwrap();
+
+        // Same key + same AAD: clean roundtrip.
+        assert_eq!(
+            decrypt_with_aad(&key, &nonce, &ct, b"slot 7").unwrap(),
+            b"piece data"
+        );
+
+        // Same ciphertext under a DIFFERENT context (the slot-transplant
+        // attack): the tag must fail even though the key is correct.
+        assert!(decrypt_with_aad(&key, &nonce, &ct, b"slot 8").is_err());
+        // Empty AAD must not match either (bare-decrypt of bound blob).
         assert!(decrypt(&key, &nonce, &ct).is_err());
     }
 
