@@ -41,19 +41,22 @@ fn same_host_redirect_policy() -> reqwest::redirect::Policy {
         let Some(first) = attempt.previous().first() else {
             return attempt.follow();
         };
-        let origin = || (first.host_str(), first.port_or_known_default());
-        let next = || {
-            (
-                attempt.url().host_str(),
-                attempt.url().port_or_known_default(),
-            )
-        };
-        if origin() == next() {
+        if same_redirect_origin(first, attempt.url()) {
             attempt.follow()
         } else {
             attempt.stop()
         }
     })
+}
+
+/// Pure decision core of [`same_host_redirect_policy`], extracted so the
+/// security property stays under test: a redirect may be followed only
+/// when it targets the host AND port of the ORIGINAL request.
+/// `port_or_known_default` also defeats scheme-change hops (http:80 ->
+/// https:443) and implicit-default-port games against non-standard ports.
+fn same_redirect_origin(first: &reqwest::Url, next: &reqwest::Url) -> bool {
+    (first.host_str(), first.port_or_known_default())
+        == (next.host_str(), next.port_or_known_default())
 }
 
 fn build_direct_client(local_ip: Option<IpAddr>) -> reqwest::Client {
@@ -1016,5 +1019,115 @@ mod tests {
         assert!(!out.contains("203.0.113.44"), "raw bind IP leaked: {out}");
         assert!(!out.contains("203.0.113"), "{out}");
         assert!(out.contains("ip:"), "{out}");
+    }
+
+    #[test]
+    fn redirect_hops_must_match_original_host_and_port() {
+        let u = |s: &str| reqwest::Url::parse(s).unwrap();
+        let origin = u("http://tracker.example:6969/announce?passkey=K");
+        // Exact same authority: follow.
+        assert!(same_redirect_origin(
+            &origin,
+            &u("http://tracker.example:6969/mirror")
+        ));
+        // Different host — the 302 identity-harvest case — refused.
+        assert!(!same_redirect_origin(
+            &origin,
+            &u("http://evil.example/ann")
+        ));
+        // Same host, different port refused...
+        assert!(!same_redirect_origin(
+            &origin,
+            &u("http://tracker.example:7070/an")
+        ));
+        // ...including implicit-default-port games against a non-standard
+        // listen port.
+        assert!(!same_redirect_origin(
+            &origin,
+            &u("http://tracker.example/an")
+        ));
+        // Scheme change flips the default port (80 -> 443): refused, which
+        // also blocks forced http->https redirects to attacker-chosen
+        // resolvers of the same name.
+        let plain = u("http://t.example/a");
+        assert!(!same_redirect_origin(&plain, &u("https://t.example/a")));
+        // Host look-alikes are not equal.
+        assert!(!same_redirect_origin(
+            &u("http://tracker.example/a"),
+            &u("http://tracker.example.evil.test/a")
+        ));
+    }
+
+    /// End-to-end proof that an announce to a hostile tracker which answers
+    /// 302 does NOT have its query (info-hash + any passkey) replayed to
+    /// the redirect target — not even to another port on the same loopback
+    /// host, since the policy pins host AND port.
+    #[tokio::test]
+    async fn announce_does_not_follow_cross_port_redirect() {
+        use crate::tracker::{announce_with_proxy_anon, Event};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        let req = AnnounceRequest {
+            info_hash: [0x33; 20],
+            peer_id: [0x44; 20],
+            port: 51413,
+            uploaded: 0,
+            downloaded: 0,
+            left: 1,
+            event: Event::Started,
+            num_want: 50,
+        };
+
+        // Redirector: answers every request with 302 -> decoy.
+        let redir = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redir_addr = redir.local_addr().unwrap();
+        let decoy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decoy_addr = decoy.local_addr().unwrap();
+        let decoy_hits = Arc::new(AtomicUsize::new(0));
+
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = redir.accept().await {
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{decoy_addr}/announce\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+        let hits2 = decoy_hits.clone();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = decoy.accept().await {
+                hits2.fetch_add(1, Ordering::Relaxed);
+                let body = b"d8:completei1e8:intervali60e5:peers0:e";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.write_all(body).await;
+            }
+        });
+
+        let result = announce_with_proxy_anon(
+            &format!("http://{redir_addr}/announce?passkey=LEAK7"),
+            &req,
+            None,
+            false,
+            None,
+        )
+        .await;
+        // The redirect must NOT have been followed: the announce either
+        // surfaces the bare 302 response's unparseable body as a bencode
+        // error or stops with a policy error — but never Ok from the decoy.
+        assert!(
+            result.is_err(),
+            "announce succeeded after a cross-port redirect: {:?}",
+            result
+        );
+        assert_eq!(
+            decoy_hits.load(Ordering::Relaxed),
+            0,
+            "redirect target was contacted — announce query replayed"
+        );
     }
 }
