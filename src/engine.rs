@@ -2460,6 +2460,21 @@ mod tests {
         eng.peer_choking_us.insert(addr, true);
         eng.inflight.insert(addr, 3);
         eng.peer_pex_ids.insert(addr, 21);
+        // Seed the picker too: forget_peer must clear the peer's claimed
+        // pieces, otherwise availability stays inflated by a ghost.
+        use bitvec::prelude::{BitVec, Msb0};
+        let mut bf: BitVec<u8, Msb0> = BitVec::repeat(false, eng.pm.num_pieces());
+        bf.set(0, true);
+        eng.picker.set_peer_bitfield(addr, bf.clone());
+        assert!(eng.picker.peer_has(&addr, 0), "setup: bitfield visible");
+
+        // Give the peer an outstanding request + an assignment so every
+        // teardown line below is load-bearing.
+        eng.outstanding_requests
+            .insert((0, 0), (addr, std::time::Instant::now()));
+        // release_outstanding_for releases block (0,0) in the piece manager;
+        // mark it requested first so the release path actually runs.
+        eng.pm.reserve_block(0);
 
         eng.cleanup_disconnected_peer(addr);
 
@@ -2468,7 +2483,16 @@ mod tests {
         assert!(!eng.peer_choking_us.contains_key(&addr));
         assert!(!eng.inflight.contains_key(&addr));
         assert!(!eng.peer_pex_ids.contains_key(&addr));
-        assert!(eng.picker.assignment(&addr).is_none());
+        // The previously-claimed piece must no longer be attributed to us.
+        assert!(
+            !eng.picker.peer_has(&addr, 0),
+            "picker still attributes pieces to the cleaned-up peer"
+        );
+        // Outstanding request released back for other peers.
+        assert!(
+            !eng.outstanding_requests.contains_key(&(0, 0)),
+            "outstanding entry leaked"
+        );
     }
 
     #[test]
