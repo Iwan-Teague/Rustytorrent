@@ -334,3 +334,94 @@ async fn magnet_bootstrap_gate_caps_concurrent_pipelines() {
         "gate failed to cap concurrent magnet-add pipelines"
     );
 }
+
+/// Queue-depth bound: once all gate permits are held, further
+/// /api/add_magnet POSTs must be refused with 429 INSTEAD of spawning
+/// another parked task (each parked task pins a whole MagnetLink body).
+/// Sequential POSTs with an observed-dial wait between them make the
+/// permit-holding deterministic — no sleep-and-hope races.
+#[tokio::test]
+async fn saturated_magnet_gate_returns_429_instead_of_queueing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let tracker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let taddr = tracker.local_addr().unwrap();
+    let acc = accepts.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            if let Ok((s, _)) = tracker.accept().await {
+                acc.fetch_add(1, Ordering::SeqCst);
+                held.push(s);
+            }
+        }
+    });
+
+    let mgr = SessionManager::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let daddr = listener.local_addr().unwrap();
+    let state = DaemonState {
+        mgr,
+        output: std::env::temp_dir(),
+        peer_id: [7u8; 20],
+        base_port: 0,
+        no_dht: true,
+        torrent_dir: std::env::temp_dir(),
+        magnet_gate: Arc::new(tokio::sync::Semaphore::new(
+            rustytorrent::web::MAX_CONCURRENT_MAGNET_ADDS,
+        )),
+    };
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, daemon_router(state)).await;
+    });
+    let client = reqwest::Client::new();
+
+    let mk_uri = |ih_byte: u8| {
+        format!(
+            "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F{taddr}%2Fa",
+            [ih_byte; 20]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )
+    };
+
+    // Fill the gate one POST at a time, observing the dial before the
+    // next request: each accepted connection proves its permit is held.
+    for i in 0..rustytorrent::web::MAX_CONCURRENT_MAGNET_ADDS {
+        let resp = client
+            .post(format!("http://{daddr}/api/add_magnet"))
+            .body(mk_uri(0xF0 + i as u8))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::ACCEPTED,
+            "add {i} while gate open must be admitted"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while accepts.load(Ordering::SeqCst) < i + 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pipeline {i} never dialed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    // Gate full: this add must be refused without queueing.
+    let resp = client
+        .post(format!("http://{daddr}/api/add_magnet"))
+        .body(mk_uri(0xFE))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "saturated gate must return 429, not spawn a parked pipeline"
+    );
+}

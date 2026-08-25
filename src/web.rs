@@ -592,6 +592,21 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
     }
 
     let ih_hex = crate::util::hex(&info_hash);
+    // Queue-depth bound: the semaphore inside magnet_bootstrap caps
+    // CONCURRENCY, but a spawned task parked on `acquire_owned` still
+    // holds its whole MagnetLink (up to the 64 KiB body cap) for as long
+    // as the gate stays full. Refusing at zero free permits keeps the
+    // parked-task population at ~zero; a benign retry succeeds once a
+    // pipeline finishes. The check-then-spawn race only lets through as
+    // many extras as requests are in flight at that exact instant —
+    // bounded by the client's own connection concurrency, not by flood
+    // volume.
+    if st.magnet_gate.available_permits() == 0 {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "bootstrap pipeline saturated".to_string(),
+        );
+    }
     tokio::spawn(magnet_bootstrap(st, magnet));
 
     (StatusCode::ACCEPTED, ih_hex)
