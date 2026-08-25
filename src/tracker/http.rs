@@ -491,6 +491,13 @@ pub fn parse_response(body: &[u8], full_url: &str, base_url: &str) -> Result<Ann
     })
 }
 
+/// Hard cap on peers parsed from ONE announce response. We request
+/// `numwant=50`; a hostile tracker ignoring it can pack ~700k compact
+/// entries into a 4MiB body, and collecting them all is a tens-of-MB
+/// transient allocation per announce. Real swarms never approach this —
+/// entries beyond the cap are dropped, not an error.
+const MAX_PEERS_PER_ANNOUNCE: usize = 8192;
+
 fn parse_compact_v4(b: &[u8]) -> Result<Vec<SocketAddr>> {
     if !b.len().is_multiple_of(6) {
         return Err(Error::Tracker(format!(
@@ -498,8 +505,11 @@ fn parse_compact_v4(b: &[u8]) -> Result<Vec<SocketAddr>> {
             b.len()
         )));
     }
-    let mut out = Vec::with_capacity(b.len() / 6);
+    let mut out = Vec::with_capacity((b.len() / 6).min(MAX_PEERS_PER_ANNOUNCE));
     for c in b.as_chunks::<6>().0 {
+        if out.len() >= MAX_PEERS_PER_ANNOUNCE {
+            break;
+        }
         let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
         let port = u16::from_be_bytes([c[4], c[5]]);
         out.push(SocketAddr::new(IpAddr::V4(ip), port));
@@ -514,8 +524,11 @@ fn parse_compact_v6(b: &[u8]) -> Result<Vec<SocketAddr>> {
             b.len()
         )));
     }
-    let mut out = Vec::with_capacity(b.len() / 18);
+    let mut out = Vec::with_capacity((b.len() / 18).min(MAX_PEERS_PER_ANNOUNCE));
     for c in b.as_chunks::<18>().0 {
+        if out.len() >= MAX_PEERS_PER_ANNOUNCE {
+            break;
+        }
         let mut octets = [0u8; 16];
         octets.copy_from_slice(&c[..16]);
         let ip = Ipv6Addr::from(octets);
@@ -755,6 +768,31 @@ mod tests {
     #[test]
     fn parse_compact_v4_rejects_short() {
         assert!(parse_compact_v4(&[1, 2, 3, 4]).is_err());
+    }
+
+    /// A hostile tracker ignoring `numwant` can pack hundreds of
+    /// thousands of compact entries into a capped 4MiB body; parsing must
+    /// bound the collected Vec instead of transiently allocating tens of
+    /// MB per announce. Entries past the cap are dropped silently — the
+    /// engine's ingestion caps take over from there.
+    #[test]
+    fn compact_peers_parse_is_capped() {
+        let entry4 = [203u8, 0, 113, 1, 0x1A, 0xE1];
+        let big: Vec<u8> = entry4.repeat(MAX_PEERS_PER_ANNOUNCE + 500);
+        let peers = parse_compact_v4(&big).unwrap();
+        assert_eq!(peers.len(), MAX_PEERS_PER_ANNOUNCE);
+        // First entries still parsed correctly.
+        assert_eq!(peers[0].to_string(), "203.0.113.1:6881");
+
+        let mut e6 = vec![0x20u8; 16];
+        e6.extend_from_slice(&[0x1A, 0xE1]);
+        let big6: Vec<u8> = e6.repeat(MAX_PEERS_PER_ANNOUNCE + 500);
+        let peers6 = parse_compact_v6(&big6).unwrap();
+        assert_eq!(peers6.len(), MAX_PEERS_PER_ANNOUNCE);
+        assert_eq!(
+            peers6[0].to_string(),
+            "[2020:2020:2020:2020:2020:2020:2020:2020]:6881"
+        );
     }
 
     #[test]
