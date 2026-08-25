@@ -454,6 +454,13 @@ pub fn parse_response(body: &[u8], full_url: &str, base_url: &str) -> Result<Ann
             BencodeValue::Bytes(b) => peers.extend(parse_compact_v4(b)?),
             BencodeValue::List(list) => {
                 for entry in list {
+                    // Same hostile-tracker bound as the compact branches
+                    // (MAX_PEERS_PER_ANNOUNCE): a numwant-ignoring tracker
+                    // can pack the whole 4 MiB body with dict entries;
+                    // stop collecting once the cap is reached.
+                    if peers.len() >= MAX_PEERS_PER_ANNOUNCE {
+                        break;
+                    }
                     let dd = entry
                         .as_dict()
                         .map_err(|e| Error::Tracker(format!("peer entry: {e}")))?;
@@ -936,6 +943,30 @@ mod tests {
         .unwrap();
         assert_eq!(r.peers.len(), 1);
         assert_eq!(r.peers[0].to_string(), "127.0.0.1:6881");
+    }
+
+    /// Dict-form peers get the same hostile-tracker bound as the compact
+    /// branches: a numwant-ignoring tracker must not make us collect the
+    /// whole 4 MiB body as addresses.
+    #[test]
+    fn dict_list_peers_are_capped() {
+        let entry = b"d2:ip7:1.2.3.44:porti1000ee";
+        let count = MAX_PEERS_PER_ANNOUNCE + 500;
+        let mut body = Vec::new();
+        body.extend_from_slice(b"d8:intervali600e5:peersl");
+        for _ in 0..count {
+            body.extend_from_slice(entry);
+        }
+        body.extend_from_slice(b"ee");
+
+        let r = parse_response(
+            &body,
+            "http://t.example/announce",
+            "http://t.example/announce",
+        )
+        .unwrap();
+        assert_eq!(r.peers.len(), MAX_PEERS_PER_ANNOUNCE);
+        assert_eq!(r.peers[0].to_string(), "1.2.3.4:1000");
     }
 
     /// Spin a tiny "HTTP server" that reads the request, captures the
