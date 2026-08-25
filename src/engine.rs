@@ -386,6 +386,21 @@ fn filter_dialable_peers(
 }
 
 impl TorrentEngine {
+    /// THE single ingestion-screening path: every untrusted peer source
+    /// (initial announce, reannounce, DHT values, PEX) funnels through
+    /// here, deriving strictness from the session config in one place. A
+    /// future call site that forgets this method has no strictness of its
+    /// own to get wrong, and the handler-level PEX posture test exercises
+    /// this exact code path end-to-end.
+    fn screen_ingested_peers(
+        &self,
+        addrs: &[std::net::SocketAddr],
+    ) -> (Vec<std::net::SocketAddr>, usize) {
+        filter_dialable_peers(addrs, self.cfg.martians_strict())
+    }
+}
+
+impl TorrentEngine {
     pub fn new(torrent: TorrentFile, peer_id: PeerId, cfg: EngineConfig) -> Self {
         let pm = PieceManager::new(
             torrent.info.piece_length,
@@ -974,8 +989,7 @@ impl TorrentEngine {
                         peers = resp.peers.len(),
                         "first announce"
                     );
-                    let strict = self.cfg.martians_strict();
-                    let (dialable, dropped) = filter_dialable_peers(&resp.peers, strict);
+                    let (dialable, dropped) = self.screen_ingested_peers(&resp.peers);
                     if dropped > 0 {
                         tracing::debug!(
                             target: "engine",
@@ -1210,9 +1224,8 @@ impl TorrentEngine {
                                 self.cfg.anonymous,
                             ));
                             tracker_timer.tick().await;
-                            let strict = self.cfg.martians_strict();
                             let (dialable, dropped) =
-                                filter_dialable_peers(&resp.peers, strict);
+                                self.screen_ingested_peers(&resp.peers);
                             if dropped > 0 {
                                 tracing::debug!(
                                     target: "engine",
@@ -1376,9 +1389,8 @@ impl TorrentEngine {
                             // martian half of the filter applies even though
                             // strict mode never reaches here (DHT is off
                             // under anonymous/proxied sessions).
-                            let strict = self.cfg.martians_strict();
                             let (dialable, dropped) =
-                                filter_dialable_peers(&new_peers, strict);
+                                self.screen_ingested_peers(&new_peers);
                             if dropped > 0 {
                                 tracing::debug!(
                                     target: "engine",
@@ -1777,8 +1789,7 @@ impl TorrentEngine {
                     // they get the same martian screening as tracker and DHT
                     // ingestion: never dial loopback/link-local/metadata
                     // targets a hostile peer tries to aim us at.
-                    let strict = self.cfg.martians_strict();
-                    let (dialable, dropped) = filter_dialable_peers(&pex_peers, strict);
+                    let (dialable, dropped) = self.screen_ingested_peers(&pex_peers);
                     if dropped > 0 {
                         tracing::debug!(
                             target: "engine",
