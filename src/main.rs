@@ -978,6 +978,62 @@ fn bootstrap_allows_tracker(url: &str, anonymous: bool) -> bool {
     !(anonymous && url.starts_with("http://"))
 }
 
+/// Outcome of one magnet-bootstrap tracker announce: `Screened` means the
+/// URL was refused by the martian screen BEFORE any dial (hostile magnet
+/// `tr=` pointing at link-local/metadata ranges), `Dialed` means the
+/// screen passed and a connection was attempted (success or transport
+/// failure). The distinction exists so tests can pin that the SCREENED
+/// wrapper — not the low-level announce — is wired here.
+#[derive(Debug, PartialEq)]
+enum TrackerOutcome {
+    Screened,
+    Dialed,
+}
+
+/// One magnet-bootstrap tracker announce through the SCREENED wrapper.
+/// The bootstrap loop must never call the low-level
+/// `announce_with_proxy_anon` directly: that would bypass the URL martian
+/// screen (`announce_screened`), letting a hostile magnet collect an
+/// info-hash + peer-id GET from us at 169.254.169.254 or any other
+/// refused range. Peers handed back are appended to `pool`.
+async fn announce_magnet_tracker(
+    url: &str,
+    req: &tracker::AnnounceRequest,
+    proxy: Option<&rustytorrent::socks5::ProxyConfig>,
+    anonymous: bool,
+    bind_iface: Option<&str>,
+    pool: &mut Vec<std::net::SocketAddr>,
+) -> TrackerOutcome {
+    match tracker::announce_screened(url, req, proxy, anonymous, bind_iface).await {
+        Ok(resp) => {
+            tracing::info!(
+                target: "magnet",
+                tracker = %rustytorrent::tracker::redact_url_query(url),
+                peers = resp.peers.len(),
+                "tracker bootstrap"
+            );
+            // Same SSRF rule as the engine: never dial martians a
+            // tracker hands us, and in anonymous/proxied mode do
+            // not let it aim our proxy at its own LAN either.
+            let strict = rustytorrent::engine::dht_martian_strict(anonymous, proxy.is_some());
+            pool.extend(
+                resp.peers
+                    .into_iter()
+                    .filter(|a| rustytorrent::util::is_dialable_peer_addr(a, strict)),
+            );
+            TrackerOutcome::Dialed
+        }
+        Err(e) => {
+            tracing::warn!(target: "magnet", tracker = %rustytorrent::tracker::redact_url_query(url), error = %e, "tracker failed");
+            if e.to_string().contains("martian screen") {
+                TrackerOutcome::Screened
+            } else {
+                TrackerOutcome::Dialed
+            }
+        }
+    }
+}
+
 /// only — typically the Tor / VPN endpoint that actually enforces
 /// auth or where circuit isolation is meaningful. Earlier hops are
 /// usually just transit (e.g. a corporate VPN) that doesn't need auth.
@@ -1164,37 +1220,15 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
                 );
                 continue;
             }
-            match rustytorrent::tracker::announce_with_proxy_anon(
+            let _ = announce_magnet_tracker(
                 url,
                 &req,
                 proxies.first(),
                 anonymous,
                 bind_iface.as_deref(),
+                &mut pool,
             )
-            .await
-            {
-                Ok(resp) => {
-                    tracing::info!(
-                        target: "magnet",
-                        tracker = %rustytorrent::tracker::redact_url_query(url),
-                        peers = resp.peers.len(),
-                        "tracker bootstrap"
-                    );
-                    // Same SSRF rule as the engine: never dial martians a
-                    // tracker hands us, and in anonymous/proxied mode do
-                    // not let it aim our proxy at its own LAN either.
-                    let strict =
-                        rustytorrent::engine::dht_martian_strict(anonymous, !proxies.is_empty());
-                    pool.extend(
-                        resp.peers
-                            .into_iter()
-                            .filter(|a| rustytorrent::util::is_dialable_peer_addr(a, strict)),
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(target: "magnet", tracker = %rustytorrent::tracker::redact_url_query(url), error = %e, "tracker failed");
-                }
-            }
+            .await;
         }
     }
 
@@ -1353,8 +1387,55 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
 mod tests {
     use super::{
         bootstrap_allows_tracker, effective_socks5_pass, effective_socks5_user, parse_rate_kib,
-        resolve_proxy_chain, validate_select_patterns,
+        resolve_proxy_chain, validate_select_patterns, TrackerOutcome,
     };
+
+    /// The magnet bootstrap must announce through the SCREENED wrapper:
+    /// a hostile magnet's `tr=http://169.254.169.254/...` must be refused
+    /// BEFORE any dial (no info-hash/peer-id GET to metadata ranges) and
+    /// the refusal must not echo the attacker-chosen path into our logs.
+    /// Swapping the helper back to the low-level announce flips both
+    /// outcomes to `Dialed`, failing this test.
+    #[tokio::test]
+    async fn magnet_bootstrap_tracker_is_martian_screened() {
+        let req = rustytorrent::tracker::AnnounceRequest {
+            info_hash: [0x42; 20],
+            peer_id: [0x24; 20],
+            port: 51413,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            event: rustytorrent::tracker::Event::Started,
+            num_want: 50,
+        };
+        let mut pool = Vec::new();
+
+        // Link-local metadata endpoint: refused before any socket work.
+        let outcome = super::announce_magnet_tracker(
+            "http://169.254.169.254/latest/meta-data/",
+            &req,
+            None,
+            false,
+            None,
+            &mut pool,
+        )
+        .await;
+        assert_eq!(outcome, TrackerOutcome::Screened);
+        assert!(pool.is_empty());
+
+        // Loopback control: screen passes (explicit-config trust class),
+        // dial is attempted and fails fast (port 9 discard, closed).
+        let outcome = super::announce_magnet_tracker(
+            "http://127.0.0.1:9/announce",
+            &req,
+            None,
+            false,
+            None,
+            &mut pool,
+        )
+        .await;
+        assert_eq!(outcome, TrackerOutcome::Dialed);
+    }
 
     #[test]
     fn validate_select_patterns_rejects_blank_entries() {
