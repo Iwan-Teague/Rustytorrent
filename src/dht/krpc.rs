@@ -370,9 +370,11 @@ impl Message {
                     }
                     other => {
                         return Err(Error::Network(format!(
+                            // `q` is remote-controlled; controls stripped so
+                            // it can't forge log lines via error=%e.
                             "krpc: unknown query {}",
-                            String::from_utf8_lossy(other)
-                        )))
+                            crate::util::sanitize_remote_text(&String::from_utf8_lossy(other))
+                        )));
                     }
                 };
                 Ok(Message::Query {
@@ -434,7 +436,7 @@ impl Message {
             }
             other => Err(Error::Network(format!(
                 "krpc: unknown y {}",
-                String::from_utf8_lossy(other)
+                crate::util::sanitize_remote_text(&String::from_utf8_lossy(other))
             ))),
         }
     }
@@ -447,12 +449,17 @@ fn node_id_from(dict: &BTreeMap<Vec<u8>, BencodeValue>, key: &[u8]) -> Result<No
 fn bytes20_from(dict: &BTreeMap<Vec<u8>, BencodeValue>, key: &[u8]) -> Result<[u8; 20]> {
     let bytes = dict
         .get(&key.to_vec())
-        .ok_or_else(|| Error::Network(format!("krpc: missing {}", String::from_utf8_lossy(key))))?
+        .ok_or_else(|| {
+            Error::Network(format!(
+                "krpc: missing {}",
+                crate::util::sanitize_remote_text(&String::from_utf8_lossy(key))
+            ))
+        })?
         .as_bytes()?;
     if bytes.len() != 20 {
         return Err(Error::Network(format!(
             "krpc: {} must be 20 bytes, got {}",
-            String::from_utf8_lossy(key),
+            crate::util::sanitize_remote_text(&String::from_utf8_lossy(key)),
             bytes.len()
         )));
     }
@@ -615,5 +622,26 @@ mod tests {
             }
             other => panic!("expected ping query, got {other:?}"),
         }
+    }
+
+    /// A hostile peer controls the `q`/`y` values; decode errors are logged
+    /// via `error = %e`, so CR/LF in those values must never survive into
+    /// the rendered message (log-line forgery).
+    #[test]
+    fn unknown_query_and_y_errors_strip_control_chars() {
+        // q = "bad\nFAKE" (8 bytes); bencode dicts are byte-sorted:
+        // a < q < t < y.
+        let pkt = b"d1:ad2:id20:abcdefghij0123456789e1:q8:bad\nFAKE1:t2:aa1:y1:qe";
+        let err = Message::decode(pkt).expect_err("unknown query must error");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown query"), "{msg}");
+        assert!(!msg.contains('\n') && !msg.contains('\r'), "{msg}");
+
+        // y = "q\nEVIL" (6 bytes) → unknown-y branch.
+        let pkt = b"d1:t2:aa1:y6:q\nEVILe";
+        let err = Message::decode(pkt).expect_err("unknown y must error");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown y"), "{msg}");
+        assert!(!msg.contains('\n') && !msg.contains('\r'), "{msg}");
     }
 }

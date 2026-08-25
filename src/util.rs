@@ -93,6 +93,14 @@ pub fn redact_info_hash(ih: &[u8; 20]) -> String {
 pub fn redact_node_id(id: &[u8; 20]) -> String {
     log_token("nid", id, 5)
 }
+/// Strip control characters (CR/LF included) from remote-supplied free
+/// text before embedding it in an error string: errors reach logs via
+/// `error = %e`, and unfiltered controls let a remote party forge log
+/// lines. Same treatment as tracker failure reasons.
+#[must_use]
+pub fn sanitize_remote_text(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
 
 /// Create `path` (and parents) as a private directory: mode 0700 on Unix,
 /// so other local users cannot list our state (peer id, hosted torrents,

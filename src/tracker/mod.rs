@@ -25,7 +25,7 @@ pub fn redact_url_query(url: &str) -> String {
 /// remote party; control characters in its reply would let it forge log
 /// lines exactly like a crafted announce URL could.
 pub fn sanitize_tracker_text(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).collect()
+    crate::util::sanitize_remote_text(text)
 }
 
 /// Remove any occurrence of `url` (e.g. one embedded by reqwest's error

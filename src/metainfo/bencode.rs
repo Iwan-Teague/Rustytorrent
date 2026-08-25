@@ -72,9 +72,15 @@ impl BencodeValue {
     }
 
     pub fn dict_get(&self, key: &[u8]) -> Result<&BencodeValue> {
-        self.as_dict()?
-            .get(key)
-            .ok_or_else(|| Error::Bencode(format!("missing key: {}", String::from_utf8_lossy(key))))
+        self.as_dict()?.get(key).ok_or_else(|| {
+            Error::Bencode(format!(
+                // Dict keys can come from remote peers (BEP 10 ext
+                // handshakes); strip controls so the echoed key can't
+                // forge log lines.
+                "missing key: {}",
+                crate::util::sanitize_remote_text(&String::from_utf8_lossy(key))
+            ))
+        })
     }
 
     /// Serialize this value back to bencode bytes. BEP 3 requires dict
@@ -437,5 +443,18 @@ mod tests {
         let bytes = original.to_bytes();
         let parsed = BencodeValue::parse_all(&bytes).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn missing_key_error_strips_control_chars() {
+        // Keys can come from remote dicts (BEP 10); the echoed key in the
+        // error must not be able to forge log lines.
+        let d = parse_all(b"d1:a1:be");
+        let err = d
+            .dict_get(b"bad\nFAKE\rLOG")
+            .expect_err("missing key must error");
+        let msg = err.to_string();
+        assert!(msg.contains("missing key"), "{msg}");
+        assert!(!msg.contains('\n') && !msg.contains('\r'), "{msg}");
     }
 }
