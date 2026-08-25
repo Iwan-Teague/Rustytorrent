@@ -7,7 +7,11 @@ use rustytorrent::metainfo::TorrentFile;
 use rustytorrent::tracker;
 
 #[derive(Parser)]
-#[command(name = "rustytorrent", about = "A BitTorrent client built in Rust")]
+#[command(
+    name = "rustytorrent",
+    about = "A BitTorrent client built in Rust",
+    version
+)]
 struct Cli {
     /// Increase log verbosity: -v = debug, -vv = trace. Overridden by
     /// the RUST_LOG environment variable if set.
