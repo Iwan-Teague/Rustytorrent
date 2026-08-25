@@ -128,6 +128,9 @@ well-defended (length-checked, bounded allocations, kernel-filtered
 UDP source, constant-time hash compares).
 
 - ✅ **bencode recursion cap** — `parse_value` recursed with no depth
+  (re-verified 2026-08: the existing boundary tests are mutation-
+  load-bearing — removing the cap fails both list- and dict-nesting
+  rejects)
   bound; a deeply nested payload (`llll…`/`dddd…`) overflowed the
   stack and crashed the process. Untrusted bencode arrives from DHT
   nodes, trackers, and peer extension/ut_metadata messages, so the
