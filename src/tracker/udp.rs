@@ -21,6 +21,28 @@ const BASE_TIMEOUT_SECS: u64 = 15;
 /// older than 45 s as stale and re-do the connect step before announcing.
 const CONNECTION_ID_MAX_AGE: Duration = Duration::from_secs(45);
 
+/// Resolve the udp:// announce target with the SAME martian screen as
+/// the HTTP resolver: a domain host is unjudgeable at the URL layer, so
+/// whatever it resolves to must be vetted before we send a packet that
+/// carries our info-hash and peer_id. Strictness is fixed at clearnet
+/// policy because this path is UNREACHABLE otherwise — tracker/mod.rs
+/// refuses udp:// outright when anonymous or a proxy is configured (the
+/// last-line-of-defense gate above any DNS work).
+fn pick_udp_addr(mut addrs: Vec<SocketAddr>) -> Result<SocketAddr> {
+    // Sort so behavior doesn't depend on resolver answer order.
+    addrs.sort();
+    let kept = crate::util::filter_dialable_addrs(addrs, false)?;
+    Ok(kept[0])
+}
+
+async fn resolve_udp_target(host_port: &str) -> Result<SocketAddr> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(host_port)
+        .await
+        .map_err(|e| Error::Tracker(format!("dns: {e}")))?
+        .collect();
+    pick_udp_addr(addrs)
+}
+
 pub async fn announce(
     url: &str,
     req: &AnnounceRequest,
@@ -36,11 +58,7 @@ pub async fn announce(
     })?;
     // strip optional /path or /announce
     let host_port = host_port.split('/').next().unwrap_or(host_port);
-    let addr: SocketAddr = tokio::net::lookup_host(host_port)
-        .await
-        .map_err(|e| Error::Tracker(format!("dns: {e}")))?
-        .next()
-        .ok_or_else(|| Error::Tracker("dns: no addrs".into()))?;
+    let addr = resolve_udp_target(host_port).await?;
     tracing::debug!(target: "tracker::udp", addr = %crate::util::redact_peer(&addr), "announcing");
 
     let bind_addr: SocketAddr = if addr.is_ipv4() {
@@ -287,6 +305,32 @@ mod tests {
         let msg = err.to_string();
         assert!(!msg.contains("SECRET"), "query leaked: {msg}");
         assert!(msg.contains("https://t.example/a.php"), "host lost: {msg}");
+    }
+
+    /// The UDP announce target must pass the same martian screen as the
+    /// HTTP resolver: a rebinding or hostile DNS answer pointing the
+    /// announce (which carries info-hash + peer_id) at a metadata
+    /// endpoint / LAN range must be refused, and an all-martian answer
+    /// must fail closed rather than dial "the first thing".
+    #[test]
+    fn pick_udp_addr_screens_martians_and_fails_closed() {
+        let parse = |s: &str| -> SocketAddr { s.parse().expect("test addr must parse") };
+        let tracker = parse("93.184.215.14:6969");
+        let loopback = parse("127.0.0.1:6969");
+        let linklocal = parse("169.254.169.254:6969");
+        let lan = parse("10.0.0.5:6969");
+
+        // Link-local metadata endpoint refused even on clearnet.
+        let err = pick_udp_addr(vec![linklocal]).unwrap_err();
+        assert!(err.to_string().contains("refused addresses"), "{err}");
+        // LAN survives ONLY because this path is clearnet-only (udp:// is
+        // refused outright under anonymous/proxy upstream): strict=false
+        // matches the HTTP resolver's clearnet posture exactly.
+        assert_eq!(pick_udp_addr(vec![lan]).unwrap(), lan);
+        // Martians dropped; loopback (explicit-config trust class) kept.
+        assert_eq!(pick_udp_addr(vec![linklocal, loopback]).unwrap(), loopback);
+        // Public wins over loopback under deterministic ordering.
+        assert_eq!(pick_udp_addr(vec![tracker, loopback]).unwrap(), tracker);
     }
 
     #[test]

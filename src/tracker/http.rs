@@ -122,20 +122,10 @@ impl reqwest::dns::Resolve for ScreenedResolver {
 }
 
 /// Pure core of [`ScreenedResolver`] so the policy is unit-testable
-/// without the async machinery. Keeps only addresses the martian policy
-/// accepts; an empty survivor set fails CLOSED — a host resolving
-/// exclusively to refused ranges must not fall back to "dial something".
+/// without the async machinery — delegates to the shared
+/// `util::filter_dialable_addrs` screen used by every resolution site.
 fn filter_resolved(addrs: Vec<SocketAddr>, strict: bool) -> Result<Vec<SocketAddr>> {
-    let kept: Vec<SocketAddr> = addrs
-        .into_iter()
-        .filter(|a| crate::util::is_dialable_resolved_ip(&a.ip(), strict))
-        .collect();
-    if kept.is_empty() {
-        return Err(Error::Tracker(
-            "announce host resolved only to refused addresses".into(),
-        ));
-    }
-    Ok(kept)
+    crate::util::filter_dialable_addrs(addrs, strict)
 }
 
 fn build_proxied_client(proxy_url: &str, local_ip: Option<IpAddr>) -> reqwest::Client {

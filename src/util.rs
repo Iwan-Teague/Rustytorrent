@@ -257,6 +257,27 @@ pub(crate) fn is_dialable_resolved_ip(ip: &IpAddr, strict: bool) -> bool {
     is_dialable_ip(ip, strict)
 }
 
+/// Shared core of every DNS-resolution screen (HTTP tracker resolver,
+/// UDP tracker target, DHT bootstrap): keep only addresses the martian
+/// policy accepts and FAIL CLOSED when nothing survives — a host that
+/// resolves exclusively to refused ranges must not fall back to "dial
+/// something anyway".
+pub(crate) fn filter_dialable_addrs(
+    addrs: Vec<SocketAddr>,
+    strict: bool,
+) -> crate::error::Result<Vec<SocketAddr>> {
+    let kept: Vec<SocketAddr> = addrs
+        .into_iter()
+        .filter(|a| is_dialable_resolved_ip(&a.ip(), strict))
+        .collect();
+    if kept.is_empty() {
+        return Err(crate::error::Error::Tracker(
+            "announce host resolved only to refused addresses".into(),
+        ));
+    }
+    Ok(kept)
+}
+
 /// Last-line-of-defense screen applied AT THE DIAL SYSCALL, independent
 /// of which source produced the address. Peer ingestion (tracker/DHT/PEX
 /// responses) applies this policy per-source with session-derived

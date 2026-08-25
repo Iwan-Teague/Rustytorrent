@@ -347,16 +347,28 @@ async fn run(
     }
 }
 
+/// Screen one host's resolved addresses down to the first IPv4 the
+/// martian policy accepts (loopback allowed: a local DHT bootstrap node
+/// is the same explicit-config trust class as a local tracker). Pure so
+/// the policy is unit-testable without DNS.
+fn first_dialable_v4(addrs: Vec<SocketAddr>) -> Option<SocketAddr> {
+    addrs
+        .into_iter()
+        .find(|a| a.is_ipv4() && crate::util::is_dialable_resolved_ip(&a.ip(), false))
+}
+
 async fn resolve_bootstrap(hosts: &[String]) -> Vec<SocketAddr> {
     let mut out = Vec::new();
     for h in hosts {
         match tokio::net::lookup_host(h.as_str()).await {
             Ok(iter) => {
-                for addr in iter {
-                    if addr.is_ipv4() {
-                        out.push(addr);
-                        break;
-                    }
+                // A bootstrap hostname is unjudgeable at config time; a
+                // poisoned/rebinding answer must not aim DHT traffic
+                // (which carries our info-hash interests) at martians.
+                if let Some(addr) = first_dialable_v4(iter.collect()) {
+                    out.push(addr);
+                } else {
+                    tracing::debug!(target: "dht", host = %h, "bootstrap host resolved no dialable addresses");
                 }
             }
             Err(e) => {
@@ -834,6 +846,37 @@ async fn announce_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bootstrap hostnames are unjudgeable at config time, so every
+    /// resolved address is screened: only the first IPv4 the martian
+    /// policy accepts (loopback allowed — local bootstrap node = explicit
+    /// config) survives; link-local/LAN answers are refused so a poisoned
+    /// or rebinding DNS answer can't aim info-hash-bearing DHT traffic at
+    /// intranet ranges.
+    #[test]
+    fn first_dialable_v4_refuses_martian_bootstrap_answers() {
+        let parse = |s: &str| -> SocketAddr { s.parse().expect("test addr must parse") };
+        let v4_public = parse("93.184.215.14:6881");
+        let v6_public = parse("[2001:db8::1]:6881");
+        let loopback = parse("127.0.0.1:6881");
+        let linklocal = parse("169.254.169.254:6881");
+        let lan = parse("10.0.0.5:6881");
+
+        // IPv4 preference preserved, link-local refused.
+        assert_eq!(
+            first_dialable_v4(vec![v6_public, linklocal, v4_public]),
+            Some(v4_public)
+        );
+        // Loopback stays allowed (explicit-config trust class).
+        assert_eq!(first_dialable_v4(vec![linklocal, loopback]), Some(loopback));
+        // LAN survives: DHT bootstrap only runs clearnet (anonymous mode
+        // disables DHT upstream), so strict=false matches the tracker
+        // resolver's clearnet posture exactly.
+        assert_eq!(first_dialable_v4(vec![lan]), Some(lan));
+        // All-martian / v6-only answers yield nothing.
+        assert_eq!(first_dialable_v4(vec![linklocal]), None);
+        assert_eq!(first_dialable_v4(vec![v6_public]), None);
+    }
 
     /// Shared in-memory writer so a fmt subscriber can capture log lines
     /// (same pattern as tracker::http's capture test). std::sync::Mutex
