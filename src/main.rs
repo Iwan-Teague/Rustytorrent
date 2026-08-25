@@ -1039,6 +1039,9 @@ async fn resolve_proxy_chain(
 }
 
 async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Result<()> {
+    // Fail fast on invalid --select patterns before any I/O.
+    validate_select_patterns(&shared.select)?;
+
     // Expand the flattened CLI args at the call site (the engine
     // constructor lives in another module). Magnet has no --no-tracker:
     // its tracker set comes from the URI, so EngineConfig.no_tracker is
