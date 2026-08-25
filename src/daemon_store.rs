@@ -31,6 +31,17 @@ struct Sidecar {
     enable_dht: bool,
 }
 
+/// Log-safe label for a store entry. A 40-hex filename stem IS an
+/// info-hash, so rendering the path into a warn log would leak which
+/// torrents are hosted — tokenize it instead; anything else gets a fixed
+/// opaque label rather than echoing arbitrary filesystem text.
+fn entry_label(stem: &str) -> String {
+    match crate::util::info_hash_from_hex(stem) {
+        Some(ih) => crate::util::redact_info_hash(&ih),
+        None => "non-info-hash-named entry".to_string(),
+    }
+}
+
 /// Handle to the daemon-state directory.
 pub struct DaemonStore {
     dir: PathBuf,
@@ -132,7 +143,7 @@ impl DaemonStore {
             let torrent_bytes = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!(target: "daemon", file = %path.display(), error = %e, "skip restore: read failed");
+                    tracing::warn!(target: "daemon", entry = %entry_label(&stem), error = %e, "skip restore: read failed");
                     continue;
                 }
             };
@@ -143,7 +154,7 @@ impl DaemonStore {
             {
                 Some(s) => s,
                 None => {
-                    tracing::warn!(target: "daemon", file = %sidecar_path.display(), "skip restore: missing/invalid sidecar");
+                    tracing::warn!(target: "daemon", entry = %entry_label(&stem), "skip restore: missing/invalid sidecar");
                     continue;
                 }
             };
@@ -212,6 +223,23 @@ mod tests {
         std::fs::write(dir.join("deadbeef.torrent"), b"x").unwrap();
         assert!(store.load_all().is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn entry_label_never_renders_info_hash_stem() {
+        // A 40-hex stem is an info-hash: the log label must be its token,
+        // never the hex itself (warn logs previously rendered path.display()).
+        let ih_hex = "3f4af8b1c2d3e4f5061728394a5b6c7d8e9f0a1b";
+        let label = entry_label(ih_hex);
+        assert!(!label.contains("3f4af8"), "hash prefix leaked: {label}");
+        assert!(label.starts_with("ih:"), "unexpected shape: {label}");
+    }
+
+    #[test]
+    fn entry_label_opaque_for_non_hash_names() {
+        // Short/arbitrary stems get a fixed label — no filesystem text echo.
+        assert_eq!(entry_label("deadbeef"), "non-info-hash-named entry");
+        assert_eq!(entry_label("../escape"), "non-info-hash-named entry");
     }
 
     #[test]
