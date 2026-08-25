@@ -425,3 +425,87 @@ async fn saturated_magnet_gate_returns_429_instead_of_queueing() {
         "saturated gate must return 429, not spawn a parked pipeline"
     );
 }
+
+/// Pins the c8bb4ed-era magnet-add LOG sites (web.rs `magnet_bootstrap`):
+/// the "no peers" warn and the per-tracker failure debug line must render
+/// the hosted info-hash as a keyed token and hostile tracker URLs as
+/// host-only labels — reverting either to raw hex / redact_url_query
+/// (which keeps attacker-controlled paths) must fail here. Drives the
+/// real async pipeline under a capturing subscriber: multi_thread flavor
+/// + block_in_place so Handle::block_on is legal inside the sync
+/// with_default closure, making capture deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn magnet_bootstrap_logs_never_echo_info_hash_or_hostile_paths() {
+    use std::sync::{Arc, Mutex};
+
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let ih = [0x5Au8; 20];
+    let raw_hex = rustytorrent::util::hex(&ih);
+    // Tracker 1: martian link-local WITH a hostile path (label must be
+    // host-only). Tracker 2: closed loopback port (fast dial failure).
+    // Both fail fast, pool stays empty, the no-peers warn fires.
+    let magnet = rustytorrent::magnet::MagnetLink::parse(&format!(
+        "magnet:?xt=urn:btih:{raw_hex}&tr=http%3A%2F%2F169.254.169.254%2Flatest%2Fmeta-data&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce"
+    ))
+    .expect("magnet fixture must parse");
+
+    let state = DaemonState {
+        mgr: SessionManager::new(),
+        output: std::env::temp_dir(),
+        peer_id: [7u8; 20],
+        base_port: 0,
+        no_dht: true,
+        torrent_dir: std::env::temp_dir(),
+        magnet_gate: Arc::new(tokio::sync::Semaphore::new(
+            rustytorrent::web::MAX_CONCURRENT_MAGNET_ADDS,
+        )),
+    };
+
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer({
+            let b = buf.clone();
+            move || SharedBuf(b.clone())
+        })
+        .finish();
+
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::block_in_place(|| {
+        tracing::subscriber::with_default(subscriber, || {
+            handle.block_on(rustytorrent::web::magnet_bootstrap(state, magnet));
+        })
+    });
+
+    let logged = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    assert!(
+        logged.contains("no peers from trackers"),
+        "expected the give-up warn to fire; captured: {logged}"
+    );
+    assert!(
+        logged.contains("magnet tracker bootstrap failed"),
+        "expected per-tracker failure lines; captured: {logged}"
+    );
+    assert!(
+        logged.contains("ih:"),
+        "info-hash token missing from magnet-add logs; captured: {logged}"
+    );
+    assert!(
+        !logged.contains(&raw_hex),
+        "RAW info-hash leaked into magnet-add logs; captured: {logged}"
+    );
+    assert!(
+        !logged.contains("meta-data"),
+        "hostile tracker PATH echoed instead of host-only label; captured: {logged}"
+    );
+}
