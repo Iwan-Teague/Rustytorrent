@@ -31,6 +31,9 @@ fn version_flag_reports_version() {
         text.contains("rustytorrent"),
         "--version should mention rustytorrent, got: {text}"
     );
+    // The version must match Cargo.toml's package version.
+    let expected = format!("rustytorrent {}", env!("CARGO_PKG_VERSION"));
+    assert_eq!(text.trim(), expected.trim());
 }
 
 #[test]
