@@ -2006,12 +2006,24 @@ impl TorrentEngine {
         // map doesn't grow unbounded over a long-lived seeding session.
         self.peer_pex_ids.remove(&addr);
         self.peer_pex_snapshot.remove(&addr);
+        // Endgame re-request bookkeeping must not outlive its owner: a
+        // dead address left in a Vec both leaks memory across churn AND
+        // poisons the contains() gate in maybe_request_blocks — a future
+        // connection from that same addr would be skipped when
+        // re-requesting those blocks, starving the endgame tail.
+        for list in self.endgame_requests.values_mut() {
+            list.retain(|a| *a != addr);
+        }
+        self.endgame_requests.retain(|_, v| !v.is_empty());
     }
 
     async fn handle_storage_event(&mut self, ev: StorageEvent, peers: &mut PeerManager) {
         match ev {
             StorageEvent::Written { index } => {
                 self.pm.mark_complete(index as usize);
+                // The piece is on disk: its endgame re-request entries can
+                // never be satisfied again and would linger forever.
+                self.endgame_requests.retain(|(i, _), _| *i != index);
                 if self.pm.is_complete() {
                     self.choker.set_seeding(true);
                 }
@@ -2033,6 +2045,11 @@ impl TorrentEngine {
                 tracing::error!(target: "engine", ?index, msg, "storage error");
                 if let Some(i) = index {
                     self.pm.reset_piece(i as usize);
+                    // The piece is missing again: stale endgame entries
+                    // from before the failure would make the contains()
+                    // gate skip those blocks for every peer that had
+                    // asked, stalling the endgame tail.
+                    self.endgame_requests.retain(|(pi, _), _| *pi != i);
                 }
             }
         }
@@ -2782,6 +2799,89 @@ mod tests {
                 "proxied posture ingested {a} — strict screening bypassed"
             );
         }
+    }
+
+    /// Endgame re-request entries are only removed by Block arrival; a
+    /// peer that dies mid-endgame must be scrubbed from every list (its
+    /// address can be reused by a future connection), keys whose only
+    /// asker died must vanish, and a piece that completes OR is reset by
+    /// a storage error must drop its whole key set — otherwise stale
+    /// entries make the contains() gate starve those blocks forever.
+    #[tokio::test]
+    async fn endgame_requests_scrubbed_on_disconnect_completion_and_reset() {
+        const PL: u64 = 16384;
+        let data = vec![0u8; PL as usize * 2];
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(&data);
+        let ih: [u8; 20] = h.finalize().into();
+        let torrent = crate::metainfo::TorrentFile {
+            info_hash: ih,
+            announce: None,
+            announce_list: vec![],
+            info: crate::metainfo::Info {
+                name: "endgame-scrub.bin".into(),
+                piece_length: PL,
+                piece_hashes: vec![ih, ih],
+                files: crate::metainfo::TorrentFiles::Single { length: PL * 2 },
+                private: false,
+            },
+        };
+        let mut eng = TorrentEngine::new(torrent, [3u8; 20], EngineConfig::default());
+        let (_event_tx, _event_rx) = mpsc::channel(1);
+        let mut peers = PeerManager::new(ih, [3u8; 20], _event_tx);
+        let (storage_tx, _storage_rx) = mpsc::channel::<StorageCommand>(1);
+
+        let dead: SocketAddr = "203.0.113.50:6881".parse().unwrap();
+        let live: SocketAddr = "203.0.113.51:6881".parse().unwrap();
+
+        eng.endgame_requests.entry((0, 0)).or_default().push(dead);
+        eng.endgame_requests.entry((0, 0)).or_default().push(live);
+        eng.endgame_requests
+            .entry((0, 16384))
+            .or_default()
+            .push(dead);
+        eng.endgame_requests.entry((1, 0)).or_default().push(live);
+
+        // Disconnect scrub.
+        eng.cleanup_disconnected_peer(dead);
+        assert!(
+            !eng.endgame_requests.values().any(|v| v.contains(&dead)),
+            "dead addr still referenced: {:?}",
+            eng.endgame_requests
+        );
+        assert_eq!(
+            eng.endgame_requests.get(&(0, 0)).map(Vec::as_slice),
+            Some(&[live][..]),
+            "surviving asker must be kept"
+        );
+        assert!(
+            !eng.endgame_requests.contains_key(&(0, 16384)),
+            "key whose only asker died must be dropped"
+        );
+
+        // Completion wipes the finished piece's remaining keys.
+        eng.handle_storage_event(StorageEvent::Written { index: 0 }, &mut peers)
+            .await;
+        assert!(!eng.endgame_requests.contains_key(&(0, 0)));
+        assert!(eng.endgame_requests.contains_key(&(1, 0)));
+
+        // A storage-error reset does the same so the blocks become
+        // requestable again.
+        eng.endgame_requests.entry((0, 0)).or_default().push(live);
+        let _ = &storage_tx;
+        eng.handle_storage_event(
+            StorageEvent::Error {
+                index: Some(0),
+                msg: "disk full".into(),
+            },
+            &mut peers,
+        )
+        .await;
+        assert!(
+            !eng.endgame_requests.contains_key(&(0, 0)),
+            "reset piece kept stale endgame keys"
+        );
     }
 
     #[test]
