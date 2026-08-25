@@ -103,18 +103,23 @@ pub(super) async fn spawn(
     // future non-Send, which breaks `tokio::spawn(engine.run())` in the
     // daemon (the single-torrent path runs un-spawned and never noticed).
     let warm_contacts = state.routing.lock().await.len();
+    emit_listening_info(listen_port, &local_id, warm_contacts);
+    tokio::spawn(run(sock, state, bootstrap, persist_path, cmd_rx));
+    Ok(())
+}
+
+/// Emit the "dht listening" info line. The node ID is persisted across
+/// runs (dht::persist) — a stable identity — so it gets the same
+/// keyed-token treatment as peer IPs and info-hashes and is never
+/// rendered raw. Extracted so a subscriber-capture test can prove that.
+fn emit_listening_info(listen_port: u16, local_id: &NodeId, warm_contacts: usize) {
     tracing::info!(
         target: "dht",
         port = listen_port,
-        // The node ID is persisted across runs (dht::persist) — a stable
-        // identity, so it gets the same keyed-token treatment as peer IPs
-        // and info-hashes, never rendered raw.
         node_id = %crate::util::redact_node_id(local_id.as_bytes()),
         warm_contacts,
         "dht listening"
     );
-    tokio::spawn(run(sock, state, bootstrap, persist_path, cmd_rx));
-    Ok(())
 }
 
 /// State shared between the receiving task, the command-handler task, and
@@ -829,6 +834,45 @@ async fn announce_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shared in-memory writer so a fmt subscriber can capture log lines
+    /// (same pattern as tracker::http's capture test). std::sync::Mutex
+    /// spelled out: the file's plain `Mutex` is tokio's.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn listening_line_never_renders_persisted_node_id() {
+        // The node ID survives restarts via dht::persist, so the listening
+        // line must render only its keyed token — never the raw hex.
+        let id = NodeId([0xAB; 20]);
+        let raw_hex = crate::util::hex(&id.0);
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer({
+                let sink = buf.clone();
+                move || sink.clone()
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            emit_listening_info(6881, &id, 3);
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("dht listening"), "{out}");
+        assert!(out.contains("nid:"), "token missing: {out}");
+        assert!(!out.contains(&raw_hex), "raw node id leaked: {out}");
+        assert!(!out.contains("ababab"), "partial hex leaked: {out}");
+    }
 
     #[tokio::test]
     async fn prune_drops_stale_and_keeps_fresh() {
