@@ -280,6 +280,14 @@ async fn csrf_guard(req: Request, next: Next) -> Response {
 
 /// Build the monitoring + control router. Split out from [`serve`] so
 /// tests can drive it over an ephemeral listener.
+/// Cap on request bodies for every route. The `String` extractors read
+/// the whole body into memory with no default limit; even though both
+/// servers bind loopback-only, any local process (or a compromised
+/// helper) could otherwise POST an unbounded body to /api/add_magnet
+/// and OOM the daemon. A magnet URI with a large tr= list is KBs at
+/// worst, so 64 KiB is generous for legitimate clients.
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+
 pub fn router(state: WebState) -> Router {
     Router::new()
         .route("/", get(index))
@@ -291,6 +299,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/shutdown", post(shutdown))
         .route("/metrics", get(metrics))
         .layer(middleware::from_fn(csrf_guard))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
@@ -441,6 +450,7 @@ pub fn daemon_router(state: DaemonState) -> Router {
         .route("/api/torrent/:ih/resume", post(daemon_resume))
         .route("/api/torrent/:ih/remove", post(daemon_remove))
         .layer(middleware::from_fn(csrf_guard))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 

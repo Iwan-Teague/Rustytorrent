@@ -193,3 +193,58 @@ async fn daemon_hosts_lists_and_controls_torrents() {
     assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
     assert_eq!(resp.text().await.unwrap(), ih_hex);
 }
+
+/// The `String` extractors have no default body limit; without the
+/// DefaultBodyLimit layer any local process could POST an unbounded
+/// body at /api/add_magnet and OOM the daemon. Oversized bodies must be
+/// refused with 413 BEFORE the handler runs.
+#[tokio::test]
+async fn oversized_request_body_is_refused_with_413() {
+    let mgr = SessionManager::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = DaemonState {
+        mgr,
+        output: std::env::temp_dir(),
+        peer_id: [7u8; 20],
+        base_port: 0,
+        no_dht: true,
+        torrent_dir: std::env::temp_dir(),
+    };
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, daemon_router(state)).await;
+    });
+    let client = reqwest::Client::new();
+
+    let huge = "x".repeat(64 * 1024 + 1);
+    let resp = client
+        .post(format!("http://{addr}/api/add_magnet"))
+        .body(huge)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "unbounded body was buffered instead of refused"
+    );
+
+    // A legal-sized (under-cap) garbage magnet still reaches the handler:
+    // it must be the LIMIT that rejects, not the layer breaking routing.
+    let under = format!(
+        "magnet:?xt=urn:btih:{}&tr=http://127.0.0.1:9/a",
+        "ef".repeat(20)
+    );
+    let pad = "y".repeat(16 * 1024); // dn-style padding keeps us well under cap
+    let resp = client
+        .post(format!("http://{addr}/api/add_magnet"))
+        .body(format!("{under}&dn={pad}"))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "under-cap request must not trip the body limit"
+    );
+}
