@@ -21,7 +21,7 @@ RustyTorrent aims to be a fully-featured, production-quality peer-to-peer file t
 | 5 | Multi-file & Correctness | ✅ Done |
 | 6 | Hardening & Resume | ✅ Done |
 | 7 | Extensions | ✅ MSE/PE + DHT + BEP 9/10/11 + magnet + µTP (BEP 29, SACK + LEDBAT) |
-| 8 | Web UI | ✅ `--web`: single-torrent status page (progress, sparkline, per-file, peers, ETA) + JSON + Prometheus + pause/resume/stop. `daemon`: multi-torrent host with add/list/pause/resume/remove. Follow-ups: shared listener+DHT, magnet add |
+| 8 | Web UI | ✅ `--web`: single-torrent status page (progress, sparkline, per-file, peers, ETA) + JSON + Prometheus + pause/resume/stop. `daemon`: multi-torrent host with add/list/pause/resume/remove + magnet add + persistence across restarts. Shared listener + shared DHT landed (acceptor demuxes by info-hash). |
 
 **Anonymity / security**:
 - Built-in SOCKS5 client (RFC 1928 + RFC 1929 auth) for outgoing peer
@@ -31,6 +31,13 @@ RustyTorrent aims to be a fully-featured, production-quality peer-to-peer file t
   tracker announces. See [docs/ANONYMITY.md](ANONYMITY.md) for the threat model.
 - MSE/PE wire encryption (BEP 8) for transport obfuscation; pair with
   `--encrypt` to force MSE on every outbound dial.
+- Fail-closed gates at every boundary: UDP tracker announces and direct
+  dials are refused under `--anonymous`; hostname proxy hops are refused
+  (clearnet-DNS leak); martian/SSRF addresses are filtered at every peer
+  ingestion site AND re-checked at the dial syscall itself; BEP 6
+  REJECT_REQUEST is range- and ownership-validated; the MSE SKEY match is
+  constant-time. Kernel-level proofs in `tests/anon_mode_sockets.rs` and
+  behavioral pins in `tests/poisoned_have.rs`, `tests/hostile_reject.rs`.
 
 **Last verified:**
 - Localhost self-test (seeder ↔ leecher) — plain path: 32 MiB single-file
