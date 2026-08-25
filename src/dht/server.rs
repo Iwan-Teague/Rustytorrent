@@ -37,6 +37,9 @@ const MAX_DATAGRAM: usize = 1500;
 /// BEP 5 clients re-announce roughly every 15 min; 30 min gives a 2×
 /// margin so a still-active peer isn't dropped between its announces.
 const ANNOUNCE_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Per-info-hash cap on stored announcers (see `record_announce`).
+const MAX_PEERS_PER_INFO_HASH: usize = 256;
 /// Hard cap on the number of distinct info_hashes we'll hold peers for.
 /// Each announce needs a valid token (a get_peers round-trip from a real
 /// IP), but a real attacker — or just organic DHT load on a long-running
@@ -240,6 +243,26 @@ impl SharedState {
             entries.retain(|(_, t)| now.duration_since(*t) <= ANNOUNCE_TTL);
             !entries.is_empty()
         });
+    }
+
+    /// Record an announce_peer into the store. The bounds live here so
+    /// the datagram handler stays thin and the caps are unit-pinnable:
+    /// - at most [`MAX_INFO_HASHES`] distinct info_hashes — a flood of
+    ///   random-hash announces cannot grow the map without bound between
+    ///   GC sweeps (already-tracked hashes keep updating);
+    /// - at most [`MAX_PEERS_PER_INFO_HASH`] entries per hash, oldest
+    ///   drained — one swarm hammering us stays a bounded list.
+    async fn record_announce(&self, info_hash: crate::session::InfoHash, peer_addr: SocketAddr) {
+        let mut store = self.peer_store.lock().await;
+        if store.len() < MAX_INFO_HASHES || store.contains_key(&info_hash) {
+            let entry = store.entry(info_hash).or_default();
+            entry.retain(|(a, _)| *a != peer_addr);
+            entry.push((peer_addr, Instant::now()));
+            // Trim the per-hash list to avoid unbounded growth.
+            if entry.len() > MAX_PEERS_PER_INFO_HASH {
+                entry.drain(..entry.len() - MAX_PEERS_PER_INFO_HASH);
+            }
+        }
     }
 }
 
@@ -576,21 +599,9 @@ async fn answer_query(
             }
             let advertised_port = if implied_port { from.port() } else { port };
             let peer_addr = SocketAddr::new(from.ip(), advertised_port);
-            let mut store = state.peer_store.lock().await;
-            // Bound the number of distinct info_hashes: once at the cap we
-            // still update hashes we already track, but refuse to create a
-            // new key. Prevents a flood of random-info_hash announces from
-            // growing the map without bound between GC sweeps. Either way
-            // we reply with our id (a normal announce_peer ack).
-            if store.len() < MAX_INFO_HASHES || store.contains_key(&info_hash) {
-                let entry = store.entry(info_hash).or_default();
-                entry.retain(|(a, _)| *a != peer_addr);
-                entry.push((peer_addr, Instant::now()));
-                // Trim per-hash list to avoid unbounded growth.
-                if entry.len() > 256 {
-                    entry.drain(..entry.len() - 256);
-                }
-            }
+            // Bounds (distinct-hash cap, per-hash trim) applied inside —
+            // either way we reply with our id (a normal announce_peer ack).
+            state.record_announce(info_hash, peer_addr).await;
             Response::Id { id: state.local_id }
         }
     };
@@ -938,6 +949,78 @@ mod tests {
         assert!(
             !store.contains_key(&stale_hash),
             "fully-stale info_hash must be removed entirely"
+        );
+    }
+
+    /// The distinct-info-hash cap is the bound between GC sweeps: a flood
+    /// of random-hash announces must stop growing the map at
+    /// MAX_INFO_HASHES, while hashes we ALREADY track keep refreshing.
+    #[tokio::test]
+    async fn announce_store_caps_distinct_info_hashes() {
+        let state = SharedState::new(NodeId([0u8; 20]), false);
+        let hash = |i: u64| {
+            let mut h = [0u8; 20];
+            h[..8].copy_from_slice(&i.to_be_bytes());
+            h
+        };
+        let peer: SocketAddr = "1.2.3.4:6881".parse().unwrap();
+
+        // Track one hash first so we can prove already-tracked hashes
+        // still update once the cap is reached.
+        state.record_announce(hash(u64::MAX), peer).await;
+        for i in 0..MAX_INFO_HASHES as u64 {
+            state.record_announce(hash(i), peer).await;
+        }
+        assert_eq!(
+            state.peer_store.lock().await.len(),
+            MAX_INFO_HASHES,
+            "store grew past the distinct-hash cap"
+        );
+
+        // Over-cap announces of NEW hashes are refused...
+        state.record_announce(hash(u64::MAX - 1), peer).await;
+        assert_eq!(
+            state.peer_store.lock().await.len(),
+            MAX_INFO_HASHES,
+            "over-cap new hash was admitted"
+        );
+
+        // ...but the tracked one still refreshes.
+        let second: SocketAddr = "5.6.7.8:6881".parse().unwrap();
+        state.record_announce(hash(u64::MAX), second).await;
+        let store = state.peer_store.lock().await;
+        assert_eq!(
+            store.get(&hash(u64::MAX)).unwrap().len(),
+            2,
+            "tracked hash stopped accepting updates at cap"
+        );
+    }
+
+    /// One swarm hammering announce_peer must stay a bounded list: past
+    /// MAX_PEERS_PER_INFO_HASH entries the OLDEST are drained, newest kept.
+    #[tokio::test]
+    async fn announce_store_trims_per_hash_to_cap() {
+        let state = SharedState::new(NodeId([0u8; 20]), false);
+        let ih = [9u8; 20];
+        let addr = |p: u16| -> SocketAddr { format!("10.1.2.3:{p}").parse().unwrap() };
+
+        let n = MAX_PEERS_PER_INFO_HASH as u16 + 50;
+        for p in 10000..10000 + n {
+            state.record_announce(ih, addr(p)).await;
+        }
+        let store = state.peer_store.lock().await;
+        let entries = store.get(&ih).expect("hash must be tracked");
+        assert_eq!(
+            entries.len(),
+            MAX_PEERS_PER_INFO_HASH,
+            "per-hash cap failed"
+        );
+        let first_port = entries.first().unwrap().0.port();
+        let last_port = entries.last().unwrap().0.port();
+        assert_eq!(last_port, 10000 + n - 1, "newest entry missing");
+        assert!(
+            (first_port..10000 + n).contains(&first_port) && first_port >= 10000 + 50,
+            "oldest entries were not drained (first kept port {first_port})"
         );
     }
 
