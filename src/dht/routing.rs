@@ -168,6 +168,42 @@ mod tests {
         assert!(!b.insert(new));
     }
 
+    /// Eclipse-resistance pin: a full bucket must evict ONLY stale
+    /// contacts. An insert flood from an attacker (fresh contacts every
+    /// time) must admit exactly ONE node — the one stale slot — and
+    /// never displace a single live contact; a bucket of all-live nodes
+    /// rejects the flood entirely (covered by `bucket_fills_to_k`).
+    #[test]
+    fn full_bucket_evicts_only_stale_contacts_under_insert_flood() {
+        let mut b = KBucket::default();
+        for i in 0..K {
+            assert!(b.insert(contact(i as u8, 1000 + i as u16)));
+        }
+        // Exactly one contact goes stale.
+        b.contacts[2].last_seen = Instant::now() - GOOD_NODE_TTL - Duration::from_secs(1);
+
+        let mut admitted = 0;
+        for i in 0..(3 * K) {
+            if b.insert(contact(100 + i as u8, 2000 + i as u16)) {
+                admitted += 1;
+            }
+        }
+
+        assert_eq!(admitted, 1, "flood must displace exactly the stale slot");
+        assert_eq!(b.len(), K);
+        // Every live original survives; only the stale one is gone.
+        for i in 0..K {
+            let present = b.contacts.iter().any(|c| c.id == contact(i as u8, 0).id);
+            assert_eq!(present, i != 2, "live contact {i} wrongly evicted");
+        }
+        assert!(
+            b.contacts
+                .iter()
+                .any(|c| c.id == contact(100, 0).id && c.addr.port() == 2000),
+            "the flood's first insert should have taken the stale slot"
+        );
+    }
+
     #[test]
     fn bucket_refreshes_existing() {
         let mut b = KBucket::default();
