@@ -388,6 +388,21 @@ pub struct DaemonState {
     pub torrent_dir: std::path::PathBuf,
 }
 
+/// Daemon v1 runs clearnet-only, so tracker-supplied peers are screened
+/// with the NON-strict martian policy (loopback/link-local/multicast
+/// refused; genuine LAN ranges still dialable). Module-level constant so
+/// [`filter_daemon_peer_pool`] and its test cannot drift apart: if the
+/// daemon ever gains anonymity knobs this becomes `anonymous || proxied`.
+const DAEMON_MARTIANS_STRICT: bool = false;
+
+/// Screen a tracker response's peer list before any daemon bootstrap dial.
+fn filter_daemon_peer_pool(peers: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    peers
+        .into_iter()
+        .filter(|a| crate::util::is_dialable_peer_addr(a, DAEMON_MARTIANS_STRICT))
+        .collect()
+}
+
 /// Resolve `requested` and require it to live under `dir`. Both are
 /// canonicalized (following symlinks, collapsing `..`) so a path like
 /// `dir/../../etc/passwd` or a symlink escape is caught. Returns the
@@ -580,12 +595,7 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
                     // the implicit coupling explicit and greppable: if the
                     // daemon ever gains anonymity knobs, replace with
                     // strict = anonymous || proxied like the engine does.
-                    const DAEMON_MARTIANS_STRICT: bool = false;
-                    pool.extend(
-                        resp.peers.into_iter().filter(|a| {
-                            crate::util::is_dialable_peer_addr(a, DAEMON_MARTIANS_STRICT)
-                        }),
-                    );
+                    pool.extend(filter_daemon_peer_pool(resp.peers));
                 }
                 Err(e) => {
                     tracing::debug!(target: "web", tracker = %crate::tracker::redact_url_query(url), error = %e, "magnet tracker bootstrap failed")
@@ -1023,6 +1033,34 @@ mod tests {
         assert!(resolve_under(&base, base.join("nope.torrent").to_str().unwrap()).is_err());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The daemon's magnet bootstrap is the one ingestion site OUTSIDE the
+    /// engine, so its screening must be pinned too: hard martians never
+    /// reach a dial, while site-local ranges stay dialable (clearnet v1).
+    /// The RFC1918 entry doubles as the tripwire if someone flips
+    /// `DAEMON_MARTIANS_STRICT` or deletes the filter wholesale.
+    #[test]
+    fn daemon_peer_pool_screening_matches_clearnet_policy() {
+        use std::net::SocketAddr;
+        let parse = |s: &str| -> SocketAddr { s.parse().expect("test addr must parse") };
+        let pool = vec![
+            parse("93.184.215.14:6881"),
+            parse("127.0.0.1:6881"),
+            parse("169.254.169.254:80"),
+            parse("[fe80::1]:6881"),
+            parse("10.0.0.5:6881"),
+            parse("224.0.0.1:6881"),
+        ];
+        let kept = filter_daemon_peer_pool(pool);
+        assert_eq!(
+            kept,
+            vec![parse("93.184.215.14:6881"), parse("10.0.0.5:6881")],
+            "clearnet daemon keeps public + LAN, drops loopback/link-local/multicast"
+        );
+        if DAEMON_MARTIANS_STRICT {
+            panic!("daemon v1 is clearnet-only by design; flipping this requires the anonymous||proxied derivation instead");
+        }
     }
 
     #[test]
