@@ -26,9 +26,14 @@ pub async fn announce(
     req: &AnnounceRequest,
     bind_iface: Option<&str>,
 ) -> Result<AnnounceResponse> {
-    let host_port = url
-        .strip_prefix("udp://")
-        .ok_or_else(|| Error::Tracker(format!("not a udp URL: {url}")))?;
+    let host_port = url.strip_prefix("udp://").ok_or_else(|| {
+        // The configured URL may carry a passkey/info-hash in its query;
+        // this error is logged verbatim upstream (`error = %e`).
+        Error::Tracker(format!(
+            "not a udp URL: {}",
+            crate::tracker::redact_url_query(url)
+        ))
+    })?;
     // strip optional /path or /announce
     let host_port = host_port.split('/').next().unwrap_or(host_port);
     let addr: SocketAddr = tokio::net::lookup_host(host_port)
@@ -252,6 +257,37 @@ pub fn parse_announce_response(buf: &[u8]) -> Result<AnnounceResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_udp_url_error_redacts_query_secrets() {
+        // A passkey-bearing announce URL misrouted to the udp tracker must
+        // not surface its query (passkey/info-hash) in the error string —
+        // callers log `error = %e` verbatim.
+        let req = AnnounceRequest {
+            info_hash: [0xAB; 20],
+            peer_id: [0xCD; 20],
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            event: crate::tracker::Event::Started,
+            num_want: 50,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(announce(
+                "https://t.example/a.php?passkey=SECRET",
+                &req,
+                None,
+            ))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("SECRET"), "query leaked: {msg}");
+        assert!(msg.contains("https://t.example/a.php"), "host lost: {msg}");
+    }
 
     #[test]
     fn announce_packet_layout() {
