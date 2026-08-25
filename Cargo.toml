@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "A peer-to-peer file transfer client in Rust"
 license = "MIT"
+# `as_chunks` (1.88) and `is_multiple_of` (1.87) are used in the
+# tracker/DHT/PEX parsers; the release profile also enables
+# overflow-checks which requires no additional MSRV.
+rust-version = "1.88"
 
 [dependencies]
 tokio        = { version = "1", features = ["full"] }
