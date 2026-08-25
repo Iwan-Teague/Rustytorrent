@@ -87,6 +87,19 @@ impl MagnetLink {
         let info_hash = info_hash
             .ok_or_else(|| Error::Bencode("magnet URI missing required xt=urn:btih:…".into()))?;
 
+        // Hostile-magnet bound. A 64 KiB URI can carry thousands of `tr=`
+        // params; the bootstrap loops (CLI + daemon) announce to every
+        // entry sequentially, each dial bounded only by the client's 30s
+        // timeout — one add would mean hours-to-days of background dials,
+        // and duplicates would hammer the same host repeatedly. Real
+        // torrents carry a handful of trackers. Dedupe (first occurrence
+        // wins, tier order preserved) and cap here — the single choke
+        // point every consumer reads from.
+        const MAX_TRACKERS: usize = 64;
+        let mut seen = std::collections::HashSet::new();
+        trackers.retain(|t| seen.insert(t.clone()));
+        trackers.truncate(MAX_TRACKERS);
+
         Ok(Self {
             info_hash,
             display_name,
@@ -225,6 +238,35 @@ mod tests {
                 "udp://tracker2.example:6969",
             ]
         );
+    }
+
+    /// Hostile-magnet bound: duplicate `tr=` entries must not turn the
+    /// bootstrap loop into a repeat-hammer of the same host, and a URI
+    /// stuffed with thousands of params must be capped — every entry is
+    /// announced to sequentially, each dial up to a 30s timeout.
+    #[test]
+    fn magnet_trackers_dedupe_and_cap() {
+        let base = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        let m = MagnetLink::parse(&format!(
+            "{base}&tr=udp%3A%2F%2Fa.example&tr=udp%3A%2F%2Fb.example&tr=udp%3A%2F%2Fa.example&tr=udp%3A%2F%2Fc.example"
+        ))
+        .unwrap();
+        // First occurrence wins; tier order preserved.
+        assert_eq!(
+            m.trackers,
+            vec!["udp://a.example", "udp://b.example", "udp://c.example",]
+        );
+
+        let uri: String = (0..200)
+            .map(|i| format!("&tr=udp%3A%2F%2Ft{i}.example"))
+            .fold(base.to_string(), |mut acc, piece| {
+                acc.push_str(&piece);
+                acc
+            });
+        let m = MagnetLink::parse(&uri).unwrap();
+        assert_eq!(m.trackers.len(), 64, "tracker cap not applied");
+        assert_eq!(m.trackers[0], "udp://t0.example");
+        assert_eq!(m.trackers[63], "udp://t63.example");
     }
 
     #[test]
