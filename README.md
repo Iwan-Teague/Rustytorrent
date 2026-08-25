@@ -1,5 +1,6 @@
 # RustyTorrent
 
+![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)
 A fully-functional peer-to-peer file transfer client written from scratch
 in Rust. The protocol-specific bits — bencode, info-hash, the peer wire
 protocol, HTTP/UDP trackers, MSE/PE encryption, the BEP 5 DHT, the piece
