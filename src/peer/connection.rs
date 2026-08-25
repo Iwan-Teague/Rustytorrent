@@ -197,6 +197,7 @@ pub async fn run_outgoing(
     bind_iface: Option<String>,
     anonymous: bool,
     utp: Option<Arc<UtpSocket>>,
+    read_abort_cell: Option<Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>>>,
 ) -> Result<()> {
     tracing::debug!(target: "peer", %addr, hops = proxies.len(), bind = ?bind_iface, utp = utp.is_some(), "dialing (plain)");
     let iface = bind_iface.as_deref();
@@ -206,7 +207,7 @@ pub async fn run_outgoing(
         let transport = connect_transport(addr, utp.as_ref(), &proxies, iface, anonymous).await?;
         match plain_handshake_outgoing(transport, info_hash, peer_id).await {
             Ok((reader, writer, theirs)) => {
-                run_after_handshake(reader, writer, addr, &theirs, event_tx.clone(), cmd_rx, anonymous)
+                run_after_handshake(reader, writer, addr, &theirs, event_tx.clone(), cmd_rx, anonymous, read_abort_cell)
                     .await
             }
             Err(e) if is_likely_mse_signal(&e) => {
@@ -215,7 +216,7 @@ pub async fn run_outgoing(
                 let transport = connect_transport(addr, utp.as_ref(), &proxies, iface, anonymous).await?;
                 let (reader, writer, theirs) =
                     mse_handshake_outgoing(transport, info_hash, peer_id).await?;
-                run_after_handshake(reader, writer, addr, &theirs, event_tx.clone(), cmd_rx, anonymous)
+                run_after_handshake(reader, writer, addr, &theirs, event_tx.clone(), cmd_rx, anonymous, read_abort_cell)
                     .await
             }
             Err(e) => Err(e),
@@ -237,6 +238,7 @@ pub async fn run_outgoing(
 /// Emit the `Connected` event and run the post-handshake loop. Shared
 /// by the plain and MSE outgoing paths so the connected-event + loop
 /// boilerplate lives in one place.
+#[allow(clippy::too_many_arguments)] // read_abort_cell is the connection's kill-switch handle
 async fn run_after_handshake<R, W>(
     reader: R,
     writer: W,
@@ -245,6 +247,7 @@ async fn run_after_handshake<R, W>(
     event_tx: mpsc::Sender<PeerEvent>,
     cmd_rx: mpsc::Receiver<PeerCommand>,
     anonymous: bool,
+    read_abort_cell: Option<Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>>>,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -266,6 +269,7 @@ where
         cmd_rx,
         supports_ext,
         anonymous,
+        read_abort_cell,
     )
     .await
 }
@@ -295,6 +299,7 @@ pub async fn run_outgoing_mse_only(
     bind_iface: Option<String>,
     anonymous: bool,
     utp: Option<Arc<UtpSocket>>,
+    read_abort_cell: Option<Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>>>,
 ) -> Result<()> {
     tracing::debug!(target: "peer", %addr, hops = proxies.len(), bind = ?bind_iface, utp = utp.is_some(), "dialing (MSE-only)");
     let iface = bind_iface.as_deref();
@@ -310,6 +315,7 @@ pub async fn run_outgoing_mse_only(
             event_tx.clone(),
             cmd_rx,
             anonymous,
+            read_abort_cell,
         )
         .await
     }
@@ -640,6 +646,7 @@ pub async fn run_with_stream(
     cmd_rx: mpsc::Receiver<PeerCommand>,
     outgoing: bool,
     anonymous: bool,
+    read_abort_cell: Option<Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>>>,
 ) -> Result<()> {
     let outcome = if outgoing {
         // Outgoing-on-existing-stream is only used by tests today; keep it
@@ -653,6 +660,7 @@ pub async fn run_with_stream(
             cmd_rx,
             true,
             anonymous,
+            read_abort_cell,
         )
         .await
     } else {
@@ -664,6 +672,7 @@ pub async fn run_with_stream(
             event_tx.clone(),
             cmd_rx,
             anonymous,
+            read_abort_cell,
         )
         .await
     };
@@ -692,6 +701,7 @@ pub async fn run_handshaken(
     event_tx: mpsc::Sender<PeerEvent>,
     cmd_rx: mpsc::Receiver<PeerCommand>,
     anonymous: bool,
+    read_abort_cell: Option<Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>>>,
 ) -> Result<()> {
     let crate::peer::inbound::HandshakenPeer {
         addr,
@@ -717,6 +727,7 @@ pub async fn run_handshaken(
         cmd_rx,
         supports_ext,
         anonymous,
+        read_abort_cell,
     )
     .await;
     let (reason, violation) = classify_outcome(&outcome);
@@ -742,6 +753,7 @@ async fn run_plain_on_stream(
     cmd_rx: mpsc::Receiver<PeerCommand>,
     outgoing: bool,
     anonymous: bool,
+    read_abort_cell: Option<Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>>>,
 ) -> Result<()> {
     let theirs = match timeout(HANDSHAKE_TIMEOUT, async {
         if outgoing {
@@ -772,11 +784,13 @@ async fn run_plain_on_stream(
         cmd_rx,
         supports_ext,
         anonymous,
+        read_abort_cell,
     )
     .await
 }
 
 /// Inbound connection dispatcher: peek the first byte and pick the right path.
+#[allow(clippy::too_many_arguments)] // read_abort_cell is the connection's kill-switch handle
 async fn run_incoming_dispatch(
     mut stream: Transport,
     addr: SocketAddr,
@@ -785,6 +799,7 @@ async fn run_incoming_dispatch(
     event_tx: mpsc::Sender<PeerEvent>,
     cmd_rx: mpsc::Receiver<PeerCommand>,
     anonymous: bool,
+    read_abort_cell: Option<Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>>>,
 ) -> Result<()> {
     // Peek the first byte without consuming it (MSG_PEEK on TCP; a
     // buffered non-consuming read on µTP). `None` means EOF.
@@ -799,13 +814,28 @@ async fn run_incoming_dispatch(
     if first == crate::peer::handshake::PSTRLEN {
         // 0x13 → plain BT.
         run_plain_on_stream(
-            stream, addr, info_hash, peer_id, event_tx, cmd_rx, false, anonymous,
+            stream,
+            addr,
+            info_hash,
+            peer_id,
+            event_tx,
+            cmd_rx,
+            false,
+            anonymous,
+            read_abort_cell,
         )
         .await
     } else {
         // Anything else → assume MSE/PE; the peeked byte is the first byte of Ya.
         run_mse_on_stream(
-            stream, addr, info_hash, peer_id, event_tx, cmd_rx, anonymous,
+            stream,
+            addr,
+            info_hash,
+            peer_id,
+            event_tx,
+            cmd_rx,
+            anonymous,
+            read_abort_cell,
         )
         .await
     }
@@ -813,6 +843,7 @@ async fn run_incoming_dispatch(
 
 /// MSE-over-stream incoming flow. The peek above did NOT consume the byte,
 /// so the inner MSE handshake reads `Ya` from the start.
+#[allow(clippy::too_many_arguments)] // read_abort_cell is the connection's kill-switch handle
 async fn run_mse_on_stream(
     stream: Transport,
     addr: SocketAddr,
@@ -821,6 +852,7 @@ async fn run_mse_on_stream(
     event_tx: mpsc::Sender<PeerEvent>,
     cmd_rx: mpsc::Receiver<PeerCommand>,
     anonymous: bool,
+    read_abort_cell: Option<Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>>>,
 ) -> Result<()> {
     let info_hashes = [info_hash];
     let (mut enc, _matched) = match timeout(
@@ -865,6 +897,7 @@ async fn run_mse_on_stream(
         cmd_rx,
         supports_ext,
         anonymous,
+        read_abort_cell,
     )
     .await
 }
@@ -877,6 +910,7 @@ async fn run_mse_on_stream(
 /// Generic over the reader/writer types so the same loop serves:
 /// - plain peers: `OwnedReadHalf` / `OwnedWriteHalf` of a `TcpStream`
 /// - MSE peers: `Rc4Reader<OwnedReadHalf>` / `Rc4Writer<OwnedWriteHalf>`
+#[allow(clippy::too_many_arguments)]
 async fn post_handshake_loop<R, W>(
     mut reader: R,
     mut writer: W,
@@ -885,6 +919,7 @@ async fn post_handshake_loop<R, W>(
     mut cmd_rx: mpsc::Receiver<PeerCommand>,
     peer_supports_extension: bool,
     anonymous: bool,
+    read_abort_cell: Option<Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>>>,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -992,7 +1027,13 @@ where
         .await;
         let _ = read_done_tx.send(res);
     });
-
+    // Publish the child task's AbortHandle so drop_peer/ban can kill BOTH
+    // tasks — aborting only the outer one leaves this child holding the
+    // reader half (half-open socket up to READ_IDLE_TIMEOUT, events still
+    // flowing from a banned address).
+    if let Some(cell) = &read_abort_cell {
+        let _ = cell.set(read_task.abort_handle());
+    }
     let result: Result<()> = async {
         let mut last_send = Instant::now();
         loop {
