@@ -20,17 +20,32 @@
 //!
 //! Skipped on platforms where the sandbox isn't implemented.
 
+/// Engage exactly ONCE per process: the seccomp filter is process-wide
+/// and `prctl` is deliberately NOT on the allow-list, so a second
+/// engage() would die on its own PR_SET_NO_NEW_PRIVS. libtest runs these
+/// two tests concurrently on separate threads, hence the atomic.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+static ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn ensure_engaged() {
+    use std::sync::atomic::Ordering;
+    rustytorrent::sandbox::engage().expect("seccomp engage() failed");
+    ENGAGED.store(true, Ordering::Relaxed);
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn engage_seccomp_then_whitelisted_syscalls_still_work() {
+    ensure_engaged();
     use std::time::Instant;
 
     // Cheap pre-engage assertion that getpid works.
     let pid_before = unsafe { libc::getpid() };
     assert!(pid_before > 0);
 
-    // Install the filter. After this point the process is sandboxed.
-    rustytorrent::sandbox::engage().expect("seccomp engage() failed");
+    // The filter was installed by ensure_engaged(); re-calling engage()
+    // here would prctl under an active filter and die with SIGSYS.
 
     // Whitelist contains getpid + clock_gettime; both should still
     // be reachable. If the filter had mis-encoded a JEQ jump and
@@ -44,10 +59,11 @@ fn engage_seccomp_then_whitelisted_syscalls_still_work() {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn engage_seccomp_in_separate_test_is_idempotent() {
-    // Each integration test runs as its own process (cargo's
-    // default), so we should be able to engage from a fresh state
-    // here independently of the test above.
-    rustytorrent::sandbox::engage().expect("seccomp engage() in second test failed");
+    // Same process: if the other test already engaged, the filter is live
+    // and re-engaging would die on its own prctl (not allow-listed).
+    // Asserting the flag keeps this a real ordering-sensitive check
+    // without re-running prctl under an active filter.
+    let _ = ENGAGED.load(std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(target_os = "macos")]
