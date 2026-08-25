@@ -86,6 +86,39 @@ extension handshake, peer_id prefix, and tracker User-Agent now blend in
 as libtorrent 2.0.9 under `--anonymous`, and cleartext `http://` trackers
 are rejected up front in that mode.
 
+### Hardening pass (2026-08)
+
+- ✅ **µTP flow control, three coordinated bounds** — SendGate credit
+  ledger caps the app→driver send path; the advertised receive window is
+  now ENFORCED on inbound DATA (frontier pins like TCP zero-window); the
+  driver→stream delivery queue is bounded. Undelivered/deliverable memory
+  per connection is fixed regardless of either side's behavior. Property
+  suite (`tests/utp_flow_props.rs`) + scripted-peer e2e; both guards
+  mutation-checked.
+- ✅ **BEP 6 REJECT_REQUEST validation** — out-of-range index no longer
+  reaches unchecked piece indexing (remote panic), and rejects are
+  ownership-checked (closing a cross-peer stall vector).
+  `tests/hostile_reject.rs` mutation-checked.
+- ✅ **Constant-time MSE SKEY match** — full sweep with
+  `subtle::ConstantTimeEq`; closes the last plain-`==` secret compare.
+- ✅ **Martian strictness derived from anonymity** at every ingestion site
+  plus a dial-syscall chokepoint (`is_safe_dial_target`); DHT threading
+  pinned end-to-end via scripted bootstrap node.
+- ✅ **SOCKS5**: hostname proxy hops refused under `--anonymous` (startup
+  DNS leak); hostile-proxy reply parsing fail-closed tests.
+- ✅ **Anonymous-mode proofs** — kernel-level socket audits
+  (`tests/anon_mode_sockets.rs`): zero UDP sockets, zero LISTENING TCP,
+  even with a udp:// tracker baked into the metainfo.
+- ✅ **Rate-cap edges** — sub-8 KiB/s throttles no longer stall transfers
+  (bucket capacity floored at one block); `--max-down 0` / `--max-up 0`
+  mean unlimited as documented.
+- ✅ **Ban-path teardown + pins** — SHA1-mismatch ban wipes all per-peer
+  engine state (half-open read task can't keep feeding events);
+  try_connect_many refuses banned IPs (both mutation-checked). Poisoned-
+  block integrity path covered end to end (`tests/poisoned_have.rs`).
+- ✅ **CI enforcement** — cargo-deny supply-chain job; linux release-profile
+  test pass exercising overflow-checks.
+
 ### Hardening pass (2026-05-29)
 
 Audit of every untrusted-input parser (bencode, peer wire, KRPC,
