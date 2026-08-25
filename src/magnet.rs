@@ -48,9 +48,12 @@ impl MagnetLink {
             if pair.is_empty() {
                 continue;
             }
-            let (k, v) = pair
-                .split_once('=')
-                .ok_or_else(|| Error::Bencode(format!("magnet param missing `=`: {pair}")))?;
+            let (k, v) = pair.split_once('=').ok_or_else(|| {
+                // Don't echo the pair: it may embed an info-hash (or other
+                // identifying material) that would otherwise reach logs via
+                // the caller's `error = %e`.
+                Error::Bencode("magnet param missing `=`".into())
+            })?;
             // Per RFC 3986 query strings are percent-encoded.
             let decoded = percent_decode(v)?;
             match k {
@@ -58,7 +61,8 @@ impl MagnetLink {
                     let s = std::str::from_utf8(&decoded)
                         .map_err(|_| Error::Bencode("magnet xt not utf-8".into()))?;
                     let hash_str = s.strip_prefix("urn:btih:").ok_or_else(|| {
-                        Error::Bencode(format!("xt missing urn:btih: prefix: {s}"))
+                        // Same rule: never render the xt value itself.
+                        Error::Bencode("xt missing urn:btih: prefix".into())
                     })?;
                     info_hash = Some(parse_info_hash(hash_str)?);
                 }
@@ -99,7 +103,9 @@ fn parse_info_hash(s: &str) -> Result<[u8; 20]> {
         40 => parse_hex_20(s),
         32 => parse_base32_20(s),
         n => Err(Error::Bencode(format!(
-            "info_hash must be 40 hex chars or 32 base32 chars, got {n}: {s}"
+            // Length only — the candidate string may be the info-hash
+            // itself and this error reaches daemon logs.
+            "info_hash must be 40 hex chars or 32 base32 chars, got {n}"
         ))),
     }
 }
@@ -252,6 +258,33 @@ mod tests {
     #[test]
     fn rejects_bad_hash_length() {
         assert!(MagnetLink::parse("magnet:?xt=urn:btih:DEADBEEF").is_err());
+    }
+
+    #[test]
+    fn malformed_magnet_errors_never_echo_the_hash() {
+        // Parse errors surface in daemon logs via `error = %e`; the magnet
+        // string may come from anywhere, so its identifying material must
+        // never be echoed back into an error message.
+        let ih = "0123456789abcdef0123456789abcdef01234567";
+        let cases = [
+            // Missing `=` with the hash embedded in the bare pair.
+            format!("magnet:?{ih}"),
+            // xt value without the urn:btih: prefix.
+            format!("magnet:?xt={ih}"),
+            // Right prefix, wrong length.
+            "magnet:?xt=urn:btih:DEADBEEF".to_string(),
+        ];
+        for uri in &cases {
+            let err = match MagnetLink::parse(uri) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("expected parse error for {uri}"),
+            };
+            assert!(!err.contains(ih), "hash leaked via {uri}: {err}");
+            assert!(
+                !err.contains("deadbeef") && !err.contains("DEADBEEF"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
