@@ -55,7 +55,19 @@ pub fn scrub_url_from_message(msg: &str, url: &str) -> String {
     if redacted == url {
         return msg.to_string();
     }
-    msg.replace(url, &redacted)
+    let mut out = msg.replace(url, &redacted);
+    // reqwest renders the PARSED url, not our raw string: percent-encoding
+    // normalization (space → %20, non-ASCII → UTF-8 escapes), default-port
+    // stripping and scheme/case folding can all diverge from what we
+    // passed. An exact-match replace would then miss it and leak the
+    // credential-bearing form verbatim — also replace the parsed Display.
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        let disp = parsed.to_string();
+        if disp != url && disp != redacted {
+            out = out.replace(&disp, &redacted);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,6 +442,27 @@ mod tests {
         assert_eq!(out, "http://t.example/xINFO spoofed line");
         // Host and path survive; DEL (0x7F) is also a control char.
         assert_eq!(redact_url_query("http://h/p\u{7f}q"), "http://h/pq");
+    }
+
+    #[test]
+    fn scrub_url_catches_reqwest_normalized_display_form() {
+        // reqwest renders the PARSED url: a space in the path becomes %20,
+        // so an exact-match replace of the raw configured string misses it
+        // and the passkey query would leak verbatim through the error text.
+        let raw = "http://t.example/ann ounce.php?passkey=SECRET9";
+        let disp = reqwest::Url::parse(raw).unwrap().to_string();
+        assert_ne!(disp, raw, "normalization must diverge for this fixture");
+        let msg = format!("error sending request for url ({disp})");
+        let out = scrub_url_from_message(&msg, raw);
+        assert!(
+            !out.contains("SECRET9") && !out.contains("ann%20ounce"),
+            "normalized form must be scrubbed too: {out}"
+        );
+        assert!(out.contains("http://t.example/ann ounce.php"), "{out}");
+        // The exact-match path still works when no divergence exists.
+        let plain = format!("error sending request for url ({raw})");
+        let out2 = scrub_url_from_message(&plain, raw);
+        assert!(!out2.contains("SECRET9"), "{out2}");
     }
 
     #[test]
