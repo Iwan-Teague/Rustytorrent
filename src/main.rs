@@ -278,6 +278,30 @@ struct SharedDownloadArgs {
     sequential: bool,
 }
 
+/// Resolve on graceful-shutdown signals: Ctrl+C (SIGINT) or SIGTERM.
+/// Process managers (systemd, Docker/K8s, etc.) send SIGTERM; without
+/// handling it the binary dies immediately without flushing state,
+/// sending tracker `stopped` events, or saving the DHT routing table.
+#[cfg(unix)]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+}
+
+/// Non-Unix fallback: Ctrl+C only.
+#[cfg(not(unix))]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    async {
+        tokio::signal::ctrl_c().await.ok();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -806,7 +830,7 @@ async fn cmd_daemon(
     // Serve until ctrl-c, then stop every session gracefully.
     tokio::select! {
         _ = rustytorrent::web::serve_daemon(web, state) => {}
-        _ = tokio::signal::ctrl_c() => {
+        _ = shutdown_signal() => {
             println!("\nshutting down daemon...");
         }
     }

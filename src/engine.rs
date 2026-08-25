@@ -1151,6 +1151,16 @@ impl TorrentEngine {
             crate::sandbox::engage()?;
         }
 
+        // Unix-only: listen for SIGTERM alongside Ctrl+C so process
+        // managers can gracefully stop the download. On non-Unix this
+        // compiles to a never-firing placeholder.
+        #[cfg(unix)]
+        #[allow(unused_variables, unused_mut)]
+        let mut sigterm_stream = {
+            use tokio::signal::unix::{signal, SignalKind};
+            signal(SignalKind::terminate()).ok()
+        };
+
         let result: Result<()> = loop {
             tokio::select! {
                 Some(ev) = peer_event_rx.recv() => {
@@ -1338,6 +1348,17 @@ impl TorrentEngine {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!(target: "engine", "ctrl-c — beginning graceful shutdown");
+                    break Ok(());
+                }
+                _ = async {
+                    #[cfg(unix)]
+                    {
+                        use tokio::signal::unix::{signal, SignalKind};
+                        let mut term = signal(SignalKind::terminate()).unwrap();
+                        term.recv().await;
+                    }
+                } => {
+                    tracing::info!(target: "engine", "SIGTERM received — beginning graceful shutdown");
                     break Ok(());
                 }
                 _ = dht_timer.tick(), if dht.is_some() => {
