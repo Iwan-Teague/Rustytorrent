@@ -277,4 +277,21 @@ mod tests {
         // (lowest index b has and we need), for in-order delivery.
         assert_eq!(p.pick_for(&b, &pm, false), Some(0));
     }
+
+    #[test]
+    fn sequential_beats_rarest_when_rarest_is_not_lowest_index() {
+        // Piece 0 is already downloaded, so the lowest-index *needed*
+        // piece is 1 (availability 2). Piece 2 is the strict rarest
+        // (availability 1) and sits at a HIGHER index than 1. Sequential
+        // must ignore rarity entirely and take 1.
+        let mut pm = PieceManager::new(16384, 49152, 3);
+        pm.mark_complete(0);
+        let mut p = Picker::new(3);
+        p.set_sequential(true);
+        let a: SocketAddr = "1.1.1.1:1".parse().unwrap();
+        let b: SocketAddr = "2.2.2.2:2".parse().unwrap();
+        p.set_peer_bitfield(a, mkbf(&[true, true, false]));
+        p.set_peer_bitfield(b, mkbf(&[true, true, true]));
+        assert_eq!(p.pick_for(&b, &pm, false), Some(1));
+    }
 }
