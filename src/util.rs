@@ -249,12 +249,23 @@ pub fn is_dialable_url_host(host: &str, strict: bool) -> bool {
 /// that DNS resolved from an otherwise-passing domain host: loopback is
 /// allowed (explicit-configuration trust class, same as the URL gate),
 /// everything else goes through [`is_dialable_ip`]. Used by the tracker
-/// HTTP client's DNS-rebinding screen.
+/// HTTP client's DNS-rebinding screen. The IPv4-mapped normalization
+/// MUST happen BEFORE the loopback check: `::ffff:127.0.0.1` does not
+/// satisfy `IpAddr::is_loopback()`, so without it the mapped form would
+/// be judged dial-side (refused) while plain `127.0.0.1` passes — the
+/// exact split-brain this crate's log-token work fixed for identity.
 pub(crate) fn is_dialable_resolved_ip(ip: &IpAddr, strict: bool) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => *ip,
+        },
+        v4 => *v4,
+    };
     if ip.is_loopback() {
         return true;
     }
-    is_dialable_ip(ip, strict)
+    is_dialable_ip(&ip, strict)
 }
 
 /// Shared core of every DNS-resolution screen (HTTP tracker resolver,
@@ -423,6 +434,32 @@ fn is_dialable_ip(ip: &IpAddr, strict: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The resolved-address screen must judge `::ffff:a.b.c.d` by the
+    /// IPv4 rules BEFORE its loopback exception: the mapped form of
+    /// 127.0.0.1 fails `IpAddr::is_loopback()`, so a normalization-last
+    /// implementation would allow plain loopback but refuse its mapped
+    /// twin — diverging from [`is_dialable_url_host`] and breaking
+    /// local-tracker workflows that answer on both forms.
+    #[test]
+    fn filter_dialable_addrs_treats_mapped_loopback_like_plain_loopback() {
+        let plain: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:6881".parse().unwrap();
+        let mapped_metadata: SocketAddr = "[::ffff:169.254.169.254]:80".parse().unwrap();
+
+        for strict in [false, true] {
+            let kept =
+                filter_dialable_addrs(vec![plain, mapped], strict).expect("loopback survives");
+            assert_eq!(
+                kept.len(),
+                2,
+                "mapped twin dropped at strict={strict}: {kept:?}"
+            );
+        }
+        // The same normalization must not smuggle martians through:
+        // mapped metadata endpoint is still judged as v4 link-local.
+        assert!(filter_dialable_addrs(vec![mapped_metadata], false).is_err());
+    }
 
     #[test]
     fn hex_roundtrips() {
