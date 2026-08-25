@@ -54,7 +54,12 @@ use crate::storage::disk::{StorageCommand, StorageEvent};
 use crate::storage::layout::Layout;
 
 pub const MAGIC: &[u8; 4] = b"RTSP";
-pub const VERSION: u8 = 1;
+/// Spool format version. 2: piece ciphertexts are bound to their slot
+/// index via AEAD associated data (a transplanted blob fails its tag
+/// instead of decrypting to foreign plaintext). v1 spools predate the
+/// binding — every slot would fail to decrypt under the new scheme and
+/// silently re-download, so they are rejected loudly at open instead.
+pub const VERSION: u8 = 2;
 
 /// Open options for the spool file: created owner-only (0600 on Unix).
 ///
