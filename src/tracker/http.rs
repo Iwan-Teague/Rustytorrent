@@ -284,9 +284,58 @@ fn url_host_is_ipv6_literal(url: &str) -> bool {
 /// peer-id and any passkey carried by the base) in its Display output, so
 /// both the built announce URL and the bare base URL must be replaced;
 /// scrubbing only the base would miss the query-bearing form entirely.
+///
+/// Exact-match replacement cannot recognize a RE-ENCODED echo: a hostile
+/// or MITM'd tracker returning our announce URL inside `failure reason`
+/// may case-fold the host, uppercase/lowercase percent hex, or decode
+/// safe characters — every variant slips past string equality. The final
+/// pass therefore blanket-redacts any surviving sensitive query
+/// parameter's VALUE wherever it appears in the text.
 fn scrub_announce_error(msg: &str, full_url: &str, base_url: &str) -> String {
     let once = crate::tracker::scrub_url_from_message(msg, full_url);
-    crate::tracker::scrub_url_from_message(&once, base_url)
+    let twice = crate::tracker::scrub_url_from_message(&once, base_url);
+    redact_param_values(&twice)
+}
+
+/// Query parameter names whose VALUES must never survive into logs. Only
+/// exact name matches (ASCII case-insensitive) followed by '=' trigger
+/// redaction; prose mentioning "passkey" without one is untouched.
+const SENSITIVE_PARAMS: [&str; 5] = ["passkey", "info_hash", "peer_id", "key", "auth"];
+
+fn redact_param_values(msg: &str) -> String {
+    let mut result = String::with_capacity(msg.len());
+    let bytes = msg.as_bytes();
+    let mut i = 0;
+    while i < msg.len() {
+        let mut hit: Option<usize> = None;
+        for k in SENSITIVE_PARAMS {
+            let nl = k.len() + 1; // "key="
+            if msg[i..].len() >= nl
+                && bytes[i + k.len()] == b'='
+                && msg[i..i + k.len()].eq_ignore_ascii_case(k)
+            {
+                hit = Some(nl);
+                break;
+            }
+        }
+        match hit {
+            Some(nl) => {
+                result.push_str(&msg[i..i + nl]);
+                // Value runs to the next query delimiter (or end of text).
+                let rest = &msg[i + nl..];
+                let end = rest.find(['&', '#']).unwrap_or(rest.len());
+                result.push_str("[scrubbed]");
+                i += nl + end;
+            }
+            None => {
+                // Advance one char to stay on UTF-8 boundaries.
+                let step = msg[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                result.push_str(&msg[i..i + step]);
+                i += step;
+            }
+        }
+    }
+    result
 }
 
 /// Emit the "announcing" debug line. The configured announce URL may carry a
@@ -914,6 +963,42 @@ mod tests {
         assert!(!err.contains("SECRET9"), "passkey leaked: {err}");
         assert!(!err.contains("passkey"), "query echoed: {err}");
         assert!(err.contains("t.example"), "host should survive: {err}");
+    }
+
+    #[test]
+    fn reencoded_url_echo_is_blanked_by_param_redaction() {
+        // Exact-match replacement only catches faithful echoes. A hostile
+        // tracker returning our announce URL with a case-folded host and
+        // re-encoded query defeats string equality — the generic pass
+        // must still blank every sensitive parameter VALUE, while prose
+        // and hosts survive.
+        let reason = "rejected: HTTP://T.example/announce?PaSsKeY=SECRET9%2Fx&INFO_HASH=%AB%CD";
+        let mut body = b"d14:failure reason".to_vec();
+        body.extend_from_slice(format!("{}:", reason.len()).as_bytes());
+        body.extend_from_slice(reason.as_bytes());
+        body.push(b'e');
+        let base = "http://t.example/announce";
+        let err = match parse_response(&body, base, base) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("failure reason must be an error"),
+        };
+        assert!(
+            !err.contains("SECRET9"),
+            "passkey survived re-encoding: {err}"
+        );
+        assert!(
+            !err.contains("%AB"),
+            "info-hash survived re-encoding: {err}"
+        );
+        assert!(
+            err.contains("[scrubbed]"),
+            "expected blanket redaction: {err}"
+        );
+        assert!(err.contains("T.example"), "host text should survive: {err}");
+        assert!(err.contains("rejected"), "prose should survive: {err}");
+        // Prose mentioning the word without '=' is not mangled.
+        let plain = redact_param_values("your passkey is required");
+        assert_eq!(plain, "your passkey is required");
     }
 
     #[test]
