@@ -27,11 +27,13 @@ use crate::tracker::{AnnounceRequest, AnnounceResponse};
 /// peer-id, and for private trackers the passkey. reqwest's default policy
 /// follows redirects across hosts, so a hostile (or MITM'd) tracker could
 /// 302 the announce to an attacker URL and harvest all of it, even though
-/// the redirect still rides our proxy. Restrict following to same-host
-/// redirects only: every hop must target the host of the ORIGINAL request
-/// (`previous().first()`), which also forbids scheme changes like a forced
-/// http→https downgrade to a different port. Same-host hops stay allowed,
-/// since some trackers genuinely round-robin between their own mirrors.
+/// the redirect still rides our proxy. Restrict following to same-origin
+/// redirects only: every hop must target the scheme+host+port of the
+/// ORIGINAL request (`previous().first()`), which forbids cross-host hops,
+/// implicit-default-port games, and both directions of scheme changes —
+/// including the explicit-port https→http DOWNGRADE that a port-only
+/// comparison misses. Same-origin hops stay allowed, since some trackers
+/// genuinely round-robin between their own mirrors.
 fn same_host_redirect_policy() -> reqwest::redirect::Policy {
     const MAX_HOPS: usize = 10;
     reqwest::redirect::Policy::custom(|attempt| {
@@ -51,12 +53,23 @@ fn same_host_redirect_policy() -> reqwest::redirect::Policy {
 
 /// Pure decision core of [`same_host_redirect_policy`], extracted so the
 /// security property stays under test: a redirect may be followed only
-/// when it targets the host AND port of the ORIGINAL request.
-/// `port_or_known_default` also defeats scheme-change hops (http:80 ->
-/// https:443) and implicit-default-port games against non-standard ports.
+/// when it targets the SAME ORIGIN — scheme, host AND port — of the
+/// original request. `port_or_known_default` defeats implicit-default-port
+/// games against non-standard ports; scheme equality closes the explicit-
+/// port https→http downgrade (https:443 -> http:443) that a port-only
+/// comparison would follow in plaintext.
+/// A redirect may be followed only within the EXACT origin we announced
+/// to: same scheme, same host, same port. Comparing `port_or_known_default`
+/// alone defeats implicit-default games (http:80 -> https:443) but still
+/// allows an explicit-port scheme DOWNGRADE — `https://t/a` (443) followed
+/// by `Location: http://t:443/b` compares equal and would send our
+/// passkey-bearing announce in plaintext. Scheme equality closes it.
 fn same_redirect_origin(first: &reqwest::Url, next: &reqwest::Url) -> bool {
-    (first.host_str(), first.port_or_known_default())
-        == (next.host_str(), next.port_or_known_default())
+    (
+        first.scheme(),
+        first.host_str(),
+        first.port_or_known_default(),
+    ) == (next.scheme(), next.host_str(), next.port_or_known_default())
 }
 
 fn build_direct_client(local_ip: Option<IpAddr>, strict: bool) -> reqwest::Client {
@@ -1370,6 +1383,13 @@ mod tests {
         // resolvers of the same name.
         let plain = u("http://t.example/a");
         assert!(!same_redirect_origin(&plain, &u("https://t.example/a")));
+        // EXPLICIT same-port scheme changes must refuse too: a port-only
+        // comparison sees (t.example, 443) == (t.example, 443) and would
+        // follow an https->http DOWNGRADE, sending the passkey query in
+        // plaintext.
+        let secure = u("https://t.example/a");
+        assert!(!same_redirect_origin(&secure, &u("http://t.example:443/b")));
+        assert!(!same_redirect_origin(&plain, &u("https://t.example:80/b")));
         // Host look-alikes are not equal.
         assert!(!same_redirect_origin(
             &u("http://tracker.example/a"),
