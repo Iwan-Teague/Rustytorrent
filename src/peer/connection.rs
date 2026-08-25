@@ -1411,6 +1411,30 @@ mod tests {
     }
 
     #[test]
+    fn mse_signal_classifier_matches_all_variants() {
+        // Handshake EOF variants — all indicate the peer dropped us
+        // because it expected MSE, not plain.
+        for msg in [
+            "early eof",
+            "bad pstrlen",
+            "bad protocol string",
+            "read: unexpected end of file",
+        ] {
+            let err = Error::Handshake(msg.to_string());
+            assert!(is_likely_mse_signal(&err), "{msg} should match");
+        }
+        // Connection reset — peer actively rejected our plain handshake.
+        let err = Error::Network("Connection reset by peer".to_string());
+        assert!(is_likely_mse_signal(&err), "Connection reset should match");
+
+        // Non-matching errors must NOT be classified as MSE signals.
+        assert!(!is_likely_mse_signal(&Error::Network(
+            "timeout".to_string()
+        )));
+        assert!(!is_likely_mse_signal(&Error::Bencode("bad".to_string())));
+    }
+
+    #[test]
     fn should_use_utp_covers_anonymous() {
         // Truth table: µTP (raw UDP, no proxy support, no iface binding)
         // is only allowed with no proxy chain, no --bind-iface, and
