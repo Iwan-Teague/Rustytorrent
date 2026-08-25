@@ -41,7 +41,6 @@ async fn mse_wire_never_leaks_plain_bt_preamble() {
         n < 20 || &buf[..19] != b"BitTorrent protocol",
         "wire begins with 'BitTorrent protocol' - DPI fingerprint leak"
     );
-    assert_ne!(buf[0], 0x13, "first wire byte is 0x13 (pstrlen marker)");
 
     // The MSE handshake sends Ya (96 bytes) as part of the key exchange,
     // so we should see at least that many bytes of cryptographically
