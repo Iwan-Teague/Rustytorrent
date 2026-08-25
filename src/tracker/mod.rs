@@ -226,6 +226,23 @@ fn tracker_url_dialable(url: &str, strict: bool) -> bool {
     }
 }
 
+/// Host-only label for a REFUSED announce URL. The URL is attacker-
+/// controlled (hostile magnet `tr=`), so errors must not echo its path or
+/// query — scheme://host[:port] names the offender for log correlation
+/// without carrying anything an attacker planted.
+fn martian_url_label(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) => match u.host_str() {
+            Some(h) => match u.port() {
+                Some(p) => format!("{}://{h}:{p}", u.scheme()),
+                None => format!("{}://{h}", u.scheme()),
+            },
+            None => "<unparseable>".into(),
+        },
+        Err(_) => "<unparseable>".into(),
+    }
+}
+
 pub async fn announce_with_fallback_anon(
     tiers: &[Vec<String>],
     fallback_single: Option<&str>,
@@ -244,6 +261,34 @@ pub async fn announce_with_fallback_anon(
         ANNOUNCE_WALK_DEADLINE,
     )
     .await
+}
+
+/// Screened single-URL announce for callers that drive their OWN loop over
+/// tracker URLs (daemon magnet bootstrap) instead of handing the list to
+/// [`announce_with_fallback_anon`]. The martian URL screen is NOT optional:
+/// skipping it would let a hostile magnet's `tr=http://169.254.169.254/`
+/// collect an info-hash + peer_id GET from us even though every other path
+/// refuses it. Strictness derivation mirrors the walk.
+pub async fn announce_screened(
+    url: &str,
+    req: &AnnounceRequest,
+    proxy: Option<&crate::socks5::ProxyConfig>,
+    anonymous: bool,
+    bind_iface: Option<&str>,
+) -> Result<AnnounceResponse> {
+    let strict = anonymous || proxy.is_some();
+    if !tracker_url_dialable(url, strict) {
+        tracing::warn!(
+            target: "tracker",
+            url = %redact_url_query(url),
+            "tracker host refused by martian screen"
+        );
+        return Err(crate::error::Error::Tracker(format!(
+            "tracker host refused by martian screen: {}",
+            martian_url_label(url)
+        )));
+    }
+    crate::tracker::http::announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await
 }
 
 /// Overall deadline for ONE full announce walk across every tier. Each
@@ -296,7 +341,7 @@ async fn walk_tiers(
                 );
                 last_err = Some(crate::error::Error::Tracker(format!(
                     "tracker host refused by martian screen: {}",
-                    redact_url_query(url)
+                    martian_url_label(url)
                 )));
                 continue;
             }
@@ -318,7 +363,7 @@ async fn walk_tiers(
             );
             return Err(crate::error::Error::Tracker(format!(
                 "tracker host refused by martian screen: {}",
-                redact_url_query(url)
+                martian_url_label(url)
             )));
         }
         match announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await {
@@ -729,6 +774,50 @@ mod tests {
             "https://tracker.example.com/a.php?k=x",
             true
         ));
+    }
+
+    /// announce_screened is the ONLY sanctioned way to announce to a URL
+    /// picked outside the tier walk (daemon magnet bootstrap drives its own
+    /// loop). The screen must fire BEFORE any socket work: a hostile
+    /// magnet's `tr=http://169.254.169.254/` must be refused outright, not
+    /// handed an info-hash + peer_id GET. Loopback stays allowed on
+    /// clearnet, so the control case proceeds past the screen and fails at
+    /// DIAL time instead — proving the refusal came from the screen only
+    /// for genuine martians.
+    #[tokio::test]
+    async fn announce_screened_refuses_martian_url_before_any_dial() {
+        let req = AnnounceRequest {
+            info_hash: [0x42; 20],
+            peer_id: [0x24; 20],
+            port: 51413,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            event: Event::Started,
+            num_want: 50,
+        };
+
+        let err = announce_screened(
+            "http://169.254.169.254/latest/meta-data",
+            &req,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("metadata endpoint must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("martian screen"), "{msg}");
+        assert!(!msg.contains("meta-data"), "path leaked: {msg}");
+
+        // Control: loopback clears the screen and dies at dial time.
+        let err = announce_screened("http://127.0.0.1:9/announce", &req, None, false, None)
+            .await
+            .expect_err("port 9 refuses everything");
+        assert!(
+            !err.to_string().contains("martian screen"),
+            "loopback wrongly screened: {err}"
+        );
     }
 
     #[tokio::test]

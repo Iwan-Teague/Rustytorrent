@@ -596,7 +596,11 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
         };
         let mut pool: Vec<SocketAddr> = Vec::new();
         for url in &magnet.trackers {
-            match crate::tracker::announce_with_proxy_anon(url, &req, None, false, None).await {
+            // announce_screened (NOT the low-level announce) so hostile
+            // magnet tr= URLs hit the same martian screen the engine's
+            // tier walk applies — without it, `tr=http://169.254.169.254/`
+            // would collect an info-hash + peer_id GET from this daemon.
+            match crate::tracker::announce_screened(url, &req, None, false, None).await {
                 Ok(resp) => {
                     // Daemon runs clearnet-only (no anonymous/proxy knobs),
                     // so the non-strict half applies TODAY: refuse the
