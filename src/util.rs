@@ -49,17 +49,31 @@ fn log_token(prefix: &str, data: &[u8], bytes: usize) -> String {
     format!("{prefix}:{}", hex(&out[..bytes]))
 }
 
+/// Normalize IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to plain IPv4. The same
+/// hazard [`is_dialable_ip`] guards against, on the log side: the kernel
+/// surfaces one peer as v4-mapped through an AF_INET6 socket and as plain
+/// v4 through another, and unnormalized tokens would split one peer into
+/// two unrelated log identities.
+fn log_canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
 /// Redact a peer address for logging: keyed per-run token, port dropped.
 /// Raw IPs in logs are an anonymity leak — a seized or leaked logfile
 /// reveals who we talked to; the token keeps intra-log correlation.
 #[must_use]
 pub fn redact_peer(addr: &SocketAddr) -> String {
-    log_token("peer", &addr.ip().to_string().into_bytes(), 5)
+    let ip = log_canonical_ip(addr.ip());
+    log_token("peer", &ip.to_string().into_bytes(), 5)
 }
 
 /// Redact a bare IP for logging (same scheme as [`redact_peer`]).
 #[must_use]
 pub fn redact_ip(ip: &IpAddr) -> String {
+    let ip = log_canonical_ip(*ip);
     log_token("ip", &ip.to_string().into_bytes(), 5)
 }
 
@@ -696,5 +710,17 @@ mod tests {
         }
         assert_eq!(body(&redact_ip(&ip)), body(&redact_peer(&addr)));
         assert!(!redact_ip(&ip).contains("203.0.113"));
+    }
+
+    #[test]
+    fn redact_peer_collapses_ipv4_mapped_ipv6_to_one_identity() {
+        let v4: SocketAddr = "203.0.113.7:51413".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:203.0.113.7]:51413".parse().unwrap();
+        // One peer surfacing through an AF_INET6 socket and an AF_INET
+        // socket must yield ONE token, or log correlation silently splits.
+        assert_eq!(redact_peer(&v4), redact_peer(&mapped));
+        // A genuinely different v6 address must NOT collapse onto it.
+        let real_v6: SocketAddr = "[2001:db8::7]:51413".parse().unwrap();
+        assert_ne!(redact_peer(&v4), redact_peer(&real_v6));
     }
 }
