@@ -85,7 +85,11 @@ sh
 ./target/release/rustytorrent magnet \
     "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=demo&tr=udp://tracker.example:6969" \
     --output ~/Downloads
-```
+
+# Magnets also support --select, --sequential, --max-down, etc.:
+./target/release/rustytorrent magnet \
+    "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=demo&tr=udp://tracker.example:6969" \
+    --output ~/Downloads --sequential --max-down 512
 
 ### Anonymity
 
