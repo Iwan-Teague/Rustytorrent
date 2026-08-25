@@ -371,17 +371,33 @@ pub fn advertised_port(anonymous: bool, proxied: bool, listen_port: u16) -> u16 
 /// values) into dialable ones and the number of refused martians, so the
 /// caller can log how many a hostile source tried to sneak past. See
 /// [`crate::util::is_dialable_peer_addr`] for the policy.
+/// Upper bound on peers retained from ONE ingestion event after the
+/// martian screen. A hostile tracker can pack ~700k compact addrs into a
+/// 4 MiB announce body; materializing every survivor spikes tens of MB
+/// on EVERY reannounce. Anything past this can never be dialed anyway —
+/// `try_connect_many` breaks at the session caps long before — so
+/// truncating here is functionally lossless and bounds the spike.
+const MAX_INGESTED_PEERS_PER_EVENT: usize = 1024;
+
 fn filter_dialable_peers(
     addrs: &[std::net::SocketAddr],
     strict: bool,
 ) -> (Vec<std::net::SocketAddr>, usize) {
-    let before = addrs.len();
-    let out: Vec<std::net::SocketAddr> = addrs
-        .iter()
-        .copied()
-        .filter(|a| crate::util::is_dialable_peer_addr(a, strict))
-        .collect();
-    let dropped = before - out.len();
+    // Single pass, bounded allocation: survivors are collected only up to
+    // MAX_INGESTED_PEERS_PER_EVENT while martian counting continues over
+    // the whole input so the `dropped` figure stays purely "refused by
+    // the screen" (call sites log it that way).
+    let mut out = Vec::with_capacity(addrs.len().min(MAX_INGESTED_PEERS_PER_EVENT));
+    let mut dropped = 0usize;
+    for a in addrs {
+        if crate::util::is_dialable_peer_addr(a, strict) {
+            if out.len() < MAX_INGESTED_PEERS_PER_EVENT {
+                out.push(*a);
+            }
+        } else {
+            dropped += 1;
+        }
+    }
     (out, dropped)
 }
 
@@ -2668,6 +2684,42 @@ mod tests {
             vec![parse("93.184.215.14:6881")],
             "only the public peer survives strict screening"
         );
+    }
+
+    /// A hostile tracker can pack ~700k compact addrs into one announce
+    /// body; the survivor list must be capped (bounded allocation every
+    /// reannounce) while `dropped` keeps counting ONLY martians over the
+    /// whole input — call sites log it as "unroutable", so overflow peers
+    /// must not inflate it.
+    #[test]
+    fn filter_dialable_peers_caps_survivors_and_keeps_martian_count_honest() {
+        use std::net::SocketAddr;
+        let public: Vec<SocketAddr> = (0..3000)
+            .map(|i| -> SocketAddr { format!("93.184.215.14:{}", 10000 + i).parse().unwrap() })
+            .collect();
+        let (kept, dropped) = filter_dialable_peers(&public, false);
+        assert_eq!(
+            kept.len(),
+            MAX_INGESTED_PEERS_PER_EVENT,
+            "survivor list must be capped"
+        );
+        assert_eq!(dropped, 0, "cap overflow is not a martian drop");
+
+        // Mixed input past the cap: martians after the cap still count.
+        let mut mixed = vec!["169.254.169.254:80".parse().unwrap()];
+        mixed.extend(public.iter().copied());
+        mixed.push("10.9.9.9:1".parse().unwrap()); // LAN kept on clearnet
+        let (kept, dropped) = filter_dialable_peers(&mixed, false);
+        assert_eq!(kept.len(), MAX_INGESTED_PEERS_PER_EVENT);
+        assert_eq!(dropped, 1, "only the link-local entry is a martian");
+        assert!(
+            !kept.contains(&"169.254.169.254:80".parse().unwrap()),
+            "martian must never appear among survivors"
+        );
+        // First-come order preserved: survivors are the earliest
+        // dialable entries, the LAN tail beyond the cap is cut.
+        assert_eq!(kept[0], "93.184.215.14:10000".parse().unwrap());
+        assert!(!kept.contains(&"10.9.9.9:1".parse().unwrap()));
     }
 
     /// The PEX ingestion branch is an anonymity control, so the HANDLER —
