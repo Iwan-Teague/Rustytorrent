@@ -245,6 +245,33 @@ mod tests {
     }
 
     #[test]
+    fn extension_bytes_dht_bit_sets_byte7_low() {
+        let r = extension_bytes_from(true, false);
+        assert_eq!(r[7] & 0x01, 0x01, "DHT bit must set byte 7 low");
+        assert_eq!(r[5] & 0x10, 0x00, "BEP 10 bit must not be set");
+        assert_eq!(r[7] & 0x04, 0x00, "fast-ext bit must not be set");
+    }
+
+    #[test]
+    fn extension_bytes_bep10_sets_byte5_and_fast() {
+        let r = extension_bytes_from(false, true);
+        // BEP 10: byte 5 bit 0x10.
+        assert_eq!(r[5] & 0x10, 0x10);
+        // BEP 6 fast extensions: byte 7 bit 0x04 (fingerprint parity
+        // with libtorrent).
+        assert_eq!(r[7] & 0x04, 0x04);
+        // DHT bit must NOT be set when dht_enabled=false.
+        assert_eq!(r[7] & 0x01, 0x00);
+    }
+
+    #[test]
+    fn extension_bytes_both_together_set_all_bits() {
+        let r = extension_bytes_from(true, true);
+        assert_eq!(r[5], 0x10, "byte 5 must have exactly BEP 10 bit");
+        assert_eq!(r[7], 0x05, "byte 7 must have DHT (0x01) + fast (0x04)");
+    }
+
+    #[test]
     fn supports_fast_extensions_detects_the_bit() {
         let yes = extension_bytes_from(false, true); // BEP 10 + BEP 6 together
         let no = extension_bytes_from(false, false); // neither
