@@ -99,6 +99,7 @@ rustytorrent download <file> [OPTIONS]
   --output DIR              destination directory (default: ".")
   --port N                  listen port (default: 6881); 0 = OS-assigned
                             free port (announces use the resolved port)
+  --version                 print version info
   --peer host:port          extra peer to dial directly (repeatable)
   --no-tracker              skip the .torrent's tracker list
   --dht                     enable BEP 5 DHT
