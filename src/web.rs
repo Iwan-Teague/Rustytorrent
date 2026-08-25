@@ -595,7 +595,7 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
         pool.sort();
         pool.dedup();
         if pool.is_empty() {
-            tracing::warn!(target: "web", info_hash = %crate::util::hex(&info_hash), "magnet add: no peers from trackers; giving up");
+            tracing::warn!(target: "web", info_hash = %crate::util::redact_info_hash(&info_hash), "magnet add: no peers from trackers; giving up");
             return;
         }
 
@@ -610,7 +610,7 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
         {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(target: "web", info_hash = %crate::util::hex(&info_hash), error = %e, "magnet add: metadata fetch failed");
+                tracing::warn!(target: "web", info_hash = %crate::util::redact_info_hash(&info_hash), error = %e, "magnet add: metadata fetch failed");
                 return;
             }
         };
@@ -640,10 +640,10 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
             .await
         {
             Some(ih) => {
-                tracing::info!(target: "web", info_hash = %crate::util::hex(&ih), "magnet add: session started")
+                tracing::info!(target: "web", info_hash = %crate::util::redact_info_hash(&ih), "magnet add: session started")
             }
             None => {
-                tracing::info!(target: "web", info_hash = %crate::util::hex(&info_hash), "magnet add: already running (raced)")
+                tracing::info!(target: "web", info_hash = %crate::util::redact_info_hash(&info_hash), "magnet add: already running (raced)")
             }
         }
     });

@@ -181,7 +181,7 @@ pub async fn fetch_metadata(
                 Err(e) => {
                     tracing::debug!(
                         target: "magnet",
-                        %addr,
+                        peer = %crate::util::redact_peer(&addr),
                         error = %e,
                         "ut_metadata fetch attempt failed"
                     );
@@ -251,7 +251,7 @@ async fn try_fetch_from(
         Ok(v) => return Ok(v),
         Err(e) if !looks_like_mse_signal(&e) => return Err(e),
         Err(_) => {
-            tracing::debug!(target: "magnet", %addr, "plain BT failed; retrying with MSE");
+            tracing::debug!(target: "magnet", peer = %crate::util::redact_peer(&addr), "plain BT failed; retrying with MSE");
         }
     }
 

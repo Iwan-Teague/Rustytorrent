@@ -181,7 +181,7 @@ pub async fn announce_with_fallback_anon(
             match announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await {
                 Ok(r) => return Ok((url.clone(), r)),
                 Err(e) => {
-                    tracing::warn!(url = %url, error = %e, "tracker announce failed");
+                    tracing::warn!(url = %redact_url_query(url), error = %e, "tracker announce failed");
                     last_err = Some(e);
                 }
             }
@@ -191,7 +191,7 @@ pub async fn announce_with_fallback_anon(
         match announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await {
             Ok(r) => return Ok((url.to_string(), r)),
             Err(e) => {
-                tracing::warn!(url = %url, error = %e, "tracker announce failed");
+                tracing::warn!(url = %redact_url_query(url), error = %e, "tracker announce failed");
                 last_err = Some(e);
             }
         }
@@ -361,6 +361,26 @@ mod tests {
         assert_eq!(
             redact_url_query("udp://t.example:6969/announce"),
             "udp://t.example:6969/announce"
+        );
+    }
+
+    #[test]
+    fn redact_url_query_strips_info_hash_param() {
+        // Announce URLs carry the info-hash in the query (raw or
+        // percent-encoded). The tracker-failure log sites render the URL
+        // through this redactor, so the hash must never survive it.
+        let ih = "3f4af8b1c2d3e4f5061728394a5b6c7d8e9f0a1b";
+        assert_eq!(
+            redact_url_query(&format!("http://t.example/an?info_hash={ih}")),
+            "http://t.example/an"
+        );
+        assert_eq!(
+            redact_url_query("udp://t.example:6969/an?info_hash=%3f%4a&x=1"),
+            "udp://t.example:6969/an"
+        );
+        assert!(
+            !redact_url_query(&format!("http://t.example/an?passkey=S&info_hash={ih}"))
+                .contains(ih)
         );
     }
 

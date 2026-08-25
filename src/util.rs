@@ -27,6 +27,50 @@ pub fn info_hash_from_hex(s: &str) -> Option<[u8; 20]> {
     Some(out)
 }
 
+/// Per-process pseudonymization key for log redaction. Regenerated every
+/// run, so the same peer/info-hash never yields the same token across two
+/// sessions (no long-term correlation from captured logs) while staying
+/// stable WITHIN one process (log lines about the same peer still join up).
+fn log_salt() -> &'static [u8; 16] {
+    use std::sync::OnceLock;
+    static SALT: OnceLock<[u8; 16]> = OnceLock::new();
+    SALT.get_or_init(rand::random::<[u8; 16]>)
+}
+
+/// Keyed-digest pseudonym: first `bytes` of SHA-1(key || data), hex.
+/// SHA-1 here is only a PRF over secret-salted input for log tokens —
+/// no protocol/security property rests on it.
+fn log_token(prefix: &str, data: &[u8], bytes: usize) -> String {
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    h.update(log_salt());
+    h.update(data);
+    let out = h.finalize();
+    format!("{prefix}:{}", hex(&out[..bytes]))
+}
+
+/// Redact a peer address for logging: keyed per-run token, port dropped.
+/// Raw IPs in logs are an anonymity leak — a seized or leaked logfile
+/// reveals who we talked to; the token keeps intra-log correlation.
+#[must_use]
+pub fn redact_peer(addr: &SocketAddr) -> String {
+    log_token("peer", &addr.ip().to_string().into_bytes(), 5)
+}
+
+/// Redact a bare IP for logging (same scheme as [`redact_peer`]).
+#[must_use]
+pub fn redact_ip(ip: &IpAddr) -> String {
+    log_token("ip", &ip.to_string().into_bytes(), 5)
+}
+
+/// Redact an info-hash for logging: keyed per-run token, full 160-bit
+/// value never rendered. Identifies "the torrent" within one log without
+/// revealing which torrent it actually is.
+#[must_use]
+pub fn redact_info_hash(ih: &[u8; 20]) -> String {
+    log_token("ih", ih, 5)
+}
+
 /// Create `path` (and parents) as a private directory: mode 0700 on Unix,
 /// so other local users cannot list our state (peer id, hosted torrents,
 /// DHT routing table). Best-effort on other platforms.
@@ -604,5 +648,53 @@ mod tests {
                 "{addr} refused under anonymity"
             );
         }
+    }
+
+    #[test]
+    fn redact_peer_hides_raw_ip_and_port() {
+        let v4: SocketAddr = "203.0.113.7:51413".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
+        for a in [v4, v6] {
+            let out = redact_peer(&a);
+            assert!(!out.contains("203.0.113"), "v4 leaked: {out}");
+            assert!(!out.contains("51413"), "port leaked: {out}");
+            assert!(!out.contains("2001:db8"), "v6 leaked: {out}");
+            assert!(out.starts_with("peer:"), "unexpected shape: {out}");
+        }
+    }
+
+    #[test]
+    fn redact_peer_stable_within_run_and_distinct_across_peers() {
+        let a: SocketAddr = "198.51.100.9:6881".parse().unwrap();
+        let b: SocketAddr = "198.51.100.10:6881".parse().unwrap();
+        // Same peer → same token, so one log's lines still join up.
+        assert_eq!(redact_peer(&a), redact_peer(&a));
+        // Different peers/ports → different tokens (no collisions here).
+        assert_ne!(redact_peer(&a), redact_peer(&b));
+    }
+
+    #[test]
+    fn redact_info_hash_hides_full_hex_but_is_deterministic() {
+        let ih = [0xABu8; 20];
+        let out = redact_info_hash(&ih);
+        let full = hex(&ih);
+        assert!(!out.contains(&full), "full hash leaked: {out}");
+        // No run of the hash's repeated byte pattern survives either.
+        assert!(!out.contains("ababab"), "partial hex leaked: {out}");
+        assert_eq!(out, redact_info_hash(&ih));
+        assert_ne!(out, redact_info_hash(&[0xCD; 20]));
+    }
+
+    #[test]
+    fn redact_ip_matches_redact_peer_scheme() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let addr = SocketAddr::new(ip, 1234);
+        // Port is dropped, so bare-IP and SocketAddr tokens share a body
+        // (prefixes differ: "ip:" vs "peer:").
+        fn body(s: &str) -> &str {
+            s.split_once(':').unwrap().1
+        }
+        assert_eq!(body(&redact_ip(&ip)), body(&redact_peer(&addr)));
+        assert!(!redact_ip(&ip).contains("203.0.113"));
     }
 }

@@ -199,7 +199,7 @@ pub async fn run_outgoing(
     utp: Option<Arc<UtpSocket>>,
     read_abort_cell: Option<Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>>>,
 ) -> Result<()> {
-    tracing::debug!(target: "peer", %addr, hops = proxies.len(), bind = ?bind_iface, utp = utp.is_some(), "dialing (plain)");
+    tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), hops = proxies.len(), bind = ?bind_iface, utp = utp.is_some(), "dialing (plain)");
     let iface = bind_iface.as_deref();
     let outcome = async {
         // Establish a transport (TCP, or a TCP+µTP race when µTP is
@@ -211,7 +211,7 @@ pub async fn run_outgoing(
                     .await
             }
             Err(e) if is_likely_mse_signal(&e) => {
-                tracing::debug!(target: "peer", %addr, reason = %e, "plain failed, retrying with MSE");
+                tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), reason = %e, "plain failed, retrying with MSE");
                 // Redial (racing again if µTP is on) and force MSE.
                 let transport = connect_transport(addr, utp.as_ref(), &proxies, iface, anonymous).await?;
                 let (reader, writer, theirs) =
@@ -301,7 +301,7 @@ pub async fn run_outgoing_mse_only(
     utp: Option<Arc<UtpSocket>>,
     read_abort_cell: Option<Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>>>,
 ) -> Result<()> {
-    tracing::debug!(target: "peer", %addr, hops = proxies.len(), bind = ?bind_iface, utp = utp.is_some(), "dialing (MSE-only)");
+    tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), hops = proxies.len(), bind = ?bind_iface, utp = utp.is_some(), "dialing (MSE-only)");
     let iface = bind_iface.as_deref();
     let outcome = async {
         let transport = connect_transport(addr, utp.as_ref(), &proxies, iface, anonymous).await?;
@@ -486,7 +486,7 @@ async fn race_tcp_utp(
             },
             r = &mut utp_fut, if !utp_done => match r {
                 Ok(s) => return Ok(Transport::Utp(s)),
-                Err(e) => { utp_done = true; last_err = Some(Error::Network(format!("utp connect {addr}: {e}"))); }
+                Err(e) => { utp_done = true; last_err = Some(Error::Network(format!("utp connect {}: {e}", crate::util::redact_peer(&addr)))); }
             },
             else => break,
         }
@@ -494,7 +494,12 @@ async fn race_tcp_utp(
             break;
         }
     }
-    Err(last_err.unwrap_or_else(|| Error::Network(format!("connect {addr}: no transport"))))
+    Err(last_err.unwrap_or_else(|| {
+        Error::Network(format!(
+            "connect {}: no transport",
+            crate::util::redact_peer(&addr)
+        ))
+    }))
 }
 
 /// Perform the plain BT handshake over an already-connected transport,
@@ -561,10 +566,16 @@ async fn dial_tcp(
         let effective: Vec<ProxyConfig> = proxies.iter().map(|p| p.for_dial()).collect();
         return socks5::connect_chain(&effective, addr, bind_iface)
             .await
-            .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}")));
+            .map_err(|e| {
+                Error::Network(format!(
+                    "socks5 dial {}: {e}",
+                    crate::util::redact_peer(&addr)
+                ))
+            });
     }
     match bind_iface {
         Some(iface) => {
+            let peer = crate::util::redact_peer(&addr);
             match timeout(
                 Duration::from_secs(10),
                 crate::netbind::connect_via_interface(addr, iface),
@@ -572,17 +583,20 @@ async fn dial_tcp(
             .await
             {
                 Ok(Ok(s)) => Ok(s),
-                Ok(Err(e)) => Err(Error::Network(format!("connect {addr} via {iface}: {e}"))),
+                Ok(Err(e)) => Err(Error::Network(format!("connect {peer} via {iface}: {e}"))),
                 Err(_) => Err(Error::Network(format!(
-                    "connect {addr} via {iface}: timeout"
+                    "connect {peer} via {iface}: timeout"
                 ))),
             }
         }
-        None => match timeout(Duration::from_secs(10), TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => Ok(s),
-            Ok(Err(e)) => Err(Error::Network(format!("connect {addr}: {e}"))),
-            Err(_) => Err(Error::Network(format!("connect {addr}: timeout"))),
-        },
+        None => {
+            let peer = crate::util::redact_peer(&addr);
+            match timeout(Duration::from_secs(10), TcpStream::connect(addr)).await {
+                Ok(Ok(s)) => Ok(s),
+                Ok(Err(e)) => Err(Error::Network(format!("connect {peer}: {e}"))),
+                Err(_) => Err(Error::Network(format!("connect {peer}: timeout"))),
+            }
+        }
     }
 }
 
@@ -941,7 +955,7 @@ where
         if let Err(e) = crate::peer::message::write_message(&mut writer, &msg).await {
             // Non-fatal — log and proceed; the peer still gets the
             // regular BT message stream, just without PEX.
-            tracing::debug!(target: "peer", %addr, error = %e, "ext handshake send failed");
+            tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), error = %e, "ext handshake send failed");
         }
     }
     let read_event_tx = event_tx.clone();
@@ -964,7 +978,7 @@ where
                 if matches!(msg, Message::Request { .. }) && !request_bucket.try_consume(1.0) {
                     tracing::debug!(
                         target: "peer",
-                        %addr,
+                        peer = %crate::util::redact_peer(&addr),
                         "request rate-limit hit; dropping Request frame"
                     );
                     continue;
@@ -993,7 +1007,7 @@ where
                                 }
                             }
                             Err(e) => {
-                                tracing::debug!(target: "peer", %addr, error = %e, "ext handshake parse");
+                                tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), error = %e, "ext handshake parse");
                             }
                         }
                         continue;
@@ -1011,7 +1025,7 @@ where
                             }
                             Ok(_) => {} // empty payload, nothing to do
                             Err(e) => {
-                                tracing::debug!(target: "peer", %addr, error = %e, "ut_pex parse");
+                                tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), error = %e, "ut_pex parse");
                             }
                         }
                         continue;

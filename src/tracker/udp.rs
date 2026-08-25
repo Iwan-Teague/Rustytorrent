@@ -36,7 +36,7 @@ pub async fn announce(
         .map_err(|e| Error::Tracker(format!("dns: {e}")))?
         .next()
         .ok_or_else(|| Error::Tracker("dns: no addrs".into()))?;
-    tracing::debug!(target: "tracker::udp", %addr, "announcing");
+    tracing::debug!(target: "tracker::udp", addr = %crate::util::redact_peer(&addr), "announcing");
 
     let bind_addr: SocketAddr = if addr.is_ipv4() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)

@@ -753,7 +753,7 @@ impl TorrentEngine {
                                         if !bucket.try_consume(1.0) {
                                             tracing::debug!(
                                                 target: "engine",
-                                                %addr,
+                                                peer = %crate::util::redact_peer(&addr),
                                                 "per-IP connect rate limit; dropping"
                                             );
                                             drop(s);
@@ -1261,7 +1261,7 @@ impl TorrentEngine {
                         .collect();
                     for ((piece, begin), addr) in stale {
                         tracing::debug!(
-                            target: "engine", %addr, piece, begin,
+                            target: "engine", peer = %crate::util::redact_peer(&addr), piece, begin,
                             "stale block request — releasing for re-request"
                         );
                         self.outstanding_requests.remove(&(piece, begin));
@@ -1335,13 +1335,13 @@ impl TorrentEngine {
                     match inbound {
                         crate::peer::inbound::Inbound::Raw(stream, addr) => {
                             if !peers.accept_incoming(stream, addr) {
-                                tracing::debug!(target: "engine", %addr, "incoming peer rejected");
+                                tracing::debug!(target: "engine", peer = %crate::util::redact_peer(&addr), "incoming peer rejected");
                             }
                         }
                         crate::peer::inbound::Inbound::Handshaken(p) => {
                             let addr = p.addr;
                             if !peers.accept_handshaken(p) {
-                                tracing::debug!(target: "engine", %addr, "handshaken peer rejected");
+                                tracing::debug!(target: "engine", peer = %crate::util::redact_peer(&addr), "handshaken peer rejected");
                             }
                         }
                     }
@@ -1514,7 +1514,7 @@ impl TorrentEngine {
                 reason,
                 violation,
             } => {
-                tracing::debug!(target: "engine", %addr, reason, violation, "peer disconnected");
+                tracing::debug!(target: "engine", peer = %crate::util::redact_peer(&addr), reason, violation, "peer disconnected");
                 if violation {
                     // Record under the IP, not the SocketAddr — a peer
                     // that reconnects from a fresh source port keeps
@@ -1561,7 +1561,7 @@ impl TorrentEngine {
                 } else {
                     tracing::debug!(
                         target: "engine",
-                        %addr,
+                        peer = %crate::util::redact_peer(&addr),
                         index,
                         begin,
                         "ignoring forged or out-of-range REJECT_REQUEST"
@@ -1638,7 +1638,7 @@ impl TorrentEngine {
                     .is_some_and(|(a, _)| a == &addr);
                 if !in_normal && !in_endgame {
                     tracing::debug!(
-                        target: "engine", %addr, index, begin,
+                        target: "engine", peer = %crate::util::redact_peer(&addr), index, begin,
                         "dropping unsolicited block"
                     );
                     self.maybe_request_blocks(addr, peers);
@@ -1653,7 +1653,7 @@ impl TorrentEngine {
                     Err(e) => {
                         // Protocol violation (bad offset, wrong size, out-of-range piece).
                         // Drop the peer rather than letting them keep us spinning.
-                        tracing::warn!(target: "engine", %addr, error = %e, "bad block from peer");
+                        tracing::warn!(target: "engine", peer = %crate::util::redact_peer(&addr), error = %e, "bad block from peer");
                         peers.ban(addr.ip());
                         self.cleanup_disconnected_peer(addr);
                         return Ok(());
@@ -1705,7 +1705,7 @@ impl TorrentEngine {
                             .await
                             .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
                     } else {
-                        tracing::warn!(target: "engine", index, %addr, "piece SHA1 mismatch — banning peer");
+                        tracing::warn!(target: "engine", index, peer = %crate::util::redact_peer(&addr), "piece SHA1 mismatch — banning peer");
                         self.pm.reset_piece(index as usize);
                         self.upload_cache.invalidate(index).await;
                         peers.ban(addr.ip());
@@ -1768,7 +1768,7 @@ impl TorrentEngine {
                 if self.cfg.anonymous || self.torrent.info.private {
                     tracing::debug!(
                         target: "engine",
-                        from = %addr,
+                        from = %crate::util::redact_peer(&addr),
                         n = pex_peers.len(),
                         "ignoring PEX (anonymous or private torrent)"
                     );
@@ -1782,7 +1782,7 @@ impl TorrentEngine {
                     if dropped > 0 {
                         tracing::debug!(
                             target: "engine",
-                            from = %addr,
+                            from = %crate::util::redact_peer(&addr),
                             dropped,
                             "dropped unroutable peer addresses from PEX"
                         );
@@ -1791,7 +1791,7 @@ impl TorrentEngine {
                     if started > 0 {
                         tracing::debug!(
                             target: "engine",
-                            from = %addr,
+                            from = %crate::util::redact_peer(&addr),
                             started,
                             "added peers from PEX"
                         );

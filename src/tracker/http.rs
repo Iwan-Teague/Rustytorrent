@@ -247,12 +247,18 @@ async fn announce_inner(
         None => None,
     };
     let url = build_url(base_url, req);
+    // The resolved source IP (interface pin or proxy-local address) must
+    // not land in logs verbatim — same exposure class as peer IPs.
+    let bound_ip = local_ip
+        .as_ref()
+        .map(crate::util::redact_ip)
+        .unwrap_or_else(|| "none".to_string());
     tracing::debug!(
         target: "tracker::http",
         url = %base_url,
         via_proxy = proxy.is_some(),
         ua_override = ua_override.is_some(),
-        bound_ip = ?local_ip,
+        bound_ip = %bound_ip,
         "announcing"
     );
     let client_owned;

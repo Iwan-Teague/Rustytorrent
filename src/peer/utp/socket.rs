@@ -635,7 +635,7 @@ impl Driver {
                 // than let a forged-source flood grow state without
                 // bound. The peer (if real) will retransmit; by then a
                 // half-open entry may have been reaped.
-                tracing::debug!(target: "utp", %peer, "connection cap reached; dropping inbound SYN");
+                tracing::debug!(target: "utp", peer = %crate::util::redact_peer(&peer), "connection cap reached; dropping inbound SYN");
             } else if let Some((conn, state)) = Connection::new_receiver(&pkt, now) {
                 let (dtx, drx) = mpsc::channel(DELIVER_QUEUE_MSGS);
                 let gate = SendGate::new();

@@ -423,7 +423,7 @@ async fn handle_datagram(state: &SharedState, sock: &UdpSocket, from: SocketAddr
     let msg = match Message::decode(bytes) {
         Ok(m) => m,
         Err(e) => {
-            tracing::trace!(target: "dht", %from, error = %e, "decode");
+            tracing::trace!(target: "dht", from = %crate::util::redact_peer(&from), error = %e, "decode");
             return;
         }
     };
@@ -436,7 +436,7 @@ async fn handle_datagram(state: &SharedState, sock: &UdpSocket, from: SocketAddr
             // queries spoofing a victim's IP all share that IP's bucket,
             // capping how much we can be made to reflect at the victim.
             if !state.allow_query_from(from.ip()).await {
-                tracing::trace!(target: "dht", %from, "inbound query rate limit; dropping");
+                tracing::trace!(target: "dht", from = %crate::util::redact_peer(&from), "inbound query rate limit; dropping");
                 return;
             }
             answer_query(state, sock, from, transaction_id, query).await

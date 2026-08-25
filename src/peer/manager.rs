@@ -235,7 +235,7 @@ impl PeerManager {
         if count >= VIOLATION_BAN_THRESHOLD {
             tracing::warn!(
                 target: "peer::manager",
-                %ip,
+                ip = %crate::util::redact_ip(&ip),
                 violations = count,
                 "protocol violations exceeded threshold; banning IP"
             );
@@ -244,7 +244,7 @@ impl PeerManager {
         }
         tracing::debug!(
             target: "peer::manager",
-            %ip,
+            ip = %crate::util::redact_ip(&ip),
             count,
             threshold = VIOLATION_BAN_THRESHOLD,
             "protocol violation recorded"
@@ -253,7 +253,7 @@ impl PeerManager {
     }
 
     pub fn ban(&mut self, ip: IpAddr) {
-        tracing::info!(target: "peer::manager", %ip, "banning peer");
+        tracing::info!(target: "peer::manager", ip = %crate::util::redact_ip(&ip), "banning peer");
         self.banned.insert(ip);
         let to_drop: Vec<SocketAddr> = self
             .peers
@@ -334,7 +334,7 @@ impl PeerManager {
         let global = match self.acquire_global() {
             Ok(g) => g,
             Err(()) => {
-                tracing::debug!(target: "peer", %addr, "global peer cap reached; not dialing");
+                tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), "global peer cap reached; not dialing");
                 return false;
             }
         };
@@ -381,7 +381,7 @@ impl PeerManager {
                 .await
             };
             if let Err(e) = res {
-                tracing::debug!(target: "peer", %addr, error = %e, "peer task ended");
+                tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), error = %e, "peer task ended");
             }
         });
         self.peers.insert(
@@ -432,7 +432,7 @@ impl PeerManager {
             )
             .await
             {
-                tracing::debug!(target: "peer", %addr, error = %e, "incoming peer task ended");
+                tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), error = %e, "incoming peer task ended");
             }
         });
         self.peers.insert(
@@ -480,7 +480,7 @@ impl PeerManager {
             )
             .await
             {
-                tracing::debug!(target: "peer", %addr, error = %e, "handshaken peer task ended");
+                tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), error = %e, "handshaken peer task ended");
             }
         });
         self.peers.insert(

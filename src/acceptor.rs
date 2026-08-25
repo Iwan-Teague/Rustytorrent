@@ -97,7 +97,7 @@ pub fn spawn(
                         .entry(ip)
                         .or_insert_with(|| TokenBucket::new(10.0, 1.0));
                     if !bucket.try_consume(1.0) {
-                        tracing::debug!(target: "acceptor", %addr, "per-IP connect rate limit; dropping");
+                        tracing::debug!(target: "acceptor", peer = %crate::util::redact_peer(&addr), "per-IP connect rate limit; dropping");
                         drop(s);
                         continue;
                     }
@@ -159,7 +159,7 @@ async fn route_plain(
     let theirs = match Handshake::decode(&buf) {
         Ok(h) => h,
         Err(e) => {
-            tracing::debug!(target: "acceptor", %addr, error = %e, "plain handshake decode failed");
+            tracing::debug!(target: "acceptor", peer = %crate::util::redact_peer(&addr), error = %e, "plain handshake decode failed");
             return false;
         }
     };
@@ -167,7 +167,7 @@ async fn route_plain(
     let tx = match registry.lock().await.get(&theirs.info_hash) {
         Some(tx) => tx.clone(),
         None => {
-            tracing::debug!(target: "acceptor", %addr, "plain: no session for info_hash; dropping");
+            tracing::debug!(target: "acceptor", peer = %crate::util::redact_peer(&addr), "plain: no session for info_hash; dropping");
             return false;
         }
     };
@@ -216,7 +216,7 @@ async fn route_mse(
     {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
-            tracing::debug!(target: "acceptor", %addr, error = %e, "mse incoming failed");
+            tracing::debug!(target: "acceptor", peer = %crate::util::redact_peer(&addr), error = %e, "mse incoming failed");
             return false;
         }
         Err(_) => return false,
