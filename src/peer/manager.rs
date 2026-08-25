@@ -112,7 +112,21 @@ pub struct PeerManager {
     /// `None` for a standalone single-torrent engine (only `max_peers`
     /// applies then).
     global_cap: Option<GlobalPeerCap>,
+    /// Addresses with an outgoing dial IN FLIGHT (spawned, handshake not
+    /// yet completed). The slot is inserted into `peers` immediately at
+    /// spawn time, so without this tracker a hostile peer/tracker/PEX
+    /// source feeding `max_peers` unreachable addresses would occupy ALL
+    /// peer slots with black-hole dials for a full connect timeout per
+    /// event — sustained starvation. The gate bounds how many dials can
+    /// be simultaneously pending; entries leave on establishment or
+    /// slot removal.
+    pending_dials: HashSet<SocketAddr>,
 }
+
+/// Upper bound on simultaneous unfinished OUTGOING handshakes. Generous
+/// for legitimate swarms (healthy peers establish in milliseconds), tight
+/// enough that a hostile address feed cannot monopolize peer slots.
+pub const MAX_PENDING_OUTGOING_DIALS: usize = 8;
 
 struct PeerSlot {
     handle: PeerHandle,
@@ -147,6 +161,7 @@ impl PeerManager {
             violations: HashMap::new(),
             utp: None,
             global_cap: None,
+            pending_dials: HashSet::new(),
         }
     }
 
@@ -293,6 +308,7 @@ impl PeerManager {
     }
 
     pub fn drop_peer(&mut self, addr: &SocketAddr) {
+        self.pending_dials.remove(addr);
         if let Some(slot) = self.peers.remove(addr) {
             // Kill the INNER read task too — see PeerSlot::read_abort.
             if let Some(h) = slot.read_abort.get() {
@@ -329,8 +345,16 @@ impl PeerManager {
         started
     }
 
-    /// Returns false if the global cap blocked the dial (no slot spawned).
+    /// Returns false if the global cap or the pending-dial gate blocked
+    /// the dial (no slot spawned).
     fn spawn_outgoing(&mut self, addr: SocketAddr) -> bool {
+        // Pending-dial gate FIRST: a hostile address feed must not be
+        // able to convert `max_peers` slots into simultaneous black-hole
+        // dials. See the field docs on `pending_dials`.
+        if self.pending_dials.len() >= MAX_PENDING_OUTGOING_DIALS {
+            tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), "too many pending outgoing dials; not dialing");
+            return false;
+        }
         let global = match self.acquire_global() {
             Ok(g) => g,
             Err(()) => {
@@ -384,6 +408,7 @@ impl PeerManager {
                 tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), error = %e, "peer task ended");
             }
         });
+        self.pending_dials.insert(addr);
         self.peers.insert(
             addr,
             PeerSlot {
@@ -394,6 +419,13 @@ impl PeerManager {
             },
         );
         true
+    }
+
+    /// Handshake for `addr` completed (engine forwards
+    /// `PeerEvent::Connected`): the dial is no longer pending, freeing a
+    /// gate slot. No-op for unknown/inbound addresses.
+    pub fn note_established(&mut self, addr: &SocketAddr) {
+        self.pending_dials.remove(addr);
     }
 
     /// Accept an inbound connection (TCP or µTP) from a peer and spawn
@@ -532,6 +564,54 @@ mod tests {
         m.ban(addr.ip());
         assert_eq!(m.connected_count(), 0);
         assert!(m.is_banned(&addr.ip()));
+    }
+
+    /// The pending-dial gate: `spawn_outgoing` inserts the peer slot at
+    /// DIAL time, so without a bound a hostile tracker/PEX feed of
+    /// unreachable addresses would occupy every peer slot with
+    /// black-hole dials for a full connect timeout per event — sustained
+    /// starvation across events. The gate caps simultaneous unfinished
+    /// outgoing handshakes; establishment ([`Self::note_established`])
+    /// or slot removal ([`Self::drop_peer`]) frees a slot.
+    #[tokio::test]
+    async fn pending_dial_gate_bounds_concurrent_outgoing_attempts() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut m = PeerManager::new([0u8; 20], [0u8; 20], tx);
+        let mk = |i: u8| -> SocketAddr { format!("10.9.{i}.1:6881").parse().unwrap() };
+
+        // First batch: exactly MAX_PENDING_OUTGOING_DIALS may spawn; the
+        // remainder are refused while every gate slot is pending.
+        let batch1: Vec<SocketAddr> = (0..MAX_PENDING_OUTGOING_DIALS as u8 * 2).map(mk).collect();
+        let started = m.try_connect_many(batch1);
+        assert_eq!(
+            started, MAX_PENDING_OUTGOING_DIALS,
+            "gate must cap concurrent unfinished outgoing handshakes"
+        );
+
+        // An entire second batch is refused while nothing establishes —
+        // this is the starvation the gate prevents from compounding.
+        let batch2: Vec<SocketAddr> = (100..130).map(mk).collect();
+        assert_eq!(m.try_connect_many(batch2), 0);
+
+        // Establishment (engine forwards PeerEvent::Connected) frees slots.
+        for i in 0..MAX_PENDING_OUTGOING_DIALS as u8 {
+            m.note_established(&mk(i));
+        }
+        let started2 = m.try_connect_many((200..210).map(mk));
+        assert_eq!(
+            started2, MAX_PENDING_OUTGOING_DIALS,
+            "freed gate slots must admit new dials"
+        );
+
+        // Failed dials leave via Disconnected → drop_peer, which must
+        // release the pending entry too.
+        m.drop_peer(&mk(200));
+        let probe = mk(250);
+        assert_eq!(
+            m.try_connect_many([probe]),
+            1,
+            "drop_peer must free a pending-dial slot"
+        );
     }
 
     #[test]

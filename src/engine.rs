@@ -1517,6 +1517,9 @@ impl TorrentEngine {
                 peer_id: _,
                 peer_reserved,
             } => {
+                // The dial is no longer pending: free its pending-dial
+                // gate slot so further dials can proceed.
+                peers.note_established(&addr);
                 self.peer_choking_us.insert(addr, true);
                 self.am_interested.insert(addr, false);
                 self.we_unchoked.insert(addr, false);
