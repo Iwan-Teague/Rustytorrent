@@ -59,10 +59,16 @@ fn same_redirect_origin(first: &reqwest::Url, next: &reqwest::Url) -> bool {
         == (next.host_str(), next.port_or_known_default())
 }
 
-fn build_direct_client(local_ip: Option<IpAddr>) -> reqwest::Client {
+fn build_direct_client(local_ip: Option<IpAddr>, strict: bool) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(same_host_redirect_policy())
+        // DNS-rebinding screen: a domain announce host is unjudgeable at
+        // the URL layer (see `is_dialable_url_host`), so every resolved
+        // address is vetted HERE before hyper dials it. Without this a
+        // rebinding domain could resolve to 169.254.169.254 mid-session
+        // and collect our info-hash + peer_id.
+        .dns_resolver(std::sync::Arc::new(ScreenedResolver { strict }))
         .user_agent(concat!("rustytorrent/", env!("CARGO_PKG_VERSION")));
     if let Some(ip) = local_ip {
         builder = builder.local_address(ip);
@@ -72,17 +78,64 @@ fn build_direct_client(local_ip: Option<IpAddr>) -> reqwest::Client {
         .expect("build static reqwest client with default config")
 }
 
-fn direct_client(local_ip: Option<IpAddr>) -> reqwest::Client {
+fn direct_client(local_ip: Option<IpAddr>, strict: bool) -> reqwest::Client {
     static CACHE: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = format!("{local_ip:?}");
+    // strict MUST be part of the key: it selects the resolver's policy,
+    // and a client cached under the wrong posture would screen (or allow)
+    // resolved addresses for the wrong session class.
+    let key = format!("{local_ip:?}#{strict}");
     let mut guard = cache.lock().expect("direct client cache mutex poisoned");
     if let Some(c) = guard.get(&key) {
         return c.clone();
     }
-    let client = build_direct_client(local_ip);
+    let client = build_direct_client(local_ip, strict);
     guard.insert(key, client.clone());
     client
+}
+
+/// DNS resolver that screens every resolved address through the same
+/// martian predicate as literal tracker URLs and peer dials. This closes
+/// the DNS-rebinding hole: `is_dialable_url_host` can only judge LITERAL
+/// IPs, so a hostile announce host that resolves to 169.254.169.254 (or
+/// any LAN/ULA range under `strict`) would otherwise sail past the URL
+/// screen at connect time. Proxied announces need none of this —
+/// `socks5h://` resolves REMOTELY through the tunnel, so no local
+/// resolution (and therefore no rebinding surface) ever happens.
+#[derive(Clone, Copy)]
+struct ScreenedResolver {
+    strict: bool,
+}
+
+impl reqwest::dns::Resolve for ScreenedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let strict = self.strict;
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), 0))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .collect();
+            let kept = filter_resolved(addrs, strict)?;
+            Ok(Box::new(kept.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Pure core of [`ScreenedResolver`] so the policy is unit-testable
+/// without the async machinery. Keeps only addresses the martian policy
+/// accepts; an empty survivor set fails CLOSED — a host resolving
+/// exclusively to refused ranges must not fall back to "dial something".
+fn filter_resolved(addrs: Vec<SocketAddr>, strict: bool) -> Result<Vec<SocketAddr>> {
+    let kept: Vec<SocketAddr> = addrs
+        .into_iter()
+        .filter(|a| crate::util::is_dialable_resolved_ip(&a.ip(), strict))
+        .collect();
+    if kept.is_empty() {
+        return Err(Error::Tracker(
+            "announce host resolved only to refused addresses".into(),
+        ));
+    }
+    Ok(kept)
 }
 
 fn build_proxied_client(proxy_url: &str, local_ip: Option<IpAddr>) -> reqwest::Client {
@@ -186,7 +239,8 @@ pub async fn announce_with_proxy(
     req: &AnnounceRequest,
     proxy: Option<&ProxyConfig>,
 ) -> Result<AnnounceResponse> {
-    announce_inner(base_url, req, proxy, None, None).await
+    let strict = proxy.is_some();
+    announce_inner(base_url, req, proxy, None, None, strict).await
 }
 
 /// User-Agent string we send when anonymized: matches libtorrent 2.0.9
@@ -211,7 +265,10 @@ pub async fn announce_with_proxy_anon(
     } else {
         None
     };
-    announce_inner(base_url, req, proxy, ua_override, bind_iface).await
+    // Strictness mirrors ingestion (engine::dht_martian_strict): anonymous
+    // OR any proxy leg means LAN/ULA resolved addresses are refused too.
+    let strict = anonymous || proxy.is_some();
+    announce_inner(base_url, req, proxy, ua_override, bind_iface, strict).await
 }
 
 /// Does the URL's *authority* (host) use an IPv6 literal (`[...]`)? Checked
@@ -273,6 +330,7 @@ async fn announce_inner(
     proxy: Option<&ProxyConfig>,
     ua_override: Option<&str>,
     bind_iface: Option<&str>,
+    strict: bool,
 ) -> Result<AnnounceResponse> {
     // Resolve the kill-switch interface to a source IP up front and fail
     // closed if it doesn't exist — before any DNS or socket work.
@@ -296,7 +354,7 @@ async fn announce_inner(
             };
             client_owned
         }
-        None => direct_client(local_ip),
+        None => direct_client(local_ip, strict),
     };
     let mut builder = client.get(&url);
     if let Some(ua) = ua_override {
@@ -474,6 +532,42 @@ fn parse_compact_v6(b: &[u8]) -> Result<Vec<SocketAddr>> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// The DNS-rebinding screen: a domain announce host passes
+    /// `is_dialable_url_host` unjudged, so EVERY address it resolves to
+    /// must be vetted here. Loopback stays allowed (explicit-config trust
+    /// class, mirrors the URL gate), link-local/multicast/unspecified are
+    /// always refused, LAN/ULA only under strict — and a host resolving
+    /// ONLY to refused ranges must fail closed instead of dialing.
+    #[test]
+    fn filter_resolved_enforces_martian_policy_and_fails_closed() {
+        let parse = |s: &str| -> SocketAddr { s.parse().expect("test addr must parse") };
+        let public = parse("93.184.215.14:443");
+        let loopback = parse("127.0.0.1:6881");
+        let linklocal = parse("169.254.169.254:80");
+        let lan = parse("10.0.0.5:6881");
+        let ula = parse("[fc00::1]:6881");
+        let mapped = parse("[::ffff:169.254.169.254]:80");
+
+        // Clearnet: martians dropped, public+loopback survive.
+        let kept = filter_resolved(vec![public, loopback, linklocal], false).unwrap();
+        assert_eq!(kept, vec![public, loopback]);
+
+        // Strict (anonymous/proxied): LAN/ULA additionally refused.
+        let kept = filter_resolved(vec![public, lan, ula], true).unwrap();
+        assert_eq!(kept, vec![public]);
+
+        // v4-mapped v6 wrapper of the metadata endpoint is judged as v4.
+        let kept = filter_resolved(vec![mapped], false);
+        assert!(
+            kept.is_err(),
+            "mapped metadata endpoint survived the screen"
+        );
+
+        // Fail closed: no survivor => error, never an empty dial set.
+        let err = filter_resolved(vec![linklocal, lan], true).unwrap_err();
+        assert!(err.to_string().contains("refused addresses"), "{err}");
+    }
 
     #[test]
     fn proxied_url_rotates_under_tor_stream_isolation() {

@@ -206,8 +206,11 @@ pub fn is_dialable_peer_addr(addr: &SocketAddr, strict: bool) -> bool {
 
 /// Judge a URL host string by the martian policy for ANNOUNCE targets.
 /// `host` comes from `Url::host_str()` — IPv6 arrives bracketed. Domain
-/// names cannot be judged without DNS resolution and pass; the dial-side
-/// netbind screen still covers whatever they resolve to. This is the SSRF
+/// names cannot be judged without DNS resolution and pass; whatever they
+/// RESOLVE to is screened at connect time by the tracker HTTP client's
+/// DNS resolver (`ScreenedResolver` in tracker/http.rs) through
+/// [`is_dialable_resolved_ip`] — without that, a rebinding domain could
+/// fetch 169.254.169.254 past this gate. This is the SSRF
 /// gate for tracker URLs: a hostile magnet's `tr=` parameter pointing at
 /// a cloud-metadata endpoint (`169.254.169.254`) must never turn our
 /// announce (which carries info-hash + peer_id) into an intranet pivot.
@@ -240,6 +243,18 @@ pub fn is_dialable_url_host(host: &str, strict: bool) -> bool {
         return true;
     }
     is_dialable_ip(&ip, strict)
+}
+
+/// IP form of the [`is_dialable_url_host`] policy, for judging addresses
+/// that DNS resolved from an otherwise-passing domain host: loopback is
+/// allowed (explicit-configuration trust class, same as the URL gate),
+/// everything else goes through [`is_dialable_ip`]. Used by the tracker
+/// HTTP client's DNS-rebinding screen.
+pub(crate) fn is_dialable_resolved_ip(ip: &IpAddr, strict: bool) -> bool {
+    if ip.is_loopback() {
+        return true;
+    }
+    is_dialable_ip(ip, strict)
 }
 
 /// Last-line-of-defense screen applied AT THE DIAL SYSCALL, independent
