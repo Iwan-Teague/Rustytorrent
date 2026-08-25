@@ -105,6 +105,19 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P1 — poisoned-block integrity path pinned end to end.** New
+  tests/poisoned_have.rs: an inbound peer claims a piece via HAVE, gets
+  unchoked, receives a REQUEST, and serves garbage. Asserts the engine
+  verifies + rejects the block, bans the IP, and closes BOTH connection
+  tasks promptly (closure within 6 s — deterministic now that
+  drop_peer aborts the inner read task too), that the honest pre-seeded
+  half of the file is untouched, and that not one poisoned byte reaches
+  disk. Mutation-checked: removing peers.ban() leaves the socket open
+  and fails with 'stayed open 6s after poisoning'. Harness lessons
+  encoded as comments: BT ids 2=INTERESTED/1=UNCHOKE (an earlier draft
+  sent id 3 NOT-interested and misparsed BITFIELD bytes as frames),
+  PIECE payload is index||begin||data with no length field, and reads
+  must use a sized buffer appended into an accumulator.
 - [x] **P1 — sandbox_smoke SIGSYS race (flaky full-suite failure).**
   [root-caused via strace under CPU load] sandbox_smoke's two tests both
   call engage(); libtest runs them concurrently, and whichever thread's
