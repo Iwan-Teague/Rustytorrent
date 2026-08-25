@@ -14,6 +14,22 @@ pub mod udp;
 /// protect. `scheme://host/path` keeps enough to identify the tracker.
 pub fn redact_url_query(url: &str) -> String {
     let base = url.split(['?', '#']).next().unwrap_or(url);
+    // Userinfo (user:pass@host): private trackers hand out announce URLs
+    // carrying credentials there too, so strip it exactly like the query.
+    let base = match base.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, after) = rest
+                .split_once('/')
+                .map_or((rest, None), |(a, t)| (a, Some(t)));
+            let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            match after {
+                Some(tail) => format!("{scheme}://{authority}/{tail}"),
+                None => format!("{scheme}://{authority}"),
+            }
+        }
+        // No scheme: leave as-is rather than guessing where the host ends.
+        None => base.to_string(),
+    };
     // URLs come from torrent files, i.e. from whoever authored the torrent.
     // Control characters (CRLF included) would let a crafted announce URL
     // forge additional lines in our logs; drop them.
@@ -381,6 +397,26 @@ mod tests {
         assert!(
             !redact_url_query(&format!("http://t.example/an?passkey=S&info_hash={ih}"))
                 .contains(ih)
+        );
+    }
+
+    #[test]
+    fn redact_url_query_strips_userinfo_credentials() {
+        // Announce URLs sometimes carry user:pass@ credentials in the
+        // authority; they must not survive into logs either.
+        assert_eq!(
+            redact_url_query("http://user:secret@t.example/announce?passkey=S"),
+            "http://t.example/announce"
+        );
+        // Userinfo without a path.
+        assert_eq!(
+            redact_url_query("http://user:secret@t.example"),
+            "http://t.example"
+        );
+        // An '@' in the PATH is not userinfo — host stays intact.
+        assert_eq!(
+            redact_url_query("http://t.example/a@b/c"),
+            "http://t.example/a@b/c"
         );
     }
 
