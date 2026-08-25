@@ -241,8 +241,19 @@ fn scrub_announce_error(msg: &str, full_url: &str, base_url: &str) -> String {
 
 /// Emit the "announcing" debug line. The configured announce URL may carry a
 /// passkey in its query (private trackers hand out such URLs), so it must be
-/// query-stripped exactly like every other place we display it.
-fn emit_announce_debug(base_url: &str, via_proxy: bool, ua_override: bool, bound_ip: &str) {
+/// query-stripped exactly like every other place we display it — and the
+/// kill-switch source IP is tokenized HERE, at the render site, so a caller
+/// can't accidentally hand us an untokenized address (same guard shape as
+/// dht's emit_listening_info).
+fn emit_announce_debug(
+    base_url: &str,
+    via_proxy: bool,
+    ua_override: bool,
+    bound_ip: Option<std::net::IpAddr>,
+) {
+    let bound_ip = bound_ip
+        .map(|ip| crate::util::redact_ip(&ip))
+        .unwrap_or_else(|| "none".to_string());
     tracing::debug!(
         target: "tracker::http",
         url = %crate::tracker::redact_url_query(base_url),
@@ -270,13 +281,7 @@ async fn announce_inner(
         None => None,
     };
     let url = build_url(base_url, req);
-    // The resolved source IP (interface pin or proxy-local address) must
-    // not land in logs verbatim — same exposure class as peer IPs.
-    let bound_ip = local_ip
-        .as_ref()
-        .map(crate::util::redact_ip)
-        .unwrap_or_else(|| "none".to_string());
-    emit_announce_debug(base_url, proxy.is_some(), ua_override.is_some(), &bound_ip);
+    emit_announce_debug(base_url, proxy.is_some(), ua_override.is_some(), local_ip);
     let client_owned;
     let client: reqwest::Client = match proxy {
         Some(p) => {
@@ -980,12 +985,36 @@ mod tests {
             .finish();
         let url = "http://tracker.example/announce.php?passkey=SUPERSECRET&info_hash=zz";
         tracing::subscriber::with_default(subscriber, || {
-            emit_announce_debug(url, false, false, "none");
+            emit_announce_debug(url, false, false, None);
         });
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         assert!(out.contains("announcing"), "{out}");
         assert!(out.contains("http://tracker.example/announce.php"), "{out}");
         assert!(!out.contains("SUPERSECRET"), "{out}");
         assert!(!out.contains("passkey"), "{out}");
+    }
+
+    /// The kill-switch source IP rides the same debug line. Tokenization
+    /// lives INSIDE the emit fn so a future caller passing a raw resolved
+    /// address still cannot land it in the log verbatim.
+    #[test]
+    fn announcing_debug_line_hides_bind_iface_source_ip() {
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer({
+                let sink = buf.clone();
+                move || sink.clone()
+            })
+            .finish();
+        let bound: std::net::IpAddr = "203.0.113.44".parse().unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            emit_announce_debug("http://tracker.example/announce", true, false, Some(bound));
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("announcing"), "{out}");
+        assert!(!out.contains("203.0.113.44"), "raw bind IP leaked: {out}");
+        assert!(!out.contains("203.0.113"), "{out}");
+        assert!(out.contains("ip:"), "{out}");
     }
 }
