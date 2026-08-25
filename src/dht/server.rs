@@ -106,7 +106,10 @@ pub(super) async fn spawn(
     tracing::info!(
         target: "dht",
         port = listen_port,
-        node_id = %local_id,
+        // The node ID is persisted across runs (dht::persist) — a stable
+        // identity, so it gets the same keyed-token treatment as peer IPs
+        // and info-hashes, never rendered raw.
+        node_id = %crate::util::redact_node_id(local_id.as_bytes()),
         warm_contacts,
         "dht listening"
     );

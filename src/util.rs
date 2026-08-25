@@ -85,6 +85,15 @@ pub fn redact_info_hash(ih: &[u8; 20]) -> String {
     log_token("ih", ih, 5)
 }
 
+/// Redact the DHT node ID for logging. The node ID is PERSISTED across
+/// runs (`dht::persist`), so unlike a per-run peer_id it is a stable
+/// long-term identity — rendering it raw would let any leaked logfile
+/// fingerprint this node across sessions.
+#[must_use]
+pub fn redact_node_id(id: &[u8; 20]) -> String {
+    log_token("nid", id, 5)
+}
+
 /// Create `path` (and parents) as a private directory: mode 0700 on Unix,
 /// so other local users cannot list our state (peer id, hosted torrents,
 /// DHT routing table). Best-effort on other platforms.
@@ -697,6 +706,20 @@ mod tests {
         assert!(!out.contains("ababab"), "partial hex leaked: {out}");
         assert_eq!(out, redact_info_hash(&ih));
         assert_ne!(out, redact_info_hash(&[0xCD; 20]));
+    }
+
+    #[test]
+    fn redact_node_id_hides_full_hex_but_is_deterministic() {
+        let id = [0x12u8; 20];
+        let out = redact_node_id(&id);
+        // NodeId's Display is lowercase hex; none of it may survive.
+        let full = hex(&id);
+        assert!(!out.contains(&full), "full node id leaked: {out}");
+        assert!(!out.contains("121212"), "partial hex leaked: {out}");
+        assert!(out.starts_with("nid:"), "{out}");
+        // Stable within a run (log correlation), distinct across IDs.
+        assert_eq!(out, redact_node_id(&id));
+        assert_ne!(out, redact_node_id(&[0x34; 20]));
     }
 
     #[test]
