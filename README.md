@@ -68,7 +68,18 @@ cargo build --release
 
 ### Magnet links
 
-```sh
+```
+
+**Selective download** — fetch only files whose path contains a substring:
+
+```bash
+# Download only files matching "ep1" from a multi-file torrent
+rustytorrent download show.torrent --output . --select ep1
+
+# Multiple patterns are OR'd together
+rustytorrent download show.torrent --output . --select ep1 --select ep2
+```
+sh
 # Magnet URI — fetches metadata from peers via DHT + ut_metadata, then
 # downloads as usual. DHT defaults to on for magnets.
 ./target/release/rustytorrent magnet \
