@@ -2642,6 +2642,137 @@ mod tests {
         );
     }
 
+    /// The PEX ingestion branch is an anonymity control, so the HANDLER —
+    /// not just `filter_dialable_peers` in isolation — must be pinned:
+    /// anonymous and private postures must attempt NOTHING, while clearnet
+    /// still runs the martian screen before any dial. ULA/RFC1918 entries
+    /// double as the strict-vs-clearnet asymmetry probes (dialable on a
+    /// genuine LAN swarm, refused under anonymity). The spawned dials are
+    /// never awaited: slot presence alone proves ingestion happened.
+    #[tokio::test]
+    async fn pex_ingestion_gated_by_posture_and_screened_on_clearnet() {
+        const PL: u64 = 16384;
+        let data = vec![0u8; PL as usize];
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(&data);
+        let ih: [u8; 20] = h.finalize().into();
+        let mk_torrent = |private: bool| crate::metainfo::TorrentFile {
+            info_hash: ih,
+            announce: None,
+            announce_list: vec![],
+            info: crate::metainfo::Info {
+                name: "pex-gate.bin".into(),
+                piece_length: PL,
+                piece_hashes: vec![ih],
+                files: crate::metainfo::TorrentFiles::Single { length: PL },
+                private,
+            },
+        };
+
+        let parse = |s: &str| -> SocketAddr { s.parse().expect("test addr must parse") };
+        let loopback = parse("127.0.0.1:6881");
+        let lan_v4 = parse("10.0.0.5:6881");
+        let ula_v6 = parse("[fc00::1]:6881");
+        let entries = vec![loopback, lan_v4, ula_v6];
+        let from: SocketAddr = parse("93.184.215.14:6881");
+
+        let (storage_tx, _storage_rx) = mpsc::channel::<StorageCommand>(1);
+        let assert_ingested = |peers: &PeerManager, want: bool, label: &str| {
+            for a in [loopback, lan_v4, ula_v6] {
+                assert_eq!(
+                    peers.handle(&a).is_some(),
+                    want && a != loopback,
+                    "{label}: wrong ingestion decision for {a}"
+                );
+            }
+        };
+
+        // Anonymous: PEX is ignored wholesale — no dial attempts at all.
+        let cfg = EngineConfig {
+            anonymous: true,
+            ..Default::default()
+        };
+        let mut eng = TorrentEngine::new(mk_torrent(false), [7u8; 20], cfg);
+        let (_event_tx, _event_rx) = mpsc::channel(1);
+        let mut peers = PeerManager::new(ih, [7u8; 20], _event_tx);
+        eng.handle_peer_event(
+            PeerEvent::Pex {
+                addr: from,
+                peers: entries.clone(),
+            },
+            &mut peers,
+            &storage_tx,
+        )
+        .await
+        .unwrap();
+        assert_ingested(&peers, false, "anonymous");
+
+        // Private torrent (BEP 27): same total ignore.
+        let cfg = EngineConfig::default();
+        let mut eng = TorrentEngine::new(mk_torrent(true), [7u8; 20], cfg);
+        let (_event_tx2, _event_rx2) = mpsc::channel(1);
+        let mut peers = PeerManager::new(ih, [7u8; 20], _event_tx2);
+        eng.handle_peer_event(
+            PeerEvent::Pex {
+                addr: from,
+                peers: entries.clone(),
+            },
+            &mut peers,
+            &storage_tx,
+        )
+        .await
+        .unwrap();
+        assert_ingested(&peers, false, "private");
+
+        // Clearnet: loopback martian dropped, site-local LAN targets kept.
+        let cfg = EngineConfig::default();
+        let mut eng = TorrentEngine::new(mk_torrent(false), [7u8; 20], cfg);
+        let (_event_tx3, _event_rx3) = mpsc::channel(1);
+        let mut peers = PeerManager::new(ih, [7u8; 20], _event_tx3);
+        eng.handle_peer_event(
+            PeerEvent::Pex {
+                addr: from,
+                peers: entries.clone(),
+            },
+            &mut peers,
+            &storage_tx,
+        )
+        .await
+        .unwrap();
+        assert_ingested(&peers, true, "clearnet");
+
+        // Proxied-but-not-anonymous derives STRICT screening like anonymous:
+        // LAN/ULA targets would aim our proxy at its own intranet.
+        let cfg = EngineConfig {
+            proxies: vec![crate::socks5::ProxyConfig {
+                addr: "127.0.0.1:1".parse().unwrap(),
+                credentials: None,
+                isolation: false,
+            }],
+            ..Default::default()
+        };
+        let mut eng = TorrentEngine::new(mk_torrent(false), [7u8; 20], cfg);
+        let (_event_tx4, _event_rx4) = mpsc::channel(1);
+        let mut peers = PeerManager::new(ih, [7u8; 20], _event_tx4);
+        eng.handle_peer_event(
+            PeerEvent::Pex {
+                addr: from,
+                peers: entries,
+            },
+            &mut peers,
+            &storage_tx,
+        )
+        .await
+        .unwrap();
+        for a in [loopback, lan_v4, ula_v6] {
+            assert!(
+                peers.handle(&a).is_none(),
+                "proxied posture ingested {a} — strict screening bypassed"
+            );
+        }
+    }
+
     #[test]
     fn inbound_wanted_truth_table() {
         // Plain clearnet session: listener allowed.
