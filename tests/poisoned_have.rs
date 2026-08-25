@@ -57,8 +57,12 @@ fn frame(id: u8, payload: &[u8]) -> Vec<u8> {
 async fn poisoned_inbound_seeder_is_banned_and_disk_stays_clean() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let piece0: Vec<u8> = (0..PIECE_LEN as usize).map(|i| (i % 251 + 1) as u8).collect();
-    let piece1: Vec<u8> = (0..PIECE_LEN as usize).map(|i| (i % 249 + 2) as u8).collect();
+    let piece0: Vec<u8> = (0..PIECE_LEN as usize)
+        .map(|i| (i % 251 + 1) as u8)
+        .collect();
+    let piece1: Vec<u8> = (0..PIECE_LEN as usize)
+        .map(|i| (i % 249 + 2) as u8)
+        .collect();
     let torrent = make_two_piece_torrent(&piece0, &piece1);
 
     // Malicious peer listens inbound; the leecher dials IT as the sole
@@ -81,15 +85,12 @@ async fn poisoned_inbound_seeder_is_banned_and_disk_stays_clean() {
     // resume scan verifies piece0 at startup, so the leecher starts as 1/2
     // complete and the attacker is the sole source for its only missing
     // piece.
-    std::fs::write(
-        tmp.join("poison.bin"),
-        {
-            let mut f = Vec::new();
-            f.extend_from_slice(&piece0);
-            f.extend(std::iter::repeat(0).take(PIECE_LEN as usize));
-            f
-        },
-    )
+    std::fs::write(tmp.join("poison.bin"), {
+        let mut f = Vec::new();
+        f.extend_from_slice(&piece0);
+        f.extend(std::iter::repeat_n(0, PIECE_LEN as usize));
+        f
+    })
     .unwrap();
 
     let leecher = TorrentEngine::new(torrent.clone(), [2u8; 20], cfg);
@@ -108,8 +109,27 @@ async fn poisoned_inbound_seeder_is_banned_and_disk_stays_clean() {
     sock.read_exact(&mut hs).await.unwrap();
     sock.write_all(&hs).await.unwrap();
 
+    // Phase 0 — UNSOLICITED block injection: push a garbage PIECE for
+    // the missing piece 1 BEFORE any REQUEST exists. The solicitation
+    // check must silently DROP it (no ban, no state change): if the check
+    // ever regresses, this block is accepted, SHA1-fails, and self-bans
+    // us — the subsequent interest dance below then times out and fails
+    // the test.
+    let mut junk = Vec::with_capacity(8 + PIECE_LEN as usize);
+    junk.extend_from_slice(&1u32.to_be_bytes());
+    junk.extend_from_slice(&0u32.to_be_bytes());
+    junk.extend(std::iter::repeat_n(0xDD, PIECE_LEN as usize));
+    sock.write_all(&frame(7, &junk)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Still connected and unbanned: prove it by round-tripping a PING-
+    // equivalent — send KEEPALIVE and expect the connection to stay usable
+    // (no EOF).
+    sock.write_all(&[0u8; 4]).await.unwrap();
+
     // Claim piece 1 via HAVE (id 4).
-    sock.write_all(&frame(4, &1u32.to_be_bytes())).await.unwrap();
+    sock.write_all(&frame(4, &1u32.to_be_bytes()))
+        .await
+        .unwrap();
 
     // Wait for INTERESTED (id 2), then REQUEST (id 6) for piece 1.
     // Reads go through a fixed buffer appended into `acc` \u2014 reading
@@ -120,11 +140,10 @@ async fn poisoned_inbound_seeder_is_banned_and_disk_stays_clean() {
     let mut saw_request: Option<(u32, u32, u32)> = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while std::time::Instant::now() < deadline && (!saw_interested || saw_request.is_none()) {
-        let n =
-            match tokio::time::timeout(Duration::from_millis(200), sock.read(&mut rbuf)).await {
-                Ok(Ok(n)) => n,
-                _ => continue,
-            };
+        let n = match tokio::time::timeout(Duration::from_millis(200), sock.read(&mut rbuf)).await {
+            Ok(Ok(n)) => n,
+            _ => continue,
+        };
         acc.extend_from_slice(&rbuf[..n]);
         loop {
             if acc.len() < 5 {
@@ -157,7 +176,10 @@ async fn poisoned_inbound_seeder_is_banned_and_disk_stays_clean() {
             acc.drain(..4 + len);
         }
     }
-    assert!(saw_interested, "engine never expressed interest in our claim");
+    assert!(
+        saw_interested,
+        "engine never expressed interest in our claim"
+    );
     let (r_index, r_begin, r_length) =
         saw_request.expect("engine never requested the claimed piece");
     assert_eq!(r_index, 1);
@@ -169,14 +191,14 @@ async fn poisoned_inbound_seeder_is_banned_and_disk_stays_clean() {
     let mut payload = Vec::with_capacity(8 + r_length as usize);
     payload.extend_from_slice(&r_index.to_be_bytes());
     payload.extend_from_slice(&r_begin.to_be_bytes());
-    payload.extend(std::iter::repeat(0xEE).take(r_length as usize));
+    payload.extend(std::iter::repeat_n(0xEE, r_length as usize));
     sock.write_all(&frame(7, &payload)).await.unwrap();
 
     // The engine must verify, fail, BAN our IP, and drop_peer aborts BOTH
     // tasks \u2014 so the socket must CLOSE promptly. A pure timeout here
     // means the socket is still open, i.e. the ban did not propagate.
     match tokio::time::timeout(Duration::from_secs(6), sock.read(&mut rbuf)).await {
-        Ok(Ok(_)) => {} // trailing frames then closure within the window
+        Ok(Ok(_)) => {}  // trailing frames then closure within the window
         Ok(Err(_)) => {} // reset: closed
         Err(_) => panic!("connection stayed open 6s after poisoning - peer not banned"),
     }
@@ -186,7 +208,11 @@ async fn poisoned_inbound_seeder_is_banned_and_disk_stays_clean() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let out = tokio::fs::read(tmp.join("poison.bin")).await.unwrap();
     assert_eq!(out.len(), 2 * PIECE_LEN as usize, "preallocated size");
-    assert_eq!(&out[..PIECE_LEN as usize], &piece0[..], "honest piece corrupted");
+    assert_eq!(
+        &out[..PIECE_LEN as usize],
+        &piece0[..],
+        "honest piece corrupted"
+    );
     assert!(
         out[PIECE_LEN as usize..].iter().all(|&b| b == 0),
         "poisoned bytes reached the output file"
