@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 
@@ -41,6 +41,13 @@ use crate::peer::transport::Transport;
 use crate::peer::utp::UtpSocket;
 use crate::peer_id::PeerId;
 use crate::ratelimit::TokenBucket;
+
+/// Global cap on concurrently in-flight inbound handshakes across ALL
+/// source IPs. The per-IP token bucket bounds one hostile host; this
+/// bounds a distributed one — every accepted connection otherwise holds
+/// a spawned task (socket + read buffer, plus a 768-bit DH modexp for
+/// MSE) for up to HANDSHAKE_TIMEOUT with no ceiling.
+pub const MAX_CONCURRENT_INBOUND_HANDSHAKES: usize = 64;
 
 /// 20-byte info-hash key.
 pub type InfoHash = [u8; 20];
@@ -71,6 +78,10 @@ pub fn spawn(
     peer_id: PeerId,
 ) -> JoinHandle<()> {
     // µTP accept loop (if a shared µTP socket was provided).
+    // Deliberately NOT gated by the handshake semaphore: every µTP stream
+    // already consumes a slot in the socket's own MAX_CONNS table (SYN
+    // floods are capped there — see utp::socket tests), so a second gate
+    // here would be dead weight.
     if let Some(u) = utp {
         let reg = registry.clone();
         tokio::spawn(async move {
@@ -94,6 +105,7 @@ async fn accept_loop(tcp: TcpListener, registry: Registry, peer_id: PeerId) {
     // Per-source-IP connect rate limit, mirroring the single-torrent
     // listener. Lazily-created buckets, GC'd to keep the map bounded on
     // a long-lived daemon.
+    let handshake_gate = Arc::new(Semaphore::new(MAX_CONCURRENT_INBOUND_HANDSHAKES));
     let mut buckets: HashMap<IpAddr, TokenBucket> = HashMap::new();
     let mut last_gc = Instant::now();
     loop {
@@ -113,8 +125,9 @@ async fn accept_loop(tcp: TcpListener, registry: Registry, peer_id: PeerId) {
                     last_gc = Instant::now();
                 }
                 let reg = registry.clone();
+                let gate = handshake_gate.clone();
                 tokio::spawn(async move {
-                    route_one(Transport::Tcp(s), addr, &reg, peer_id).await;
+                    route_one_gated(Transport::Tcp(s), addr, &reg, peer_id, &gate).await;
                 });
             }
             Err(e) => {
@@ -147,6 +160,25 @@ pub async fn route_one(
         // Anything else → assume MSE/PE; the peeked byte starts `Ya`.
         route_mse(stream, addr, registry, peer_id).await
     }
+}
+
+/// [`route_one`] behind the global handshake-concurrency gate: when the
+/// cap is exhausted the socket is dropped BEFORE any handshake work
+/// (fail-closed, same shape as the per-IP rate-limit drop). The permit is
+/// held for the whole handshake so saturated capacity means new peers
+/// wait-or-drop instead of stacking unbounded tasks.
+async fn route_one_gated(
+    stream: Transport,
+    addr: SocketAddr,
+    registry: &Registry,
+    peer_id: PeerId,
+    gate: &Semaphore,
+) -> bool {
+    let Ok(_permit) = gate.try_acquire() else {
+        tracing::debug!(target: "acceptor", peer = %crate::util::redact_peer(&addr), "handshake concurrency cap; dropping");
+        return false;
+    };
+    route_one(stream, addr, registry, peer_id).await
 }
 
 /// Plain BT: read the 68-byte handshake (the peek did not consume it),
@@ -337,6 +369,61 @@ mod tests {
             assert!(rx.recv().await.is_some(), "missing routed handshake");
         }
         assert!(rx.try_recv().is_err(), "gated connect leaked into routing");
+    }
+
+    /// The GLOBAL handshake-concurrency gate: a distributed flood must be
+    /// dropped BEFORE any handshake work (socket read, MSE DH modexp)
+    /// once the cap is exhausted — the per-IP bucket cannot see this
+    /// attacker shape. With capacity 0 every attempt is refused and
+    /// nothing reaches the session channel; adding one permit lets
+    /// exactly the next handshake through.
+    #[tokio::test]
+    async fn saturated_handshake_gate_drops_before_handshake_work() {
+        use tokio::io::AsyncWriteExt;
+
+        let ih = [0xCD; 20];
+        let (reg, mut rx) = registry_with(ih);
+        let gate = Semaphore::new(0);
+
+        for i in 0..3 {
+            let (server, mut client) = tcp_pair().await;
+            client
+                .write_all(&Handshake::new(ih, [7u8; 20]).encode())
+                .await
+                .unwrap();
+            let addr: SocketAddr = format!("10.9.9.{i}:6881").parse().unwrap();
+            let routed = route_one_gated(server, addr, &reg, [9u8; 20], &gate).await;
+            assert!(!routed, "attempt {i}: saturated gate routed a handshake");
+            assert!(
+                rx.try_recv().is_err(),
+                "attempt {i}: gated connection reached routing"
+            );
+        }
+
+        // Control: freeing a permit lets exactly the next handshake
+        // through end-to-end.
+        gate.add_permits(1);
+        let (server, mut client) = tcp_pair().await;
+        client
+            .write_all(&Handshake::new(ih, [7u8; 20]).encode())
+            .await
+            .unwrap();
+        let routed = route_one_gated(
+            server,
+            "10.9.9.99:6881".parse().unwrap(),
+            &reg,
+            [9u8; 20],
+            &gate,
+        )
+        .await;
+        assert!(routed, "control: available permit refused");
+        assert!(
+            timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .unwrap()
+                .is_some(),
+            "control handshake never delivered"
+        );
     }
 
     #[tokio::test]
