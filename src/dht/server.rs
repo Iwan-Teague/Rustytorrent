@@ -869,7 +869,7 @@ mod tests {
         // Drive the REAL recv loop so the rate-limit check in
         // handle_datagram is on the tested path.
         let recv_sock = server.clone();
-        let recv_state = state.clone();
+        let recv_state = Arc::clone(&state);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 1500];
             loop {
@@ -932,6 +932,49 @@ mod tests {
             bystander_replies, 5,
             "second IP must keep its own full budget (per-IP isolation)"
         );
+    }
+
+    #[tokio::test]
+    async fn token_validation_rejects_wrong_ip_and_bad_token() {
+        let state = SharedState::new(NodeId([0u8; 20]), false);
+
+        // Issue a token for IP A.
+        let ip_a: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let good_token = issue_token_for(&state, ip_a).await;
+
+        // Correct IP + correct token → valid.
+        assert!(
+            verify_token_for(&state, ip_a, &good_token).await,
+            "valid token must pass"
+        );
+
+        // A DIFFERENT loopback IP (127.0.0.2) produces a different token
+        // — proving the token is bound to the source IP, not just port.
+        let ip_other: SocketAddr = "127.0.0.2:9999".parse().unwrap();
+        assert!(
+            !verify_token_for(&state, ip_other, &good_token).await,
+            "token issued for A must be refused when checked against B"
+        );
+
+        // Garbage token → invalid.
+        assert!(
+            !verify_token_for(&state, ip_a, &[0xDE, 0xAD]).await,
+            "garbage token must be refused"
+        );
+
+        // Empty token → invalid.
+        assert!(
+            !verify_token_for(&state, ip_a, &[]).await,
+            "empty token must be refused"
+        );
+    }
+
+    async fn issue_token_for(state: &SharedState, addr: SocketAddr) -> Vec<u8> {
+        state.issue_token(addr).await
+    }
+
+    async fn verify_token_for(state: &SharedState, addr: SocketAddr, token: &[u8]) -> bool {
+        state.verify_token(addr, token).await
     }
 
     #[tokio::test]
