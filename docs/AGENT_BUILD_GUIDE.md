@@ -26,6 +26,9 @@
 - **No `unwrap()` in non-test code.** Use `?` and the typed `Error` enum in `src/error.rs`.
 - **Add a `tracing::debug!` or `tracing::info!` call to every function that does I/O or async work.** Future debugging depends on it.
 - **Keep `docs/TASKS.md` updated.** Mark `[x]` on tasks as you complete them.
+- **Run `cargo deny check` before adding dependencies.** New crates must pass advisories, bans, licenses, and sources checks (CI enforces this).
+- **Security-critical changes need mutation-tested coverage.** Write the test, then revert the production change to prove the test catches the regression.
+- **Update docs when behavior changes.** ANONYMITY.md, ARCHITECTURE.md, SECURITY_ROADMAP.md, and CHANGELOG.md should reflect reality after each feature or fix.
 
 ---
 
