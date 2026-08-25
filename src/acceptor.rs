@@ -83,40 +83,46 @@ pub fn spawn(
         });
     }
 
-    tokio::spawn(async move {
-        // B4 — per-source-IP connect rate limit, mirroring the
-        // single-torrent listener. Lazily-created buckets, GC'd to keep
-        // the map bounded on a long-lived daemon.
-        let mut buckets: HashMap<IpAddr, TokenBucket> = HashMap::new();
-        let mut last_gc = Instant::now();
-        loop {
-            match tcp.accept().await {
-                Ok((s, addr)) => {
-                    let ip = addr.ip();
-                    let bucket = buckets
-                        .entry(ip)
-                        .or_insert_with(|| TokenBucket::new(10.0, 1.0));
-                    if !bucket.try_consume(1.0) {
-                        tracing::debug!(target: "acceptor", peer = %crate::util::redact_peer(&addr), "per-IP connect rate limit; dropping");
-                        drop(s);
-                        continue;
-                    }
-                    if last_gc.elapsed() > Duration::from_secs(300) {
-                        buckets.retain(|_, b| b.available() < 9.0);
-                        last_gc = Instant::now();
-                    }
-                    let reg = registry.clone();
-                    tokio::spawn(async move {
-                        route_one(Transport::Tcp(s), addr, &reg, peer_id).await;
-                    });
+    tokio::spawn(accept_loop(tcp, registry, peer_id))
+}
+
+/// The TCP half of the shared acceptor. Extracted from `spawn` so the
+/// per-source-IP connect rate limit is drivable by a real-socket test:
+/// this gate is the only thing standing between one hostile IP and
+/// unbounded handshake work (B4), so deleting it must fail loudly.
+async fn accept_loop(tcp: TcpListener, registry: Registry, peer_id: PeerId) {
+    // Per-source-IP connect rate limit, mirroring the single-torrent
+    // listener. Lazily-created buckets, GC'd to keep the map bounded on
+    // a long-lived daemon.
+    let mut buckets: HashMap<IpAddr, TokenBucket> = HashMap::new();
+    let mut last_gc = Instant::now();
+    loop {
+        match tcp.accept().await {
+            Ok((s, addr)) => {
+                let ip = addr.ip();
+                let bucket = buckets
+                    .entry(ip)
+                    .or_insert_with(|| TokenBucket::new(10.0, 1.0));
+                if !bucket.try_consume(1.0) {
+                    tracing::debug!(target: "acceptor", peer = %crate::util::redact_peer(&addr), "per-IP connect rate limit; dropping");
+                    drop(s);
+                    continue;
                 }
-                Err(e) => {
-                    tracing::debug!(target: "acceptor", error = %e, "accept");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                if last_gc.elapsed() > Duration::from_secs(300) {
+                    buckets.retain(|_, b| b.available() < 9.0);
+                    last_gc = Instant::now();
                 }
+                let reg = registry.clone();
+                tokio::spawn(async move {
+                    route_one(Transport::Tcp(s), addr, &reg, peer_id).await;
+                });
+            }
+            Err(e) => {
+                tracing::debug!(target: "acceptor", error = %e, "accept");
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-    })
+    }
 }
 
 /// Handshake one inbound connection and route it to the matching session.
@@ -277,6 +283,60 @@ mod tests {
         let reg = new_registry();
         reg.try_lock().unwrap().insert(ih, tx);
         (reg, rx)
+    }
+
+    /// The per-IP connect gate is the only thing standing between one
+    /// hostile source address and unbounded per-connection handshake
+    /// work. This drives `accept_loop` over a REAL listener from ONE
+    /// source IP: the first `capacity` connects are routed, everything
+    /// after must be dropped BEFORE routing. Deleting or bypassing the
+    /// gate makes every connect succeed and fails the asserts loudly —
+    /// unlike a unit test on TokenBucket alone, this pins the wiring.
+    #[tokio::test]
+    async fn accept_loop_rate_limits_per_source_ip_end_to_end() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let ih = [0xCD; 20];
+        let (tx, mut rx) = mpsc::channel(64);
+        let reg = new_registry();
+        reg.try_lock().unwrap().insert(ih, tx);
+
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(accept_loop(l, reg.clone(), [9u8; 20]));
+
+        // Bucket: TokenBucket::new(10.0, 1.0). The whole loop runs in
+        // milliseconds, so the 1/s refill cannot smuggle an 11th token.
+        const ROUTED: usize = 10;
+        for i in 0..14 {
+            let c = TcpStream::connect(addr).await;
+            let mut c = match c {
+                Ok(c) => c,
+                Err(_) => {
+                    assert!(i >= ROUTED, "conn {i}: connect failed before the gate");
+                    continue;
+                }
+            };
+            c.write_all(&Handshake::new(ih, [7u8; 20]).encode())
+                .await
+                .unwrap();
+            let mut buf = [0u8; 68];
+            let replied = match timeout(Duration::from_millis(300), c.read_exact(&mut buf)).await {
+                Ok(Ok(n)) => n == 68,
+                _ => false, // timed out, EOF, or reset — the gate dropped us
+            };
+            assert_eq!(
+                replied,
+                i < ROUTED,
+                "conn {i}: wrong side of the rate-limit gate"
+            );
+        }
+
+        // Exactly the routed connections reached the session channel.
+        for _ in 0..ROUTED {
+            assert!(rx.recv().await.is_some(), "missing routed handshake");
+        }
+        assert!(rx.try_recv().is_err(), "gated connect leaked into routing");
     }
 
     #[tokio::test]
