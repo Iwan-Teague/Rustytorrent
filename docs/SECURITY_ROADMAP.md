@@ -118,6 +118,8 @@ are rejected up front in that mode.
   block integrity path covered end to end (`tests/poisoned_have.rs`).
 - ✅ **CI enforcement** — cargo-deny supply-chain job; linux release-profile
   test pass exercising overflow-checks.
+- ✅ **cargo audit (2026-08)** — zero known vulnerabilities across 253
+  dependency crates (RustSec advisory database).
 
 ### Hardening pass (2026-05-29)
 
