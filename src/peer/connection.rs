@@ -589,7 +589,7 @@ async fn dial_tcp(
 /// Drive the MSE handshake over an already-connected transport, then
 /// the BT handshake over the encrypted stream. Return the split
 /// RC4-wrapped halves.
-async fn mse_handshake_outgoing(
+pub async fn mse_handshake_outgoing(
     transport: Transport,
     info_hash: [u8; 20],
     peer_id: PeerId,
