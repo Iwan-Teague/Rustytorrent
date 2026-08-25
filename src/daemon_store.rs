@@ -122,6 +122,20 @@ impl DaemonStore {
         let _ = std::fs::remove_file(self.sidecar_path(info_hash));
     }
 
+    /// Render a skip-restore warning. The filename stem IS the hosted
+    /// torrent's info-hash hex — echoing the stem (or the path) would leak
+    /// WHICH torrents this daemon hosts into logs. Every render path lives
+    /// here so a revert to `%path.display()` fails the capture test.
+    fn emit_restore_skip(stem: &str, msg: &'static str, error: Option<&io::Error>) {
+        let entry = entry_label(stem);
+        match error {
+            Some(e) => {
+                tracing::warn!(target: "daemon", entry = %entry, error = %e, "skip restore: {msg}")
+            }
+            None => tracing::warn!(target: "daemon", entry = %entry, "skip restore: {msg}"),
+        }
+    }
+
     /// Load every persisted torrent. Entries that are malformed or missing
     /// their sidecar are skipped (logged), never fatal — one corrupt file
     /// must not stop the daemon from restoring the rest.
@@ -143,7 +157,7 @@ impl DaemonStore {
             let torrent_bytes = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!(target: "daemon", entry = %entry_label(&stem), error = %e, "skip restore: read failed");
+                    Self::emit_restore_skip(&stem, "read failed", Some(&e));
                     continue;
                 }
             };
@@ -154,7 +168,7 @@ impl DaemonStore {
             {
                 Some(s) => s,
                 None => {
-                    tracing::warn!(target: "daemon", entry = %entry_label(&stem), "skip restore: missing/invalid sidecar");
+                    Self::emit_restore_skip(&stem, "missing/invalid sidecar", None);
                     continue;
                 }
             };
@@ -223,6 +237,81 @@ mod tests {
         std::fs::write(dir.join("deadbeef.torrent"), b"x").unwrap();
         assert!(store.load_all().is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[derive(Clone)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The unit tests above pin `entry_label` in isolation — reverting a
+    /// warn SITE back to `file = %path.display()` would pass them while
+    /// leaking which torrents this daemon hosts on every restore skip.
+    /// This drives the real load_all path through both warn branches and
+    /// pins what actually lands in the log.
+    ///
+    /// Concurrency note: under a parallel test harness, tracing's GLOBAL
+    /// per-callsite interest cache can transiently drop an event while
+    /// other tests' subscribers churn dispatcher registrations (the
+    /// production daemon has exactly one subscriber and never hits this).
+    /// The capture therefore retries the load until both branch messages
+    /// have landed; the leak assertions run on EVERY attempt, so a revert
+    /// to raw-path logging fails immediately on the first attempt.
+    #[test]
+    fn load_all_warns_never_echo_info_hash_filenames() {
+        let ih1 = [0x11u8; 20];
+        let ih2 = [0x22u8; 20];
+        let hex1 = crate::util::hex(&ih1);
+        let hex2 = crate::util::hex(&ih2);
+
+        for attempt in 0..10u32 {
+            let dir = scratch();
+            // Read-failure branch: a DIRECTORY named <hash>.torrent makes
+            // fs::read fail (EISDIR) without embedding a path in io::Error's
+            // Display ("Is a directory (os error 21)").
+            std::fs::create_dir(dir.join(format!("{hex1}.torrent"))).unwrap();
+            // Missing-sidecar branch: valid bytes, no .json companion.
+            std::fs::write(dir.join(format!("{hex2}.torrent")), b"d4:infod...e").unwrap();
+
+            let store = DaemonStore::open(dir.clone()).unwrap();
+            let buf = SharedBuf(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer({
+                    let b = buf.clone();
+                    move || b.clone()
+                })
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(store.load_all().is_empty());
+            });
+
+            let logged = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
+            // Leak checks are unconditional: one dropped event is a harness
+            // race, but ONE leaked stem is the bug this test exists for.
+            assert!(
+                !logged.contains(&hex1),
+                "attempt {attempt}: read-failed warn leaked stem: {logged}"
+            );
+            assert!(
+                !logged.contains(&hex2),
+                "attempt {attempt}: sidecar warn leaked stem: {logged}"
+            );
+            let saw_read_fail = logged.contains("read failed") && logged.contains("ih:");
+            let saw_sidecar = logged.contains("missing/invalid sidecar") && logged.contains("ih:");
+            std::fs::remove_dir_all(&dir).ok();
+            if saw_read_fail && saw_sidecar {
+                return;
+            }
+        }
+        panic!("both skip-warn branches never landed after retries");
     }
 
     #[test]
