@@ -412,7 +412,8 @@ where
     let got: [u8; 20] = hasher.finalize().into();
     if got != info_hash {
         return Err(Error::Network(format!(
-            "fetched metadata hash mismatch: peer {addr} sent garbage that didn't verify"
+            "fetched metadata hash mismatch: peer {} sent garbage that didn't verify",
+            crate::util::redact_peer(&addr)
         )));
     }
     Ok(assembled)
@@ -511,7 +512,8 @@ async fn dial(
     let martian_strict = crate::engine::dht_martian_strict(anonymous, !proxies.is_empty());
     if !crate::util::is_safe_dial_target(&addr, martian_strict) {
         return Err(Error::Network(format!(
-            "refusing martian dial target {addr} (strict={martian_strict})"
+            "refusing martian dial target {} (strict={martian_strict})",
+            crate::util::redact_peer(&addr)
         )));
     }
     if !proxies.is_empty() {
@@ -528,8 +530,18 @@ async fn dial(
             socks5::connect_chain(&effective, addr, bind_iface),
         )
         .await
-        .map_err(|_| Error::Network(format!("socks5 dial {addr}: timeout")))?
-        .map_err(|e| Error::Network(format!("socks5 dial {addr}: {e}")));
+        .map_err(|_| {
+            Error::Network(format!(
+                "socks5 dial {}: timeout",
+                crate::util::redact_peer(&addr)
+            ))
+        })?
+        .map_err(|e| {
+            Error::Network(format!(
+                "socks5 dial {}: {e}",
+                crate::util::redact_peer(&addr)
+            ))
+        });
     }
     match bind_iface {
         Some(iface) => timeout(
@@ -537,12 +549,29 @@ async fn dial(
             crate::netbind::connect_via_interface(addr, iface),
         )
         .await
-        .map_err(|_| Error::Network(format!("connect {addr} via {iface}: timeout")))?
-        .map_err(|e| Error::Network(format!("connect {addr} via {iface}: {e}"))),
+        .map_err(|_| {
+            Error::Network(format!(
+                "connect {} via {iface}: timeout",
+                crate::util::redact_peer(&addr)
+            ))
+        })?
+        .map_err(|e| {
+            Error::Network(format!(
+                "connect {} via {iface}: {e}",
+                crate::util::redact_peer(&addr)
+            ))
+        }),
         None => timeout(DIAL_TIMEOUT, TcpStream::connect(addr))
             .await
-            .map_err(|_| Error::Network(format!("connect {addr}: timeout")))?
-            .map_err(|e| Error::Network(format!("connect {addr}: {e}"))),
+            .map_err(|_| {
+                Error::Network(format!(
+                    "connect {}: timeout",
+                    crate::util::redact_peer(&addr)
+                ))
+            })?
+            .map_err(|e| {
+                Error::Network(format!("connect {}: {e}", crate::util::redact_peer(&addr)))
+            }),
     }
 }
 
@@ -621,6 +650,11 @@ mod tests {
             msg.contains("via rn-no-such-iface-0"),
             "expected netbind-path error naming the iface, got: {msg}"
         );
+        // Same log path: the peer IP must be tokenized in dial errors.
+        assert!(
+            !msg.contains(&addr.ip().to_string()),
+            "raw addr leaked: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -654,6 +688,10 @@ mod tests {
             msg.contains("refusing martian dial target"),
             "expected martian refusal, got: {msg}"
         );
+        // The refusal reaches web magnet-add logs via error=%e — the raw
+        // address must never ride along in the message body.
+        assert!(!msg.contains("169.254"), "raw addr leaked: {msg}");
+        assert!(msg.contains("peer:"), "expected redacted token: {msg}");
 
         // Loopback exemption still holds for local bootstrap setups.
         let ok = dial("127.0.0.1:1".parse().unwrap(), &[], false, None)
@@ -661,7 +699,7 @@ mod tests {
             .unwrap_err();
         let msg2 = format!("{ok}");
         assert!(
-            msg2.contains("connect 127.0.0.1:1"),
+            msg2.contains("connect peer:") && msg2.contains("Connection refused"),
             "loopback must pass the screen and fail at connect instead, got: {msg2}"
         );
     }
