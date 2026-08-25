@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
 
 jobs:
   # Cross-platform build + test matrix. Catches Windows-specific path issues,
@@ -53,6 +54,9 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+      # Keep rustdoc links honest — broken intra-doc links fail the build.
+      - name: cargo doc
+        run: cargo doc --no-deps --locked
 
   # Supply chain — enforces deny.toml (RustSec advisories, banned/duplicate
   # crates, license allow-list, crate source restrictions) on every push
