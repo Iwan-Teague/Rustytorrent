@@ -268,8 +268,9 @@ struct SharedDownloadArgs {
     #[arg(long, value_name = "PORT")]
     web: Option<u16>,
     /// Selective download: only fetch files whose path contains this
-    /// substring (repeatable). Multi-file torrents only; omit to get
-    /// everything.
+    /// substring (repeatable; patterns are OR'd together, matching is
+    /// case-sensitive substring). Multi-file torrents only; omit to get
+    /// everything. Empty or whitespace-only values are rejected.
     #[arg(long = "select", value_name = "SUBSTR")]
     select: Vec<String>,
     /// Sequential download: fetch pieces in order (for streaming a
