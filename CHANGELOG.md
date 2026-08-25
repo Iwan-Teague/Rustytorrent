@@ -64,6 +64,9 @@ verification suite.
 - **`--max-down` / `--max-up` edge cases**: sub-8 KiB/s caps no longer
   stall transfers permanently (bucket capacity floored at one block), and
   an explicit `0` means unlimited as the help text always claimed.
+- **SIGTERM now triggers graceful shutdown** alongside Ctrl+C — process
+  managers (systemd, Docker) can stop the binary without losing in-flight
+  writes, tracker stopped-announces, or DHT routing-table state.
 - **`create` refuses zero-length inputs** (empty file, or directory of only
   empty files) instead of writing metainfo with zero piece hashes that no
   client can load.
