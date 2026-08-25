@@ -105,7 +105,20 @@ pub fn redact_node_id(id: &[u8; 20]) -> String {
 /// style spoofing of log files opened in terminals/editors).
 #[must_use]
 pub fn sanitize_remote_text(text: &str) -> String {
-    text.chars()
+    // Length bound: sanitization alone doesn't stop a hostile source from
+    // shipping megabytes of *printable* junk that we'd echo verbatim into
+    // our logs (tracker failure reasons ride bodies capped at 4 MiB).
+    // Real-world reasons/queries are far shorter than this.
+    const MAX_CHARS: usize = 512;
+    let truncated: String = if text.chars().count() > MAX_CHARS {
+        let mut t: String = text.chars().take(MAX_CHARS).collect();
+        t.push_str("..");
+        t
+    } else {
+        text.to_string()
+    };
+    truncated
+        .chars()
         .filter(|c| !c.is_control() && !is_invisible_or_directional(*c))
         .collect()
 }
@@ -914,5 +927,21 @@ mod tests {
         // filter must never become an over-broad ASCII fold.
         let normal = "привет ✅ 中文 emoji 🌊 keep";
         assert_eq!(sanitize_remote_text(normal), normal);
+    }
+
+    #[test]
+    fn sanitize_remote_text_bounds_length() {
+        // A hostile source can ship megabytes of printable junk (tracker
+        // failure reasons ride 4 MiB-capped bodies); the echo into logs
+        // must be bounded no matter how clean the bytes are.
+        let huge = "a".repeat(10_000);
+        let out = sanitize_remote_text(&huge);
+        assert_eq!(out.chars().count(), 514, "512 chars + '..' marker");
+        assert!(out.ends_with(".."), "{out:?}");
+        assert_eq!(&out[..512], &"a".repeat(512));
+
+        // Under the cap: byte-identical passthrough.
+        let short = "b".repeat(512);
+        assert_eq!(sanitize_remote_text(&short), short);
     }
 }

@@ -32,8 +32,21 @@ pub fn redact_url_query(url: &str) -> String {
     };
     // URLs come from torrent files, i.e. from whoever authored the torrent.
     // Control characters (CRLF included) would let a crafted announce URL
-    // forge additional lines in our logs; drop them.
-    base.chars().filter(|c| !c.is_control()).collect()
+    // forge additional lines in our logs; drop them. The path is also
+    // attacker-chosen (a hostile magnet's `tr=`), so bound its length —
+    // a megabyte-long path must not become a megabyte-long log line.
+    const MAX_CHARS: usize = 512;
+    let bounded = {
+        let filtered: String = base.chars().filter(|c| !c.is_control()).collect();
+        if filtered.chars().count() > MAX_CHARS {
+            let mut t: String = filtered.chars().take(MAX_CHARS).collect();
+            t.push_str("..");
+            t
+        } else {
+            filtered
+        }
+    };
+    bounded
 }
 
 /// Sanitize tracker-supplied free text (HTTP `failure reason`, BEP 15 error
@@ -484,6 +497,24 @@ mod tests {
         assert_eq!(out, "http://t.example/xINFO spoofed line");
         // Host and path survive; DEL (0x7F) is also a control char.
         assert_eq!(redact_url_query("http://h/p\u{7f}q"), "http://h/pq");
+    }
+
+    #[test]
+    fn redact_url_query_bounds_length() {
+        // The path is attacker-chosen (a hostile magnet's `tr=`); a
+        // megabyte path must not become a megabyte log line even though
+        // the query strip alone leaves it intact.
+        let long_path = format!("http://t.example/{}", "p".repeat(10_000));
+        let out = redact_url_query(&long_path);
+        assert_eq!(out.chars().count(), 514, "512 chars + '..' marker");
+        assert!(out.ends_with(".."));
+        assert!(out.starts_with("http://t.example/"));
+
+        // Query stripping still applies to bounded-length URLs.
+        let short = format!("http://t.example/a?passkey=SECRET{}", "q".repeat(600));
+        let out2 = redact_url_query(&short);
+        assert!(!out2.contains("SECRET"), "{out2}");
+        assert!(out2.chars().count() <= 514);
     }
 
     #[test]
