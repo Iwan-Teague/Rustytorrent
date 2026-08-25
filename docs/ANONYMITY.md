@@ -157,9 +157,10 @@ Tor caveats specific to high-volume P2P traffic:
   considerate of exit relay operators; don't seed long-term over Tor.
 - **Tor + heavy P2P has a checkered history.** Past clients (incl. some big
   ones) leaked the real IP through DHT or PEX even when nominally "torified".
-  This client closes DHT in `--anonymous` mode and never enabled PEX; we
-  believe the visible attack surface from `--socks5 --anonymous` is just the
-  outbound TCP connection through Tor's SOCKS port. If you find a leak vector,
+  This client closes DHT in `--anonymous` mode and ignores all PEX
+  messages (both incoming and outgoing) when anonymous; we believe the
+  visible attack surface from `--socks5 --anonymous` is just the outbound
+  TCP connection through Tor's SOCKS port. If you find a leak vector,
   open an issue.
 
 ---
