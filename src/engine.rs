@@ -1689,9 +1689,20 @@ impl TorrentEngine {
                         self.upload_cache.invalidate(index).await;
                         peers.ban(addr.ip());
                         self.picker.clear_assignment_if(&addr, index as usize);
+                        // Full teardown of the peer's engine-side state.
+                        // drop_peer (inside ban) aborts the outer peer
+                        // task, but the inner read task it spawned is an
+                        // independent tokio child: it survives holding the
+                        // reader half for up to READ_IDLE_TIMEOUT. Without
+                        // this cleanup the half-open peer's later events
+                        // (Have/Request/...) would keep hitting the engine
+                        // from a banned address.
+                        self.cleanup_disconnected_peer(addr);
                     }
                 }
-                self.maybe_request_blocks(addr, peers);
+                if !peers.is_banned(&addr.ip()) {
+                    self.maybe_request_blocks(addr, peers);
+                }
             }
             PeerEvent::Request {
                 addr,
@@ -2411,6 +2422,53 @@ mod tests {
             ..Default::default()
         }
         .martians_strict());
+    }
+
+    /// The SHA1-mismatch ban path must tear down ALL per-peer engine
+    /// state, not just drop the slot: drop_peer's task abort cannot reach
+    /// the independently spawned read task, so a half-open socket may keep
+    /// delivering events from the banned address for up to
+    /// READ_IDLE_TIMEOUT. Every lookup surface must therefore be empty
+    /// afterwards.
+    #[test]
+    fn sha1_fail_cleanup_wipes_all_per_peer_state() {
+        const PIECE_LEN: u64 = 16384;
+        let data = vec![0u8; PIECE_LEN as usize];
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(&data);
+        let digest: [u8; 20] = h.finalize().into();
+        let piece_hashes = vec![digest];
+        let torrent = crate::metainfo::TorrentFile {
+            info_hash: piece_hashes[0],
+            announce: None,
+            announce_list: vec![],
+            info: crate::metainfo::Info {
+                name: "cleanup.bin".into(),
+                piece_length: PIECE_LEN,
+                piece_hashes,
+                files: crate::metainfo::TorrentFiles::Single { length: PIECE_LEN },
+                private: false,
+            },
+        };
+        let cfg = EngineConfig::default();
+        let mut eng = TorrentEngine::new(torrent, [9u8; 20], cfg);
+
+        let addr: SocketAddr = "203.0.113.9:6881".parse().unwrap();
+        eng.we_unchoked.insert(addr, true);
+        eng.am_interested.insert(addr, false);
+        eng.peer_choking_us.insert(addr, true);
+        eng.inflight.insert(addr, 3);
+        eng.peer_pex_ids.insert(addr, 21);
+
+        eng.cleanup_disconnected_peer(addr);
+
+        assert!(!eng.we_unchoked.contains_key(&addr));
+        assert!(!eng.am_interested.contains_key(&addr));
+        assert!(!eng.peer_choking_us.contains_key(&addr));
+        assert!(!eng.inflight.contains_key(&addr));
+        assert!(!eng.peer_pex_ids.contains_key(&addr));
+        assert!(eng.picker.assignment(&addr).is_none());
     }
 
     #[test]

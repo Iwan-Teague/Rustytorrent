@@ -109,6 +109,17 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
   try_connect_many's skip of banned IPs (the "poisoned peer reconnects"
   path) had no coverage; mutation-checked that disabling the ban-list
   check fails the new pin.
+- [x] **P2 — SHA1-fail ban path now performs FULL engine-side state
+  teardown.** MITIGATION for the parked item below: drop_peer's abort
+  cannot reach the independently spawned read task, so a banned peer's
+  socket may stay half-open up to READ_IDLE_TIMEOUT — during which its
+  events would keep hitting the engine. The SHA1-mismatch branch now
+  calls cleanup_disconnected_peer() (choking/interest/inflight/PEX/picker/
+  outstanding all wiped), and the post-ban maybe_request_blocks is gated
+  on !is_banned. Pinned by sha1_fail_cleanup_wipes_all_per_peer_state;
+  mutation-checked (gutting the cleanup helper fails it). REMAINING OPEN:
+  the inner-read-task lifetime itself (socket stays half-open; harmless
+  but untidy) — needs an AbortHandle plumbed to the child task.
 - [ ] **OPEN (parked, needs investigation): post-ban socket lifetime.**
   While building a poisoned-block e2e, evidence showed `peers.ban()` /
   drop_peer aborts the OUTER peer task but the independently spawned
