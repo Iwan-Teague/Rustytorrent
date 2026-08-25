@@ -362,7 +362,7 @@ async fn announce_inner(
         ))
     })?;
     let bytes = read_bounded_body(resp, &url, base_url).await?;
-    parse_response(&bytes)
+    parse_response(&bytes, &url, base_url)
 }
 
 /// A hostile or MITM'd `http://` tracker can return an arbitrarily large
@@ -414,13 +414,20 @@ async fn read_bounded_body(
 /// separately by `reannounce_min`.
 const MAX_INTERVAL_SECS: u64 = 86_400;
 
-pub fn parse_response(body: &[u8]) -> Result<AnnounceResponse> {
+pub fn parse_response(body: &[u8], full_url: &str, base_url: &str) -> Result<AnnounceResponse> {
     let v = BencodeValue::parse_all(body).map_err(|e| Error::Tracker(format!("bencode: {e}")))?;
     let d = v
         .as_dict()
         .map_err(|e| Error::Tracker(format!("response: {e}")))?;
     if let Some(reason) = d.get(&b"failure reason".to_vec()) {
-        let msg = crate::tracker::sanitize_tracker_text(reason.as_str().unwrap_or("<non-utf8>"));
+        // A hostile tracker can echo OUR OWN announce URL back inside the
+        // failure reason (it saw the request), planting the info-hash,
+        // peer-id and any passkey query into our logs. Scrub BEFORE
+        // sanitize truncates: a URL cut in half would no longer match the
+        // exact-match replacement forms and its tail could survive.
+        let raw = reason.as_str().unwrap_or("<non-utf8>");
+        let msg =
+            crate::tracker::sanitize_tracker_text(&scrub_announce_error(raw, full_url, base_url));
         return Err(Error::Tracker(format!("failure: {msg}")));
     }
     let interval = d
@@ -796,7 +803,12 @@ mod tests {
         body.extend_from_slice(b"d8:intervali900e5:peers6:");
         body.extend_from_slice(&[1, 2, 3, 4, 0x1A, 0xE1]);
         body.push(b'e');
-        let r = parse_response(&body).unwrap();
+        let r = parse_response(
+            &body,
+            "http://t.example/announce",
+            "http://t.example/announce",
+        )
+        .unwrap();
         assert_eq!(r.interval, Duration::from_secs(900));
         assert_eq!(r.peers.len(), 1);
         assert_eq!(r.peers[0].to_string(), "1.2.3.4:6881");
@@ -805,7 +817,12 @@ mod tests {
     #[test]
     fn parse_response_failure_reason() {
         let body = b"d14:failure reason13:not authorizede";
-        assert!(parse_response(body).is_err());
+        assert!(parse_response(
+            body,
+            "http://t.example/announce",
+            "http://t.example/announce"
+        )
+        .is_err());
     }
 
     #[test]
@@ -817,7 +834,11 @@ mod tests {
         body.extend_from_slice(format!("{}:", reason.len()).as_bytes());
         body.extend_from_slice(reason.as_bytes());
         body.push(b'e');
-        let err = match parse_response(&body) {
+        let err = match parse_response(
+            &body,
+            "http://t.example/announce",
+            "http://t.example/announce",
+        ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("failure reason must be an error"),
         };
@@ -826,11 +847,41 @@ mod tests {
     }
 
     #[test]
+    fn failure_reason_echoing_announce_url_is_scrubbed() {
+        // A hostile tracker saw our full announce URL — query included.
+        // Echoing it inside `failure reason` must not plant the passkey
+        // (or info-hash/peer-id material) into our error text and logs.
+        // The URL is placed AFTER padding so this also pins the ordering:
+        // scrub runs BEFORE sanitize's length truncation, otherwise the
+        // cut-in-half URL would evade exact-match replacement.
+        let url = "http://t.example/announce?passkey=SECRET9&info_hash=%AB";
+        let reason = format!("rejected: {url}");
+        let mut body = b"d14:failure reason".to_vec();
+        body.extend_from_slice(format!("{}:", reason.len()).as_bytes());
+        body.extend_from_slice(reason.as_bytes());
+        body.push(b'e');
+        let base = "http://t.example/announce?passkey=SECRET9";
+        let err = match parse_response(&body, url, base) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("failure reason must be an error"),
+        };
+        assert!(err.contains("failure: "), "{err}");
+        assert!(!err.contains("SECRET9"), "passkey leaked: {err}");
+        assert!(!err.contains("passkey"), "query echoed: {err}");
+        assert!(err.contains("t.example"), "host should survive: {err}");
+    }
+
+    #[test]
     fn parse_response_clamps_hostile_interval() {
         // A hostile tracker returning i64::MAX must not yield an unbounded
         // Duration (which would later overflow the jitter math and panic).
         let body = b"d8:intervali9223372036854775807e12:min intervali9223372036854775807ee";
-        let r = parse_response(body).unwrap();
+        let r = parse_response(
+            body,
+            "http://t.example/announce",
+            "http://t.example/announce",
+        )
+        .unwrap();
         assert_eq!(r.interval, Duration::from_secs(MAX_INTERVAL_SECS));
         assert_eq!(r.min_interval, Some(Duration::from_secs(MAX_INTERVAL_SECS)));
     }
@@ -839,7 +890,12 @@ mod tests {
     fn parse_response_dict_peers() {
         // Non-compact: peers is a list of dicts.
         let body = b"d8:intervali600e5:peersld2:ip9:127.0.0.14:porti6881eeee";
-        let r = parse_response(body).unwrap();
+        let r = parse_response(
+            body,
+            "http://t.example/announce",
+            "http://t.example/announce",
+        )
+        .unwrap();
         assert_eq!(r.peers.len(), 1);
         assert_eq!(r.peers[0].to_string(), "127.0.0.1:6881");
     }
