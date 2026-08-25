@@ -125,6 +125,7 @@ pub fn is_dialable_peer_addr(addr: &SocketAddr, strict: bool) -> bool {
 /// derived by the caller (see `engine::dht_martian_strict`) so LAN/ULA
 /// targets are additionally refused whenever the session runs behind an
 /// anonymity tunnel.
+#[must_use = "a dial target that fails this screen must not be dialed"]
 pub fn is_safe_dial_target(addr: &SocketAddr, strict: bool) -> bool {
     if addr.ip().is_loopback() {
         return true;
