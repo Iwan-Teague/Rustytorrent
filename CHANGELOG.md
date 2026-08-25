@@ -70,6 +70,8 @@ verification suite.
 - Tracker announce response bodies are size-bounded (remote
   memory-exhaustion DoS); interval values clamped; cross-host redirects
   never followed; IPv6-literal detection corrected.
+- `--select ""` (or whitespace-only patterns) are rejected with an error
+  instead of silently matching every file.
 
 ### Performance
 
@@ -89,7 +91,9 @@ verification suite.
   mode socket audits via `/proc`, scripted hostile SOCKS5 proxies, and
   kernel-level proofs that anonymous engines own zero UDP/listening
   sockets. Security-critical fixes are mutation-checked against their
-  tests.
+  tests. Also pins the sandbox-smoke engage-once race (concurrent tests
+  racing PR_SET_NO_NEW_PRIVS against an installed filter) via a strace
+  root-cause.
 
 ### Added
 
@@ -100,3 +104,7 @@ verification suite.
 - `RUSTYTORRENT_SOCKS5_USER` / `RUSTYTORRENT_SOCKS5_PASS` environment
   fallbacks so proxy credentials need not sit in argv.
 - `--sandbox` support wired into the daemon subcommand (seccomp whitelist).
+- CI enforcement: cargo-deny supply-chain job (RustSec advisories, license
+  policy, source restrictions), a linux-only release-profile test pass
+  exercising overflow-checks, and rustdoc link hygiene via
+  `RUSTDOCFLAGS=-D warnings`.
