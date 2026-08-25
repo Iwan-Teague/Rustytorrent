@@ -117,6 +117,11 @@ pub struct PeerManager {
 struct PeerSlot {
     handle: PeerHandle,
     task: JoinHandle<()>,
+    /// AbortHandle for the connection's inner READ task. The outer task's
+    /// abort cannot cancel an independently spawned child; without this,
+    /// drop_peer would leave the banned peer's socket half-open for up to
+    /// READ_IDLE_TIMEOUT with its read loop still decoding frames.
+    read_abort: Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>>,
     /// Holds this peer's global-cap reservation, if any. Dropped with the
     /// slot, releasing the global slot on disconnect/ban/forget.
     _global: Option<GlobalPeerGuard>,
@@ -289,6 +294,10 @@ impl PeerManager {
 
     pub fn drop_peer(&mut self, addr: &SocketAddr) {
         if let Some(slot) = self.peers.remove(addr) {
+            // Kill the INNER read task too — see PeerSlot::read_abort.
+            if let Some(h) = slot.read_abort.get() {
+                h.abort();
+            }
             // Dropping `slot.handle` closes the cmd channel; combined with abort
             // this guarantees the peer task stops promptly. We deliberately skip
             // sending a Shutdown command — it would race with abort and adds no value.
@@ -338,15 +347,36 @@ impl PeerManager {
         let bind_iface = self.bind_iface.clone();
         let anonymous = self.anonymous;
         let utp = self.utp.clone();
+        let read_abort: Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let read_abort_task = read_abort.clone();
         let task = tokio::spawn(async move {
             let res = if force_mse {
                 run_outgoing_mse_only(
-                    addr, info_hash, peer_id, event_tx, cmd_rx, proxies, bind_iface, anonymous, utp,
+                    addr,
+                    info_hash,
+                    peer_id,
+                    event_tx,
+                    cmd_rx,
+                    proxies,
+                    bind_iface,
+                    anonymous,
+                    utp,
+                    Some(read_abort_task),
                 )
                 .await
             } else {
                 run_outgoing(
-                    addr, info_hash, peer_id, event_tx, cmd_rx, proxies, bind_iface, anonymous, utp,
+                    addr,
+                    info_hash,
+                    peer_id,
+                    event_tx,
+                    cmd_rx,
+                    proxies,
+                    bind_iface,
+                    anonymous,
+                    utp,
+                    Some(read_abort_task),
                 )
                 .await
             };
@@ -359,6 +389,7 @@ impl PeerManager {
             PeerSlot {
                 handle: cmd_tx,
                 task,
+                read_abort,
                 _global: global,
             },
         );
@@ -384,9 +415,20 @@ impl PeerManager {
         let peer_id = self.our_peer_id;
         let event_tx = self.event_tx.clone();
         let anonymous = self.anonymous;
+        let read_abort_in: Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let read_abort_task = read_abort_in.clone();
         let task = tokio::spawn(async move {
             if let Err(e) = crate::peer::connection::run_with_stream(
-                stream, addr, info_hash, peer_id, event_tx, cmd_rx, false, anonymous,
+                stream,
+                addr,
+                info_hash,
+                peer_id,
+                event_tx,
+                cmd_rx,
+                false,
+                anonymous,
+                Some(read_abort_task),
             )
             .await
             {
@@ -398,6 +440,7 @@ impl PeerManager {
             PeerSlot {
                 handle: cmd_tx,
                 task,
+                read_abort: read_abort_in,
                 _global: global,
             },
         );
@@ -424,9 +467,18 @@ impl PeerManager {
         let (cmd_tx, cmd_rx) = mpsc::channel(PER_PEER_CMD_BUFFER);
         let event_tx = self.event_tx.clone();
         let anonymous = self.anonymous;
+        let read_abort: Arc<tokio::sync::OnceCell<tokio::task::AbortHandle>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let read_abort_task = read_abort.clone();
         let task = tokio::spawn(async move {
-            if let Err(e) =
-                crate::peer::connection::run_handshaken(peer, event_tx, cmd_rx, anonymous).await
+            if let Err(e) = crate::peer::connection::run_handshaken(
+                peer,
+                event_tx,
+                cmd_rx,
+                anonymous,
+                Some(read_abort_task),
+            )
+            .await
             {
                 tracing::debug!(target: "peer", %addr, error = %e, "handshaken peer task ended");
             }
@@ -436,6 +488,7 @@ impl PeerManager {
             PeerSlot {
                 handle: cmd_tx,
                 task,
+                read_abort,
                 _global: global,
             },
         );

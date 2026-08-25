@@ -41,6 +41,7 @@ async fn two_peers_complete_bt_handshake_over_utp() {
             s_cmd_rx,
             false, // incoming
             false, // not anonymous
+            None,  // no read-abort plumbing needed in the smoke test
         )
         .await;
     });
@@ -58,8 +59,9 @@ async fn two_peers_complete_bt_handshake_over_utp() {
             client_id,
             c_ev_tx,
             c_cmd_rx,
-            true, // outgoing
-            false,
+            true,  // outgoing
+            false, // not anonymous
+            None,  // no read-abort plumbing needed in the smoke test
         )
         .await;
     });

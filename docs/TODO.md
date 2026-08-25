@@ -105,6 +105,16 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
 
 ## 1. Security & hardening
 
+- [x] **P1 — sandbox_smoke SIGSYS race (flaky full-suite failure).**
+  [root-caused via strace under CPU load] sandbox_smoke's two tests both
+  call engage(); libtest runs them concurrently, and whichever thread's
+  PR_SET_NO_NEW_PRIVS lands AFTER the other's TSYNC filter install gets
+  killed by that very filter (prctl is deliberately not allow-listed).
+  Historically won by luck; system load widened the race window.
+  DONE: engage-once-per-process pattern via an AtomicBool — the first
+  test installs, the second asserts engagement state instead of
+  re-running prctl under an active filter. Verified: 5 consecutive
+  solo runs plus loaded full-suite runs with zero SIGSYS.
 - [x] **P2 — ban-list re-dial refusal untested at the manager level.**
   try_connect_many's skip of banned IPs (the "poisoned peer reconnects"
   path) had no coverage; mutation-checked that disabling the ban-list
@@ -117,19 +127,12 @@ XOR-distance routing math, and the `Transport`/`UtpStream` `poll_*` impls.
   calls cleanup_disconnected_peer() (choking/interest/inflight/PEX/picker/
   outstanding all wiped), and the post-ban maybe_request_blocks is gated
   on !is_banned. Pinned by sha1_fail_cleanup_wipes_all_per_peer_state;
-  mutation-checked (gutting the cleanup helper fails it). REMAINING OPEN:
-  the inner-read-task lifetime itself (socket stays half-open; harmless
-  but untidy) — needs an AbortHandle plumbed to the child task.
-- [ ] **OPEN (parked, needs investigation): post-ban socket lifetime.**
-  While building a poisoned-block e2e, evidence showed `peers.ban()` /
-  drop_peer aborts the OUTER peer task but the independently spawned
-  inner read task survives holding the reader half — potentially keeping
-  a banned peer's TCP connection half-open for up to READ_IDLE_TIMEOUT
-  (300 s) and delaying PeerEvent::Disconnected indefinitely. An e2e
-  poisoned-block test was written but parked: it also exposed harness
-  complexity (loopback seeder+attacker share an IP, so banning one bans
-  both; PIECE frame header is 8 bytes not 12). Needs: inner-task abort
-  or read_done_rx-driven cleanup on drop_peer, then re-land the e2e.
+  mutation-checked (gutting the cleanup helper fails it). The inner-
+  read-task lifetime issue is CLOSED by f8af676: post_handshake_loop
+  publishes its read-task AbortHandle via a OnceCell stored in PeerSlot,
+  and drop_peer aborts BOTH tasks — banned sockets close promptly
+  instead of lingering half-open for READ_IDLE_TIMEOUT, and no further
+  events flow from the banned address.
 - [x] **P2 — `create` accepted zero-length inputs, writing unloadable
   torrents.** Empty files (or directories containing only empty files)
   produced zero piece hashes — metainfo our own loader rejects
