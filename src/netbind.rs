@@ -264,7 +264,10 @@ mod tests {
     /// doesn't honour pinning on this host" (environment).
     fn kernel_pinned_source(iface: &str) -> Option<IpAddr> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
-        socket.bind_device(Some(iface.as_bytes())).ok()?;
+        // Go through the module's own per-platform binder (SO_BINDTODEVICE
+        // on Linux, IP_BOUND_IF via index on macOS/BSD) instead of naming a
+        // Linux-only socket2 method directly.
+        bind_socket_to_interface(&socket, iface, true).ok()?;
         let remote: SocketAddr = "192.0.2.1:9".parse().expect("valid v4 TEST-NET addr");
         socket.connect(&remote.into()).ok()?;
         socket.local_addr().ok()?.as_socket().map(|a| a.ip())
