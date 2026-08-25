@@ -1150,6 +1150,49 @@ mod tests {
         state.verify_token(addr, token).await
     }
 
+    /// Pins the token ROTATION lifecycle: a token minted under the
+    /// previous salt stays valid for one grace window (peers may hold a
+    /// get_peers token across our rotation), but a token two generations
+    /// old must be refused — otherwise announce tokens would never
+    /// expire and could be replayed forever.
+    #[tokio::test]
+    async fn token_rotation_keeps_one_generation_grace_then_expires() {
+        let state = SharedState::new(NodeId([0u8; 20]), false);
+        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+
+        let t1 = issue_token_for(&state, addr).await; // salt gen1
+
+        // Age out the current generation so the NEXT issue rotates it.
+        {
+            let mut ts = state.token_state.lock().await;
+            ts.last_rotated = Instant::now() - TOKEN_TTL - Duration::from_secs(1);
+        }
+        let t2 = issue_token_for(&state, addr).await; // current=gen2, previous=gen1
+
+        // Grace window: gen1 token still accepted alongside gen2.
+        assert!(
+            verify_token_for(&state, addr, &t1).await,
+            "previous-generation token must stay valid across one rotation"
+        );
+        assert!(verify_token_for(&state, addr, &t2).await);
+
+        // Second rotation: t1 is now two generations old and must die.
+        {
+            let mut ts = state.token_state.lock().await;
+            ts.last_rotated = Instant::now() - TOKEN_TTL - Duration::from_secs(1);
+        }
+        let _t3 = issue_token_for(&state, addr).await; // current=gen3, previous=gen2
+
+        assert!(
+            !verify_token_for(&state, addr, &t1).await,
+            "two-generation-old token must be refused"
+        );
+        assert!(
+            verify_token_for(&state, addr, &t2).await,
+            "one-generation-old token must survive the second rotation"
+        );
+    }
+
     #[tokio::test]
     async fn query_rate_limit_caps_burst_from_one_ip() {
         let state = SharedState::new(NodeId([0u8; 20]), false);
