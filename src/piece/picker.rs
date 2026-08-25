@@ -176,6 +176,7 @@ impl Picker {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn mkbf(bits: &[bool]) -> BitVec<u8, Msb0> {
@@ -197,23 +198,83 @@ mod tests {
     }
 
     #[test]
-    fn sequential_mode_picks_index_zero_first() {
-        use crate::piece::PieceManager;
-        let pm = PieceManager::new(16384, 5 * 16384, 5);
-        let mut p = Picker::new(5);
+    fn add_have_updates_availability() {
+        let mut p = Picker::new(3);
         let a: SocketAddr = "1.1.1.1:1".parse().unwrap();
-        // All pieces equally available.
-        p.set_peer_bitfield(a, BitVec::repeat(true, 5));
+        p.set_peer_bitfield(a, mkbf(&[false, false, false]));
+        p.add_have(a, 1);
+        assert_eq!(p.availability(), &[0, 1, 0]);
+        // Re-adding same Have is idempotent.
+        p.add_have(a, 1);
+        assert_eq!(p.availability(), &[0, 1, 0]);
+    }
+
+    #[test]
+    fn forget_peer_drops_availability() {
+        let mut p = Picker::new(2);
+        let a: SocketAddr = "1.1.1.1:1".parse().unwrap();
+        p.set_peer_bitfield(a, mkbf(&[true, true]));
+        assert_eq!(p.availability(), &[1, 1]);
+        p.forget_peer(&a);
+        assert_eq!(p.availability(), &[0, 0]);
+    }
+
+    #[test]
+    fn pick_avoids_complete_pieces() {
+        let mut pm = PieceManager::new(16384, 32768, 2);
+        pm.mark_complete(0);
+        let mut p = Picker::new(2);
+        let a: SocketAddr = "1.1.1.1:1".parse().unwrap();
+        p.set_peer_bitfield(a, mkbf(&[true, true]));
+        assert_eq!(p.pick_for(&a, &pm, false), Some(1));
+    }
+
+    #[test]
+    fn pick_prefers_rarer_piece() {
+        let pm = PieceManager::new(16384, 49152, 3);
+        let mut p = Picker::new(3);
+        let a: SocketAddr = "1.1.1.1:1".parse().unwrap();
+        let b: SocketAddr = "2.2.2.2:2".parse().unwrap();
+        let c: SocketAddr = "3.3.3.3:3".parse().unwrap();
+        // Piece 0: all three have. Piece 1: only b. Piece 2: a + b.
+        p.set_peer_bitfield(a, mkbf(&[true, false, true]));
+        p.set_peer_bitfield(b, mkbf(&[true, true, true]));
+        p.set_peer_bitfield(c, mkbf(&[true, false, false]));
+        // Picking for b → rarest piece b has is piece 1 (availability=1).
+        assert_eq!(p.pick_for(&b, &pm, false), Some(1));
+    }
+
+    #[test]
+    fn sequential_picks_lowest_index_not_rarest() {
+        let pm = PieceManager::new(16384, 49152, 3);
+        let mut p = Picker::new(3);
         p.set_sequential(true);
+        let a: SocketAddr = "1.1.1.1:1".parse().unwrap();
+        let b: SocketAddr = "2.2.2.2:2".parse().unwrap();
+        let c: SocketAddr = "3.3.3.3:3".parse().unwrap();
+        // Make piece 2 the rarest (only b has it), piece 0 the commonest.
+        p.set_peer_bitfield(a, mkbf(&[true, false, true]));
+        p.set_peer_bitfield(b, mkbf(&[true, true, true]));
+        p.set_peer_bitfield(c, mkbf(&[true, false, false]));
+        // Rarest-first would pick 1 or 2 for b; sequential must pick 0
+        // (lowest index b has and we need), for in-order delivery.
+        assert_eq!(p.pick_for(&b, &pm, false), Some(0));
+    }
 
-        // Sequential must return the lowest-index missing piece (0).
-        assert_eq!(p.pick_for(&a, &pm, false), Some(0));
-
-        // Rarest-first with equal availability would also return 0, so
-        // instead prove the MODE is what drives it: flip to rarest-first
-        // and confirm no assertion about ordering is possible — but at
-        // least confirm the mode toggle itself doesn't break picking.
-        p.set_sequential(false);
-        assert!(p.pick_for(&a, &pm, false).is_some());
+    #[test]
+    fn sequential_mode_picks_index_zero_first() {
+        let pm = PieceManager::new(16384, 49152, 3);
+        let mut p = Picker::new(3);
+        p.set_sequential(true);
+        let a: SocketAddr = "1.1.1.1:1".parse().unwrap();
+        let b: SocketAddr = "2.2.2.2:2".parse().unwrap();
+        let c: SocketAddr = "3.3.3.3:3".parse().unwrap();
+        // Make piece 2 the rarest (only b has it), piece 0 the commonest.
+        p.set_peer_bitfield(a, mkbf(&[true, false, true]));
+        p.set_peer_bitfield(b, mkbf(&[true, true, true]));
+        p.set_peer_bitfield(c, mkbf(&[true, false, false]));
+        // Rarest-first would pick 1 or 2 for b; sequential must pick 0
+        // (lowest index b has and we need), for in-order delivery.
+        assert_eq!(p.pick_for(&b, &pm, false), Some(0));
     }
 }
