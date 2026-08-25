@@ -564,7 +564,10 @@ async fn cmd_download(
         max_up_bytes_per_sec: parse_rate_kib(max_up),
         utp_enabled: utp,
         web_port: web,
-        selected_files: select,
+        selected_files: {
+            validate_select_patterns(&select)?;
+            select
+        },
         sequential,
         ..Default::default()
     };
@@ -594,6 +597,19 @@ async fn cmd_download(
 /// perfect either (readable via `/proc/<pid>/environ` by the same user
 /// or root) but it stays out of the process argument list and shell
 /// history, which is the common-case exposure.
+/// Validate `--select` patterns: reject empty / whitespace-only entries.
+/// The matcher treats any pattern as a substring test, so `""` would
+/// silently match EVERY file — almost certainly not what the user meant
+/// by an empty selector.
+fn validate_select_patterns(selectors: &[String]) -> Result<()> {
+    for s in selectors {
+        if s.trim().is_empty() {
+            anyhow::bail!("--select patterns must not be empty or whitespace-only (got {s:?})");
+        }
+    }
+    Ok(())
+}
+
 /// Normalize a `--max-down`/`--max-up` value: KiB/s -> B/s, with `0`
 /// (and absence) meaning UNLIMITED. Without the zero-case, a rate-0
 /// token bucket would admit exactly one floored block and then stall
@@ -1285,7 +1301,10 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
         max_up_bytes_per_sec: parse_rate_kib(max_up),
         utp_enabled: utp,
         web_port: web,
-        selected_files: select,
+        selected_files: {
+            validate_select_patterns(&select)?;
+            select
+        },
         sequential,
         ..Default::default()
     };
@@ -1302,8 +1321,21 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
 mod tests {
     use super::{
         bootstrap_allows_tracker, effective_socks5_pass, effective_socks5_user, parse_rate_kib,
-        resolve_proxy_chain,
+        resolve_proxy_chain, validate_select_patterns,
     };
+
+    #[test]
+    fn validate_select_patterns_rejects_blank_entries() {
+        assert!(validate_select_patterns(&[]).is_ok());
+        assert!(validate_select_patterns(&["ep1".into()]).is_ok());
+        assert!(validate_select_patterns(&["a".into(), " b ".into()]).is_ok());
+        assert!(validate_select_patterns(&["".into()]).is_err());
+        assert!(validate_select_patterns(&["  ".into()]).is_err());
+        // One bad entry poisons the whole set — named in the error.
+        let err = validate_select_patterns(&["ok".into(), "".into()])
+            .expect_err("blank entry must be rejected");
+        assert!(format!("{err}").contains("whitespace-only"));
+    }
 
     #[test]
     fn parse_rate_kib_zero_means_unlimited() {
