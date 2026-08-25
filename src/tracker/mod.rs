@@ -230,7 +230,9 @@ fn tracker_url_dialable(url: &str, strict: bool) -> bool {
 /// controlled (hostile magnet `tr=`), so errors must not echo its path or
 /// query — scheme://host[:port] names the offender for log correlation
 /// without carrying anything an attacker planted.
-pub(crate) fn martian_url_label(url: &str) -> String {
+/// `pub` because the CLI binary crate logs the same host-only label for
+/// magnet-sourced tracker URLs as the daemon does.
+pub fn martian_url_label(url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(u) => match u.host_str() {
             Some(h) => match u.port() {
@@ -280,7 +282,7 @@ pub async fn announce_screened(
     if !tracker_url_dialable(url, strict) {
         tracing::warn!(
             target: "tracker",
-            url = %redact_url_query(url),
+            url = %martian_url_label(url),
             "tracker host refused by martian screen"
         );
         return Err(crate::error::Error::Tracker(format!(
@@ -336,7 +338,7 @@ async fn walk_tiers(
             if !tracker_url_dialable(url, strict) {
                 tracing::warn!(
                     target: "tracker",
-                    url = %redact_url_query(url),
+                    url = %martian_url_label(url),
                     "tracker host refused by martian screen"
                 );
                 last_err = Some(crate::error::Error::Tracker(format!(
@@ -348,7 +350,7 @@ async fn walk_tiers(
             match announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await {
                 Ok(r) => return Ok((url.clone(), r)),
                 Err(e) => {
-                    tracing::warn!(url = %redact_url_query(url), error = %e, "tracker announce failed");
+                    tracing::warn!(url = %martian_url_label(url), error = %e, "tracker announce failed");
                     last_err = Some(e);
                 }
             }
@@ -358,7 +360,7 @@ async fn walk_tiers(
         if !tracker_url_dialable(url, strict) {
             tracing::warn!(
                 target: "tracker",
-                url = %redact_url_query(url),
+                url = %martian_url_label(url),
                 "tracker host refused by martian screen"
             );
             return Err(crate::error::Error::Tracker(format!(
@@ -369,7 +371,7 @@ async fn walk_tiers(
         match announce_with_proxy_anon(url, req, proxy, anonymous, bind_iface).await {
             Ok(r) => return Ok((url.to_string(), r)),
             Err(e) => {
-                tracing::warn!(url = %redact_url_query(url), error = %e, "tracker announce failed");
+                tracing::warn!(url = %martian_url_label(url), error = %e, "tracker announce failed");
                 last_err = Some(e);
             }
         }

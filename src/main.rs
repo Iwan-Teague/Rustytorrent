@@ -1011,7 +1011,7 @@ async fn announce_magnet_tracker(
         Ok(resp) => {
             tracing::info!(
                 target: "magnet",
-                tracker = %rustytorrent::tracker::redact_url_query(url),
+                tracker = %rustytorrent::tracker::martian_url_label(url),
                 peers = resp.peers.len(),
                 "tracker bootstrap"
             );
@@ -1027,7 +1027,7 @@ async fn announce_magnet_tracker(
             TrackerOutcome::Dialed
         }
         Err(e) => {
-            tracing::warn!(target: "magnet", tracker = %rustytorrent::tracker::redact_url_query(url), error = %e, "tracker failed");
+            tracing::warn!(target: "magnet", tracker = %rustytorrent::tracker::martian_url_label(url), error = %e, "tracker failed");
             if e.to_string().contains("martian screen") {
                 TrackerOutcome::Screened
             } else {
@@ -1218,7 +1218,7 @@ async fn cmd_magnet(uri: String, dht: bool, shared: SharedDownloadArgs) -> Resul
             if !bootstrap_allows_tracker(url, anonymous) {
                 tracing::warn!(
                     target: "magnet",
-                    tracker = %rustytorrent::tracker::redact_url_query(url),
+                    tracker = %rustytorrent::tracker::martian_url_label(url),
                     "skipping cleartext http:// tracker under anonymous mode"
                 );
                 continue;
@@ -1438,6 +1438,85 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, TrackerOutcome::Dialed);
+    }
+
+    /// The bootstrap's failure log must not echo the hostile magnet's
+    /// attacker-chosen PATH — host-only label, the same policy as the
+    /// refusal sites inside tracker::announce_screened. Reverting the
+    /// render site back to redact_url_query would put `/latest/meta-data/`
+    /// (and up to 512 chars of attacker text) into our logs.
+    #[tokio::test]
+    async fn magnet_bootstrap_failure_log_hides_hostile_path() {
+        struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logged = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::level_filters::LevelFilter::WARN)
+            .with_writer({
+                let logged = logged.clone();
+                move || SharedBuf(logged.clone())
+            })
+            .finish();
+
+        let req = rustytorrent::tracker::AnnounceRequest {
+            info_hash: [0x42; 20],
+            peer_id: [0x24; 20],
+            port: 51413,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            event: rustytorrent::tracker::Event::Started,
+            num_want: 50,
+        };
+        let mut pool = Vec::new();
+        let fut = super::announce_magnet_tracker(
+            "http://169.254.169.254/latest/meta-data/",
+            &req,
+            None,
+            false,
+            None,
+            &mut pool,
+        );
+        tokio::pin!(fut);
+        // The refusal path completes without touching tokio internals
+        // (no dial happens), so polling under a noop waker inside the
+        // thread-local subscriber scope is safe here.
+        tracing::subscriber::with_default(subscriber, || {
+            use std::future::Future as _;
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            for _ in 0..100 {
+                match fut.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(outcome) => {
+                        assert_eq!(outcome, TrackerOutcome::Screened);
+                        return;
+                    }
+                    std::task::Poll::Pending => std::thread::yield_now(),
+                }
+            }
+            panic!("refusal future never resolved");
+        });
+
+        let logged = String::from_utf8_lossy(&logged.lock().unwrap()).into_owned();
+        assert!(
+            logged.contains("martian screen"),
+            "log missing refusal: {logged}"
+        );
+        assert!(
+            logged.contains("http://169.254.169.254"),
+            "host label expected in log: {logged}"
+        );
+        assert!(
+            !logged.contains("meta-data"),
+            "attacker-controlled path leaked into log: {logged}"
+        );
     }
 
     /// The helper must not just DIAL through the screen — it must apply
