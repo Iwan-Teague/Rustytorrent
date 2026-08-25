@@ -2431,6 +2431,46 @@ mod tests {
     /// READ_IDLE_TIMEOUT. Every lookup surface must therefore be empty
     /// afterwards.
     #[test]
+    fn throttle_buckets_created_when_rates_configured() {
+        // Pins that both throttle buckets exist when rates are set.
+        const PL: u64 = 16384;
+        let data = vec![0u8; PL as usize];
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(&data);
+        let ih: [u8; 20] = h.finalize().into();
+        let torrent = crate::metainfo::TorrentFile {
+            info_hash: ih,
+            announce: None,
+            announce_list: vec![],
+            info: crate::metainfo::Info {
+                name: "t.bin".into(),
+                piece_length: PL,
+                piece_hashes: vec![ih],
+                files: crate::metainfo::TorrentFiles::Single { length: PL },
+                private: false,
+            },
+        };
+        let cfg = EngineConfig {
+            max_down_bytes_per_sec: Some(1024),
+            max_up_bytes_per_sec: Some(2048),
+            ..Default::default()
+        };
+        let eng = TorrentEngine::new(torrent.clone(), [0u8; 20], cfg);
+        assert!(eng.download_bucket.is_some(), "download bucket missing");
+        assert!(eng.upload_bucket.is_some(), "upload bucket missing");
+
+        // Without rates configured, both should be None.
+        let cfg2 = EngineConfig {
+            output_dir: std::env::temp_dir(),
+            ..Default::default()
+        };
+        let eng2 = TorrentEngine::new(torrent.clone(), [0u8; 20], cfg2);
+        assert!(eng2.download_bucket.is_none());
+        assert!(eng2.upload_bucket.is_none());
+    }
+
+    #[test]
     fn sha1_fail_cleanup_wipes_all_per_peer_state() {
         const PIECE_LEN: u64 = 16384;
         let data = vec![0u8; PIECE_LEN as usize];
