@@ -348,6 +348,15 @@ impl PeerManager {
     /// Returns false if the global cap or the pending-dial gate blocked
     /// the dial (no slot spawned).
     fn spawn_outgoing(&mut self, addr: SocketAddr) -> bool {
+        // Self-defense against duplicate dials: overwriting a live slot
+        // would orphan the old task AND let its eventual Connected/
+        // Disconnected events tear down the REPLACEMENT slot's task.
+        // try_connect_many pre-checks this today, but the invariant
+        // belongs here so no future caller can bypass it.
+        if self.peers.contains_key(&addr) {
+            tracing::debug!(target: "peer", peer = %crate::util::redact_peer(&addr), "already connected/dialing; not re-dialing");
+            return false;
+        }
         // Pending-dial gate FIRST: a hostile address feed must not be
         // able to convert `max_peers` slots into simultaneous black-hole
         // dials. See the field docs on `pending_dials`.
@@ -578,6 +587,22 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut m = PeerManager::new([0u8; 20], [0u8; 20], tx);
         let mk = |i: u8| -> SocketAddr { format!("10.9.{i}.1:6881").parse().unwrap() };
+
+        // spawn_outgoing must refuse a duplicate live slot ITSELF: an
+        // overwrite would orphan the old task and let its Disconnected
+        // event kill the replacement slot's task.
+        {
+            let a = mk(250);
+            assert!(m.spawn_outgoing(a), "first dial for a fresh addr spawns");
+            assert!(
+                !m.spawn_outgoing(a),
+                "second dial for the SAME live slot must be refused"
+            );
+            assert_eq!(m.connected_count(), 1, "slot must not be duplicated");
+            // Free the gate slot so the batch math below stays exact.
+            m.drop_peer(&a);
+            assert_eq!(m.connected_count(), 0);
+        }
 
         // First batch: exactly MAX_PENDING_OUTGOING_DIALS may spawn; the
         // remainder are refused while every gate slot is pending.
