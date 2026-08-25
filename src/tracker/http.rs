@@ -96,6 +96,15 @@ fn build_proxied_client(proxy_url: &str, local_ip: Option<IpAddr>) -> reqwest::C
     if let Some(ip) = local_ip {
         builder = builder.local_address(ip);
     }
+    // SECURITY INVARIANT: this client must ride ONLY the explicit SOCKS5
+    // chain above. reqwest appends a system/env matcher (HTTP_PROXY/
+    // HTTPS_PROXY/ALL_PROXY) AFTER configured proxies when auto_sys_proxy
+    // is on, so `Proxy::all` matching every destination means the ambient
+    // matcher is never consulted — ordering is what protects anonymous
+    // announces. Do NOT "harden" this with `.no_proxy()`: it CLEARS the
+    // configured chain (client.rs:1428) and would silently dial trackers
+    // DIRECTLY. tests/proxied_tracker_announce.rs pins both halves of the
+    // invariant against live sockets.
     builder
         .proxy(proxy)
         .build()
