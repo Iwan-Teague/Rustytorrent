@@ -395,6 +395,11 @@ pub struct DaemonState {
     /// arbitrary host files. Startup positional torrents bypass this;
     /// they're trusted CLI input.
     pub torrent_dir: std::path::PathBuf,
+    /// Bounds how many magnet-add pipelines (tracker bootstrap → metadata
+    /// fetch → session insert) run at once. Each pipeline announces to up
+    /// to MAX_TRACKERS hosts sequentially, so N unbounded adds would mean
+    /// N×64 concurrent dial chains against whoever the magnet names.
+    pub magnet_gate: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 /// Daemon v1 runs clearnet-only, so tracker-supplied peers are screened
@@ -403,6 +408,11 @@ pub struct DaemonState {
 /// [`filter_daemon_peer_pool`] and its test cannot drift apart: if the
 /// daemon ever gains anonymity knobs this becomes `anonymous || proxied`.
 const DAEMON_MARTIANS_STRICT: bool = false;
+
+/// Cap on concurrently running magnet-add pipelines. Realistic UIs add a
+/// handful of torrents; anything beyond this queues on
+/// [`DaemonState::magnet_gate`] instead of stacking dial chains.
+pub const MAX_CONCURRENT_MAGNET_ADDS: usize = 4;
 
 /// Screen a tracker response's peer list before any daemon bootstrap dial.
 fn filter_daemon_peer_pool(peers: Vec<SocketAddr>) -> Vec<SocketAddr> {
@@ -582,97 +592,116 @@ async fn daemon_add_magnet(State(st): State<DaemonState>, body: String) -> impl 
     }
 
     let ih_hex = crate::util::hex(&info_hash);
-    tokio::spawn(async move {
-        // Tracker bootstrap. No proxy / non-anonymous in daemon v1.
-        let req = crate::tracker::AnnounceRequest {
-            info_hash,
-            peer_id: st.peer_id,
-            port: st.base_port,
-            uploaded: 0,
-            downloaded: 0,
-            left: 0, // metadata unknown at the magnet stage
-            event: crate::tracker::Event::Started,
-            num_want: 50,
-        };
-        let mut pool: Vec<SocketAddr> = Vec::new();
-        for url in &magnet.trackers {
-            // announce_screened (NOT the low-level announce) so hostile
-            // magnet tr= URLs hit the same martian screen the engine's
-            // tier walk applies — without it, `tr=http://169.254.169.254/`
-            // would collect an info-hash + peer_id GET from this daemon.
-            match crate::tracker::announce_screened(url, &req, None, false, None).await {
-                Ok(resp) => {
-                    // Daemon runs clearnet-only (no anonymous/proxy knobs),
-                    // so the non-strict half applies TODAY: refuse the
-                    // martians a tracker can hand us (loopback, link-local
-                    // metadata endpoint, multicast, ...). The constant makes
-                    // the implicit coupling explicit and greppable: if the
-                    // daemon ever gains anonymity knobs, replace with
-                    // strict = anonymous || proxied like the engine does.
-                    pool.extend(filter_daemon_peer_pool(resp.peers));
-                }
-                Err(e) => {
-                    tracing::debug!(target: "web", tracker = %crate::tracker::redact_url_query(url), error = %e, "magnet tracker bootstrap failed")
-                }
-            }
-        }
-        pool.sort();
-        pool.dedup();
-        if pool.is_empty() {
-            tracing::warn!(target: "web", info_hash = %crate::util::redact_info_hash(&info_hash), "magnet add: no peers from trackers; giving up");
-            return;
-        }
-
-        let info_bytes = match crate::peer::metadata_fetch::fetch_metadata(
-            info_hash,
-            pool,
-            Vec::new(),
-            false,
-            None,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(target: "web", info_hash = %crate::util::redact_info_hash(&info_hash), error = %e, "magnet add: metadata fetch failed");
-                return;
-            }
-        };
-        let torrent = match crate::metainfo::TorrentFile::from_info_dict_bytes(
-            &info_bytes,
-            info_hash,
-            magnet.trackers.clone(),
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(target: "web", error = %e, "magnet add: info dict parse/verify failed");
-                return;
-            }
-        };
-        // Assemble `.torrent` bytes (info dict verbatim → info_hash
-        // preserved) so the daemon can persist + resume this magnet add.
-        let raw_torrent = assemble_torrent_bytes(&info_bytes, &magnet.trackers);
-        let cfg = crate::engine::EngineConfig {
-            output_dir: st.output.clone(),
-            listen_port: st.base_port,
-            enable_dht: !st.no_dht,
-            ..Default::default()
-        };
-        match st
-            .mgr
-            .add_persistent(torrent, st.peer_id, cfg, &raw_torrent)
-            .await
-        {
-            Some(ih) => {
-                tracing::info!(target: "web", info_hash = %crate::util::redact_info_hash(&ih), "magnet add: session started")
-            }
-            None => {
-                tracing::info!(target: "web", info_hash = %crate::util::redact_info_hash(&info_hash), "magnet add: already running (raced)")
-            }
-        }
-    });
+    tokio::spawn(magnet_bootstrap(st, magnet));
 
     (StatusCode::ACCEPTED, ih_hex)
+}
+
+/// The spawned half of [`daemon_add_magnet`]: tracker bootstrap →
+/// metadata fetch → session insert. Standalone fn so the concurrency gate
+/// is unit-testable without going through HTTP. Takes the whole state by
+/// value — the handler is done with it.
+///
+/// The FIRST thing it does is queue on `st.magnet_gate`: every pipeline
+/// announces to up to MAX_TRACKERS hosts sequentially, so unbounded
+/// concurrent adds would stack unbounded dial chains.
+pub async fn magnet_bootstrap(st: DaemonState, magnet: crate::magnet::MagnetLink) {
+    let _permit = st
+        .magnet_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("daemon magnet gate semaphore closed");
+    let info_hash = magnet.info_hash;
+    // Tracker bootstrap. No proxy / non-anonymous in daemon v1.
+    let req = crate::tracker::AnnounceRequest {
+        info_hash,
+        peer_id: st.peer_id,
+        port: st.base_port,
+        uploaded: 0,
+        downloaded: 0,
+        left: 0, // metadata unknown at the magnet stage
+        event: crate::tracker::Event::Started,
+        num_want: 50,
+    };
+    let mut pool: Vec<SocketAddr> = Vec::new();
+    for url in &magnet.trackers {
+        // announce_screened (NOT the low-level announce) so hostile
+        // magnet tr= URLs hit the same martian screen the engine's
+        // tier walk applies — without it, `tr=http://169.254.169.254/`
+        // would collect an info-hash + peer_id GET from this daemon.
+        match crate::tracker::announce_screened(url, &req, None, false, None).await {
+            Ok(resp) => {
+                // Daemon runs clearnet-only (no anonymous/proxy knobs),
+                // so the non-strict half applies TODAY: refuse the
+                // martians a tracker can hand us (loopback, link-local
+                // metadata endpoint, multicast, ...). The constant makes
+                // the implicit coupling explicit and greppable: if the
+                // daemon ever gains anonymity knobs, replace with
+                // strict = anonymous || proxied like the engine does.
+                pool.extend(filter_daemon_peer_pool(resp.peers));
+            }
+            Err(e) => {
+                // Hostile-magnet URL: host-only label, same rule as the
+                // martian refusals — never echo attacker-controlled paths.
+                tracing::debug!(target: "web", tracker = %crate::tracker::martian_url_label(url), error = %e, "magnet tracker bootstrap failed")
+            }
+        }
+    }
+    pool.sort();
+    pool.dedup();
+    if pool.is_empty() {
+        tracing::warn!(target: "web", info_hash = %crate::util::redact_info_hash(&info_hash), "magnet add: no peers from trackers; giving up");
+        return;
+    }
+
+    let info_bytes = match crate::peer::metadata_fetch::fetch_metadata(
+        info_hash,
+        pool,
+        Vec::new(),
+        false,
+        None,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(target: "web", info_hash = %crate::util::redact_info_hash(&info_hash), error = %e, "magnet add: metadata fetch failed");
+            return;
+        }
+    };
+    let torrent = match crate::metainfo::TorrentFile::from_info_dict_bytes(
+        &info_bytes,
+        info_hash,
+        magnet.trackers.clone(),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(target: "web", error = %e, "magnet add: info dict parse/verify failed");
+            return;
+        }
+    };
+    // Assemble `.torrent` bytes (info dict verbatim → info_hash
+    // preserved) so the daemon can persist + resume this magnet add.
+    let raw_torrent = assemble_torrent_bytes(&info_bytes, &magnet.trackers);
+    let cfg = crate::engine::EngineConfig {
+        output_dir: st.output.clone(),
+        listen_port: st.base_port,
+        enable_dht: !st.no_dht,
+        ..Default::default()
+    };
+    match st
+        .mgr
+        .add_persistent(torrent, st.peer_id, cfg, &raw_torrent)
+        .await
+    {
+        Some(ih) => {
+            tracing::info!(target: "web", info_hash = %crate::util::redact_info_hash(&ih), "magnet add: session started")
+        }
+        None => {
+            tracing::info!(target: "web", info_hash = %crate::util::redact_info_hash(&info_hash), "magnet add: already running (raced)")
+        }
+    }
 }
 
 async fn daemon_pause(State(st): State<DaemonState>, Path(ih): Path<String>) -> impl IntoResponse {

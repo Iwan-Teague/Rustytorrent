@@ -827,6 +827,9 @@ async fn cmd_daemon(
         base_port: port,
         no_dht,
         torrent_dir,
+        magnet_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            rustytorrent::web::MAX_CONCURRENT_MAGNET_ADDS,
+        )),
     };
     // Serve until ctrl-c, then stop every session gracefully.
     tokio::select! {

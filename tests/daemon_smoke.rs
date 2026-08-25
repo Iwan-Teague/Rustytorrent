@@ -59,6 +59,9 @@ async fn daemon_hosts_lists_and_controls_torrents() {
         base_port: 0,
         no_dht: true,
         torrent_dir: std::env::temp_dir(),
+        magnet_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            rustytorrent::web::MAX_CONCURRENT_MAGNET_ADDS,
+        )),
     };
     tokio::spawn(async move {
         let _ = axum::serve(listener, daemon_router(state)).await;
@@ -210,6 +213,9 @@ async fn oversized_request_body_is_refused_with_413() {
         base_port: 0,
         no_dht: true,
         torrent_dir: std::env::temp_dir(),
+        magnet_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            rustytorrent::web::MAX_CONCURRENT_MAGNET_ADDS,
+        )),
     };
     tokio::spawn(async move {
         let _ = axum::serve(listener, daemon_router(state)).await;
@@ -246,5 +252,85 @@ async fn oversized_request_body_is_refused_with_413() {
         resp.status(),
         reqwest::StatusCode::PAYLOAD_TOO_LARGE,
         "under-cap request must not trip the body limit"
+    );
+}
+
+/// The magnet_gate semaphore must actually bound concurrent bootstrap
+/// pipelines: MAX_CONCURRENT_MAGNET_ADDS+1 adds pointed at a hanging
+/// tracker produce exactly MAX_CONCURRENT_MAGNET_ADDS dials — the extra
+/// add queues on the permit instead of stacking another dial chain.
+#[tokio::test]
+async fn magnet_bootstrap_gate_caps_concurrent_pipelines() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Hanging tracker: count accepted connections and HOLD them open
+    // (never respond) so no announce completes and releases a permit
+    // mid-test. The task dies with the test runtime.
+    let acc = accepts.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            if let Ok((s, _)) = listener.accept().await {
+                acc.fetch_add(1, Ordering::SeqCst);
+                held.push(s);
+            }
+        }
+    });
+
+    let state = DaemonState {
+        mgr: SessionManager::new(),
+        output: std::env::temp_dir(),
+        peer_id: [7u8; 20],
+        base_port: 0,
+        no_dht: true,
+        torrent_dir: std::env::temp_dir(),
+        magnet_gate: Arc::new(tokio::sync::Semaphore::new(
+            rustytorrent::web::MAX_CONCURRENT_MAGNET_ADDS,
+        )),
+    };
+
+    // One distinct magnet per add (different info-hash → no dup-check hit).
+    let mk_magnet = |ih_byte: u8| {
+        rustytorrent::magnet::MagnetLink::parse(&format!(
+            "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F{}%2Fa",
+            [ih_byte; 20]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            addr
+        ))
+        .unwrap()
+    };
+
+    let limit = rustytorrent::web::MAX_CONCURRENT_MAGNET_ADDS;
+    for i in 0..limit + 1 {
+        let st = state.clone();
+        let m = mk_magnet(0xE0 + i as u8);
+        tokio::spawn(rustytorrent::web::magnet_bootstrap(st, m));
+    }
+
+    // Wait for the gated steady state: exactly `limit` dials up.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let n = accepts.load(Ordering::SeqCst);
+        if n >= limit {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gate starved the pipelines: only {n} dials up"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    // Settle window: the queued (limit+1)th pipeline must NOT dial.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        limit,
+        "gate failed to cap concurrent magnet-add pipelines"
     );
 }

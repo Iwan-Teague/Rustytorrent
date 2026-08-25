@@ -230,7 +230,7 @@ fn tracker_url_dialable(url: &str, strict: bool) -> bool {
 /// controlled (hostile magnet `tr=`), so errors must not echo its path or
 /// query — scheme://host[:port] names the offender for log correlation
 /// without carrying anything an attacker planted.
-fn martian_url_label(url: &str) -> String {
+pub(crate) fn martian_url_label(url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(u) => match u.host_str() {
             Some(h) => match u.port() {
