@@ -97,9 +97,29 @@ pub fn redact_node_id(id: &[u8; 20]) -> String {
 /// text before embedding it in an error string: errors reach logs via
 /// `error = %e`, and unfiltered controls let a remote party forge log
 /// lines. Same treatment as tracker failure reasons.
+///
+/// Also strips Unicode bidi overrides/isolates and zero-width/format
+/// characters. These are NOT `char::is_control()` (category Cc) — they
+/// render as nothing or reorder surrounding text, so a hostile peer can
+/// make a logged line *visually* say something it does not (Trojan-Source
+/// style spoofing of log files opened in terminals/editors).
 #[must_use]
 pub fn sanitize_remote_text(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).collect()
+    text.chars()
+        .filter(|c| !c.is_control() && !is_invisible_or_directional(*c))
+        .collect()
+}
+
+/// Invisible or text-direction-altering code points that survive
+/// `char::is_control()`: zero-width spaces/joiners/marks, bidi embedding
+/// and override controls, bidi isolates, and the BOM.
+fn is_invisible_or_directional(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'..='\u{200F}'    // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | '\u{202A}'..='\u{202E}'  // LRE, RLE, PDF, LRO, RLO
+        | '\u{2066}'..='\u{2069}'  // LRI, RLI, FSI, PDI
+        | '\u{FEFF}'               // BOM / zero-width no-break space
+    )
 }
 
 /// Create `path` (and parents) as a private directory: mode 0700 on Unix,
@@ -753,5 +773,35 @@ mod tests {
         // A genuinely different v6 address must NOT collapse onto it.
         let real_v6: SocketAddr = "[2001:db8::7]:51413".parse().unwrap();
         assert_ne!(redact_peer(&v4), redact_peer(&real_v6));
+    }
+
+    #[test]
+    fn sanitize_remote_text_strips_controls_bidi_and_invisibles_keeps_normal_text() {
+        // Line-forgery controls (Cc) must not survive.
+        let crlf = sanitize_remote_text("ok\r\nEVIL log line");
+        assert!(!crlf.contains('\r') && !crlf.contains('\n'), "{crlf}");
+        assert!(!crlf.contains("EVIL\n"), "{crlf}");
+        assert_eq!(crlf, "okEVIL log line");
+
+        // Bidi overrides/isolates and zero-width/format chars survive
+        // is_control() but let a hostile peer visually spoof a rendered
+        // line (RLO can mirror/reorder the text a terminal shows).
+        let hostile = "a\u{202E}evil\u{202C}b\u{200B}c\u{200F}d\u{2066}x\u{2069}e\u{FEFF}f";
+        let clean = sanitize_remote_text(hostile);
+        for bad in [
+            '\u{202E}', '\u{202C}', '\u{200B}', '\u{200F}', '\u{2066}', '\u{2069}', '\u{FEFF}',
+        ] {
+            assert!(
+                !clean.contains(bad),
+                "U+{:04X} survived: {clean:?}",
+                bad as u32
+            );
+        }
+        assert!(clean.contains("evil"), "{clean}");
+
+        // Ordinary non-ASCII text must pass through untouched — this
+        // filter must never become an over-broad ASCII fold.
+        let normal = "привет ✅ 中文 emoji 🌊 keep";
+        assert_eq!(sanitize_remote_text(normal), normal);
     }
 }
