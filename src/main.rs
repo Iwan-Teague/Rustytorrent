@@ -1437,6 +1437,99 @@ mod tests {
         assert_eq!(outcome, TrackerOutcome::Dialed);
     }
 
+    /// The helper must not just DIAL through the screen — it must apply
+    /// the same peer martian filter the engine applies before handing
+    /// tracker-returned peers to the dial pool. Loopback is ALWAYS refused
+    /// (ingestion predicate), LAN survives clearnet but not anonymous.
+    #[tokio::test]
+    async fn magnet_bootstrap_filters_tracker_returned_peers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Compact-peers payload: public, loopback, LAN (6881 = 0x1AE1).
+        let mut peers_bytes = Vec::new();
+        for ip in [[93u8, 184, 215, 14], [127, 0, 0, 1], [10, 9, 9, 9]] {
+            peers_bytes.extend_from_slice(&ip);
+            peers_bytes.extend_from_slice(&6881u16.to_be_bytes());
+        }
+        let body = format!(
+            "d8:completei1e10:incompletei2e8:intervali60e5:peers{}:",
+            peers_bytes.len()
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Two rounds: clearnet then anonymous posture both announce.
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len() + peers_bytes.len() + 1
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.write_all(body.as_bytes()).await.unwrap();
+                sock.write_all(&peers_bytes.clone()).await.unwrap();
+                sock.write_all(b"e").await.unwrap();
+            }
+        });
+
+        let req = rustytorrent::tracker::AnnounceRequest {
+            info_hash: [0x42; 20],
+            peer_id: [0x24; 20],
+            port: 51413,
+            uploaded: 0,
+            downloaded: 0,
+            left: 1,
+            event: rustytorrent::tracker::Event::Started,
+            num_want: 50,
+        };
+
+        // Clearnet: loopback dropped, LAN kept.
+        let mut pool = Vec::new();
+        let outcome = super::announce_magnet_tracker(
+            &format!("http://{addr}/announce"),
+            &req,
+            None,
+            false,
+            None,
+            &mut pool,
+        )
+        .await;
+        assert_eq!(outcome, TrackerOutcome::Dialed);
+        assert_eq!(
+            pool,
+            vec![
+                "93.184.215.14:6881".parse().unwrap(),
+                "10.9.9.9:6881".parse().unwrap()
+            ],
+            "loopback peer must be filtered, LAN kept on clearnet"
+        );
+
+        // Anonymous: strict posture drops the LAN peer too.
+        let mut pool = Vec::new();
+        let outcome = super::announce_magnet_tracker(
+            &format!("http://{addr}/announce"),
+            &req,
+            None,
+            true,
+            None,
+            &mut pool,
+        )
+        .await;
+        // Join only now: the server task's accept-loop would otherwise
+        // block forever on round two before this test issues it.
+        server.await.unwrap();
+        assert_eq!(outcome, TrackerOutcome::Dialed);
+        assert_eq!(
+            pool,
+            vec!["93.184.215.14:6881".parse().unwrap()],
+            "strict posture must drop the LAN peer"
+        );
+    }
+
     #[test]
     fn validate_select_patterns_rejects_blank_entries() {
         assert!(validate_select_patterns(&[]).is_ok());
