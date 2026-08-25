@@ -437,7 +437,8 @@ async fn connect_transport(
     let martian_strict = crate::engine::dht_martian_strict(anonymous, !proxies.is_empty());
     if !crate::util::is_safe_dial_target(&addr, martian_strict) {
         return Err(Error::Network(format!(
-            "refusing martian dial target {addr} (strict={martian_strict})"
+            "refusing martian dial target {} (strict={martian_strict})",
+            crate::util::redact_peer(&addr)
         )));
     }
     let use_utp = should_use_utp(proxies.is_empty(), bind_iface.is_some(), anonymous);
@@ -549,7 +550,8 @@ async fn dial_tcp(
     let martian_strict = crate::engine::dht_martian_strict(anonymous, !proxies.is_empty());
     if !crate::util::is_safe_dial_target(&addr, martian_strict) {
         return Err(Error::Network(format!(
-            "refusing martian dial target {addr} (strict={martian_strict})"
+            "refusing martian dial target {} (strict={martian_strict})",
+            crate::util::redact_peer(&addr)
         )));
     }
     if !proxies.is_empty() {
@@ -1361,8 +1363,13 @@ mod tests {
             .expect_err("metadata endpoint must be refused");
         let msg = format!("{err}");
         assert!(
-            msg.contains("refusing martian dial target") && msg.contains("169.254.169.254"),
-            "expected martian refusal, got: {msg}"
+            msg.contains("refusing martian dial target")
+                // The target address must survive only as a redacted token —
+                // this error is logged upstream (`error = %e`), and dial
+                // targets come from swarm data (tracker/DHT/PEX).
+                && msg.contains("peer:")
+                && !msg.contains("169.254"),
+            "expected martian refusal with redacted target, got: {msg}"
         );
         // And it must fail FAST — before any 10 s connect timeout.
         assert!(msg.contains("strict=false"), "{msg}");
@@ -1419,8 +1426,10 @@ mod tests {
         .expect("metadata endpoint must be refused on every transport");
         let msg = format!("{err}");
         assert!(
-            msg.contains("refusing martian dial target"),
-            "expected chokepoint martian refusal, got: {msg}"
+            msg.contains("refusing martian dial target")
+                && msg.contains("peer:")
+                && !msg.contains("169.254"),
+            "expected chokepoint martian refusal with redacted target, got: {msg}"
         );
     }
 
