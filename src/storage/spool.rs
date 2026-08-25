@@ -633,6 +633,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn old_format_version_fails_open_loudly() {
+        // A pre-AAD v1 spool must fail AT OPEN with an explicit version
+        // error, not open fine and then fail every slot decrypt (or worse,
+        // silently re-download everything). Version lives at header offset
+        // 4 (magic u32 then version u8) — flip it to 1 and reopen.
+        let dir = tempdir();
+        let path = dir.join("spool.bin");
+        let pl = 256u64;
+        {
+            let mut spool = EncryptedSpool::open_or_create(&path, "k", pl, 2, pl * 2)
+                .await
+                .unwrap();
+            spool.write_piece(0, &vec![7u8; pl as usize]).await.unwrap();
+        }
+        use std::io::{Seek, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(std::io::SeekFrom::Start(4)).unwrap();
+        f.write_all(&[1u8]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let err = match EncryptedSpool::open_or_create(&path, "k", pl, 2, pl * 2).await {
+            Ok(_) => panic!("v1 spool must not open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("version mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn read_unwritten_slot_is_an_error() {
         let dir = tempdir();
         let path = dir.join("spool.bin");
