@@ -34,6 +34,7 @@ impl TokenBucket {
         }
     }
 
+    #[must_use = "consuming a token without checking success silently drops the request"]
     pub fn try_consume(&mut self, n: f64) -> bool {
         self.refill();
         if self.tokens >= n {
