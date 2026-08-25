@@ -230,6 +230,20 @@ fn scrub_announce_error(msg: &str, full_url: &str, base_url: &str) -> String {
     crate::tracker::scrub_url_from_message(&once, base_url)
 }
 
+/// Emit the "announcing" debug line. The configured announce URL may carry a
+/// passkey in its query (private trackers hand out such URLs), so it must be
+/// query-stripped exactly like every other place we display it.
+fn emit_announce_debug(base_url: &str, via_proxy: bool, ua_override: bool, bound_ip: &str) {
+    tracing::debug!(
+        target: "tracker::http",
+        url = %crate::tracker::redact_url_query(base_url),
+        via_proxy,
+        ua_override,
+        bound_ip = %bound_ip,
+        "announcing"
+    );
+}
+
 async fn announce_inner(
     base_url: &str,
     req: &AnnounceRequest,
@@ -253,14 +267,7 @@ async fn announce_inner(
         .as_ref()
         .map(crate::util::redact_ip)
         .unwrap_or_else(|| "none".to_string());
-    tracing::debug!(
-        target: "tracker::http",
-        url = %base_url,
-        via_proxy = proxy.is_some(),
-        ua_override = ua_override.is_some(),
-        bound_ip = %bound_ip,
-        "announcing"
-    );
+    emit_announce_debug(base_url, proxy.is_some(), ua_override.is_some(), &bound_ip);
     let client_owned;
     let client: reqwest::Client = match proxy {
         Some(p) => {
@@ -449,6 +456,7 @@ fn parse_compact_v6(b: &[u8]) -> Result<Vec<SocketAddr>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn proxied_url_rotates_under_tor_stream_isolation() {
@@ -933,5 +941,42 @@ mod tests {
             msg.contains("exceeded") && msg.contains("byte cap"),
             "expected streaming-cap refusal, got {msg:?}"
         );
+    }
+
+    /// Shared in-memory writer so a fmt subscriber can capture log lines.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn announcing_debug_line_strips_passkey_query() {
+        // The configured announce URL may itself carry a passkey query
+        // parameter (private trackers hand those out). The debug line must
+        // render only the scheme://host/path part.
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer({
+                let sink = buf.clone();
+                move || sink.clone()
+            })
+            .finish();
+        let url = "http://tracker.example/announce.php?passkey=SUPERSECRET&info_hash=zz";
+        tracing::subscriber::with_default(subscriber, || {
+            emit_announce_debug(url, false, false, "none");
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("announcing"), "{out}");
+        assert!(out.contains("http://tracker.example/announce.php"), "{out}");
+        assert!(!out.contains("SUPERSECRET"), "{out}");
+        assert!(!out.contains("passkey"), "{out}");
     }
 }
