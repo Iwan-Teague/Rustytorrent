@@ -158,6 +158,21 @@ fn is_unsafe_path_component(s: &str) -> bool {
     s.is_empty() || s == "." || s == ".." || s.contains('/') || s.contains('\\')
 }
 
+/// Bounded, sanitized rendering of a rejected (attacker-controlled) name
+/// or path segment for error text. These refusals reach our logs via
+/// magnet-add/engine error lines, so the raw value must not: beyond the
+/// `Debug` escaping, an unbounded hostile string would be a log-spam DoS,
+/// and any residual invisible characters would enable line-forgery.
+/// Truncate first (so the marker survives), then strip controls/bidi.
+fn describe_unsafe_component(s: &str) -> String {
+    const MAX_CHARS: usize = 48;
+    let mut out: String = s.chars().take(MAX_CHARS).collect();
+    if s.chars().count() > MAX_CHARS {
+        out.push_str("..");
+    }
+    crate::util::sanitize_remote_text(&out)
+}
+
 impl Info {
     fn from_value(v: &BencodeValue) -> Result<Self> {
         let d = v.as_dict()?;
@@ -171,7 +186,10 @@ impl Info {
         // component per BEP 3 — reject separators / traversal so a
         // hostile torrent can't write outside the download directory.
         if is_unsafe_path_component(&name) {
-            return Err(Error::Bencode(format!("unsafe torrent name: {name:?}")));
+            return Err(Error::Bencode(format!(
+                "unsafe torrent name: {:?}",
+                describe_unsafe_component(&name)
+            )));
         }
         let piece_length = u64::try_from(
             d.get(&b"piece length".to_vec())
@@ -229,7 +247,10 @@ impl Info {
                 for seg in path_list {
                     let s = seg.as_str()?;
                     if is_unsafe_path_component(s) {
-                        return Err(Error::Bencode(format!("unsafe path segment: {s}")));
+                        return Err(Error::Bencode(format!(
+                            "unsafe path segment: {:?}",
+                            describe_unsafe_component(s)
+                        )));
                     }
                     p.push(s);
                 }
@@ -446,6 +467,43 @@ mod tests {
     /// path) must be rejected — otherwise `Layout` would join it onto
     /// the output root and write outside the download directory. Covers
     /// single-file torrents.
+    /// The refusal error ECHOES part of the hostile name into our logs,
+    /// so it must be bounded and stripped of control/bidi characters — a
+    /// 1 MB name is a log-spam DoS, and raw CR/LF or U+202E would let a
+    /// hostile torrent forge or spoof log lines.
+    #[test]
+    fn unsafe_name_error_is_bounded_and_sanitized() {
+        // name = "../" + "\n" + U+202E + "x"*500 (has `length` → single-file).
+        let mut name = b"../\n\x1b".to_vec();
+        name.extend_from_slice(&[0xE2, 0x80, 0xAE]); // U+202E RIGHT-TO-LEFT OVERRIDE
+        let junk = vec![b'x'; 500];
+        name.extend_from_slice(&junk);
+        let name_len = name.len();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"d4:infod6:lengthi1e4:name");
+        out.extend_from_slice(name_len.to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(&name);
+        out.extend_from_slice(b"12:piece lengthi1e6:pieces20:");
+        out.extend_from_slice(&[0u8; 20]);
+        out.extend_from_slice(b"ee");
+
+        let err = TorrentFile::from_bytes(&out).expect_err("traversal must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("unsafe torrent name"), "{msg}");
+        assert!(!msg.contains('\n'), "raw newline survived: {msg:?}");
+        assert!(!msg.contains('\x1b'), "raw escape survived: {msg:?}");
+        assert!(
+            !msg.chars().any(|c| c as u32 == 0x202E),
+            "bidi override survived: {msg:?}"
+        );
+        assert!(
+            msg.len() < 200,
+            "unbounded echo ({} bytes) — log-spam DoS: {msg:?}",
+            msg.len()
+        );
+    }
+
     #[test]
     fn rejects_unsafe_name_single_file() {
         // name = "../evil" (7 bytes). Single-file (has `length`, no `files`).
