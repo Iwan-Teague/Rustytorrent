@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Daily sweep (rustydns Tier-0 parity): re-runs every job, including
+    # cargo-audit, so new RustSec advisories are caught between PRs.
+    - cron: "30 5 * * *"
+
+# Tier-0: read-only GITHUB_TOKEN by default for every job. No job in
+# this workflow needs an elevation (no release/publish job).
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,11 +32,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
+      # SHA-pinned (Tier-0): every `uses:` below is pinned to a verified
+      # commit, not a mutable tag. SHAs cross-checked against the
+      # rustydns suite workflow; re-verify on bump.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (verified 2026-09-12)
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch head (verified 2026-09-12)
       - name: Cache cargo registry + target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (verified 2026-09-12)
       - name: cargo build
         run: cargo build --all-targets --locked
       - name: cargo test
@@ -43,13 +55,13 @@ jobs:
     name: clippy + fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (verified 2026-09-12)
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch head (verified 2026-09-12)
         with:
           components: clippy, rustfmt
       - name: Cache cargo registry + target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (verified 2026-09-12)
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo clippy
@@ -65,7 +77,23 @@ jobs:
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (verified 2026-09-12)
+      - uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1 (verified 2026-09-12)
         with:
           command: check
+
+  # Tier-0: independent RustSec advisory sweep (different tooling over the
+  # same advisory DB as cargo-deny; `--deny warnings` also fails on
+  # unmaintained/unsound warnings, matching the deny.toml posture). The
+  # daily `schedule` trigger above is what catches new advisories.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (verified 2026-09-12)
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch head (verified 2026-09-12)
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit --deny warnings

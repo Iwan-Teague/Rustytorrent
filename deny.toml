@@ -4,17 +4,73 @@
 # integrity; the license allow-list below covers every permissive license
 # currently present in Cargo.lock (verify with `cargo deny check licenses`
 # before adding dependencies that need new entries).
+#
+# Crypto posture is aligned with the suite baseline (rustydns /
+# rustynet): OpenSSL/native-tls stacks are banned outright, and the
+# deprecated/legacy crypto crates (sha1, md-5, md5, rc4, ...) are banned
+# too. The two charter-sanctioned legacy primitives used by BitTorrent
+# protocols are covered by dated `# suite-exemption:` rows below
+# (ADR-012 X2 / charter T2 §K). The exemptions are ENFORCED narrow via
+# `wrappers`: a banned crate stays banned everywhere in the graph except
+# as a direct dependency of the named wrapper crate.
 
 [advisories]
 version = 2
-unmaintained = "workspace"
-unsound = "workspace"
+# Deny-by-default across the whole dependency graph (suite baseline),
+# not just crates the workspace itself depends on directly.
+unmaintained = "all"
+unsound = "all"
+# Yanked crates aren't an immediate vulnerability but they shouldn't
+# end up in a release either — fail CI so we notice before shipping.
 yanked = "deny"
-
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+
+deny = [
+    # Suite baseline: rustls backend only — no OpenSSL bindings, no
+    # native-tls. reqwest is built with default-features = false and
+    # rustls-tls (see Cargo.toml), so nothing in the graph pulls these.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+
+    # Deprecated / broken crypto, banned outright with NO in-graph use.
+    # MD5 family: practical collisions (Wang 2005) / preimage attacks.
+    { name = "md-5" },
+    # `md5` is a separate standalone crates.io package — ban both names
+    # for parity with the suite baseline.
+    { name = "md5" },
+    { name = "md4" },
+    { name = "md2" },
+    # DES family: 56-bit keys, broken in practice.
+    { name = "des" },
+    { name = "3des" },
+    { name = "des3" },
+    { name = "rc2" },
+
+    # RC4 (the crates.io RustCrypto package): practical bias / recovery
+    # attacks (RC4 NOMORE, Bar-Mitzvah); RFC 7465 prohibits it in TLS.
+    # wrappers = [] keeps the crate fully banned — rustytorrent does NOT
+    # depend on it. The RC4 in src/peer/mse/rc4.rs is hand-rolled for
+    # BEP-8 MSE under the X2 exemption below; this ban still blocks
+    # anyone from casually adding the `rc4` crate instead.
+    #
+    # suite-exemption: BEP-8 MSE RC4 handshake obfuscation only, non-confidential; expires 2027-03-01
+    { name = "rc4", wrappers = [] },
+
+    # X2 crypto exemption (ADR-012 X2 / charter T2 §K): BitTorrent v1
+    # protocol-mandated legacy primitive. NON-CONFIDENTIAL use only — the
+    # info-hash is a public identifier/integrity value, not a security
+    # boundary. The `wrappers` list is the enforcement: sha1 stays banned
+    # for every other consumer in the graph, and this entry must be
+    # pruned when the exemption expires or the protocol requirement goes
+    # away.
+    #
+    # suite-exemption: BT-v1 SHA-1 info-hash (protocol-mandated identifier/integrity, non-confidential); expires 2027-03-01
+    { name = "sha1", wrappers = ["rustytorrent"] },
+]
 
 [licenses]
 version = 2

@@ -8,6 +8,12 @@
 //!
 //! `Zeroize` wipes the S-box and indices on drop so the keystream state
 //! doesn't survive in heap-snapshot core dumps or freed-page reuse.
+//!
+//! Charter exemption (ADR-012 X2 / T2 §K): this implementation is covered
+//! by `# suite-exemption: BEP-8 MSE RC4 handshake obfuscation only,
+//! non-confidential; expires 2027-03-01` in deny.toml. Non-confidential
+//! use ONLY — do not reuse this code anywhere confidentiality or
+//! authenticity is required.
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
