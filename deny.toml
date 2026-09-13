@@ -25,8 +25,19 @@ unsound = "all"
 yanked = "deny"
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
+
+# Version-pinned skip baseline (AQ-10 lesson: pin versions, not bare names, so a
+# NEW duplicate still fails CI). windows-sys arrives in several versions
+# transitively through the Windows dependency tree; collapsing them is tracked as
+# a follow-up. Any version NOT listed here — a 5th windows-sys, or any other
+# duplicated crate — fails the deny gate.
+skip = [
+    { name = "windows-sys", version = "=0.52.0" },
+    { name = "windows-sys", version = "=0.59.0" },
+    { name = "windows-sys", version = "=0.61.2" },
+]
 
 deny = [
     # Suite baseline: rustls backend only — no OpenSSL bindings, no
@@ -35,6 +46,9 @@ deny = [
     { name = "openssl" },
     { name = "openssl-sys" },
     { name = "native-tls" },
+    # rustls-pemfile: suite baseline ban (superseded by rustls-pki-types; keeps
+    # the cert/key-parsing path on the maintained crate). Not in-graph.
+    { name = "rustls-pemfile" },
 
     # Deprecated / broken crypto, banned outright with NO in-graph use.
     # MD5 family: practical collisions (Wang 2005) / preimage attacks.
@@ -49,6 +63,8 @@ deny = [
     { name = "3des" },
     { name = "des3" },
     { name = "rc2" },
+    # Blowfish: suite baseline ban (64-bit block → sweet32; superseded). Not in-graph.
+    { name = "blowfish" },
 
     # RC4 (the crates.io RustCrypto package): practical bias / recovery
     # attacks (RC4 NOMORE, Bar-Mitzvah); RFC 7465 prohibits it in TLS.
@@ -57,7 +73,14 @@ deny = [
     # BEP-8 MSE under the X2 exemption below; this ban still blocks
     # anyone from casually adding the `rc4` crate instead.
     #
-    # suite-exemption: BEP-8 MSE RC4 handshake obfuscation only, non-confidential; expires 2027-03-01
+    # suite-exemption: BEP-8 MSE RC4 — FULL-SESSION peer-stream obfuscation, NOT
+    # handshake-only. Per BEP-8 full-encryption mode RC4 encrypts the entire peer
+    # stream (all piece + control traffic; src/peer/mse/{handshake.rs:134,stream.rs}).
+    # Non-confidential: the plaintext is public swarm data, and ANONYMITY.md:104
+    # documents MSE as obfuscation, not encryption-of-record. This exemption also
+    # DEPENDS on the SHA-1 exemption below (MSE key derivation uses SHA-1).
+    # (Corrected 2026-09-13 per 2nd-review H1: prior text said "handshake only",
+    # which the code contradicts.) expires 2027-03-01
     { name = "rc4", wrappers = [] },
 
     # X2 crypto exemption (ADR-012 X2 / charter T2 §K): BitTorrent v1
@@ -68,7 +91,13 @@ deny = [
     # pruned when the exemption expires or the protocol requirement goes
     # away.
     #
-    # suite-exemption: BT-v1 SHA-1 info-hash (protocol-mandated identifier/integrity, non-confidential); expires 2027-03-01
+    # suite-exemption: BT-v1 SHA-1, protocol-mandated, non-confidential. Full use
+    # surface (2nd-review H2): info-hash + piece hashes (integrity of public swarm
+    # data), MSE req1/req2/req3 key derivation (on which the RC4 exemption depends),
+    # peer metadata-dict acceptance (dict whose SHA-1 == the magnet's own SHA-1
+    # info-hash wins — the integrity anchor is itself SHA-1 by protocol), DHT spam
+    # token SHA1(salt||ip) (non-cryptographic), and log-pseudonym PRF (no security
+    # property rests on it). None authenticates confidential data. expires 2027-03-01
     { name = "sha1", wrappers = ["rustytorrent"] },
 ]
 

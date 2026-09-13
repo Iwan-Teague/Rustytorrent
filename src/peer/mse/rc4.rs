@@ -2,9 +2,11 @@
 //! the Schneier-textbook variant). 256-byte S-box, key-schedule sets up the
 //! permutation, then PRGA produces keystream bytes.
 //!
-//! Used only as part of the MSE/PE handshake — BitTorrent specs hardcoded
-//! RC4 in 2006. It is cryptographically broken; we treat MSE as obfuscation,
-//! not security.
+//! Used for BEP-8 MSE/PE: after the handshake key exchange, RC4 encrypts the
+//! ENTIRE peer stream in each direction (BEP-8 full-encryption mode — all piece
+//! and control traffic; see `stream.rs`), not just the handshake. BitTorrent
+//! specs hardcoded RC4 in 2006. It is cryptographically broken; we treat MSE as
+//! obfuscation of public swarm data, not encryption-of-record (see ANONYMITY.md).
 //!
 //! `Zeroize` wipes the S-box and indices on drop so the keystream state
 //! doesn't survive in heap-snapshot core dumps or freed-page reuse.
