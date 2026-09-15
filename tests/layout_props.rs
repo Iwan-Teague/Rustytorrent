@@ -28,6 +28,8 @@
 
 use proptest::prelude::*;
 
+use std::path::Path;
+
 use rustytorrent::metainfo::{FileEntry, Info, TorrentFile, TorrentFiles};
 use rustytorrent::storage::Layout;
 
@@ -137,7 +139,7 @@ proptest! {
     /// torrent at once.
     #[test]
     fn offset_map_tiles_every_file_exactly(s in synth_strategy()) {
-        let layout = Layout::from_torrent("/synthetic-root".into(), &s.torrent);
+        let layout = Layout::from_torrent(Path::new("/synthetic-root"), &s.torrent).unwrap();
 
         // Sanity: the layout agrees with the torrent we fed it.
         prop_assert_eq!(layout.num_pieces, s.num_pieces);
@@ -258,7 +260,7 @@ proptest! {
                 private: false,
             },
         };
-        let layout = Layout::from_torrent("/synthetic-root".into(), &torrent);
+        let layout = Layout::from_torrent(Path::new("/synthetic-root"), &torrent).unwrap();
 
         let last = num_pieces - 1;
         let psize = piece_size(last, num_pieces, total, piece_length);

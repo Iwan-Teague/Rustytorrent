@@ -896,7 +896,7 @@ async fn cmd_decrypt(
         .await
         .with_context(|| format!("read {}", torrent_path.display()))?;
     let t = TorrentFile::from_bytes(&raw)?;
-    let layout = rustytorrent::storage::Layout::from_torrent(output.clone(), &t);
+    let layout = rustytorrent::storage::Layout::from_torrent(&output, &t)?;
     let spool_path = spool.unwrap_or_else(|| {
         let mut p = output.clone();
         p.push(format!("{}.rustytorrent-spool", t.info.name));

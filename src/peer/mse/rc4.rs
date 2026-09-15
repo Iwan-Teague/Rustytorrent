@@ -168,7 +168,10 @@ mod tests {
         let (mut x, mut y) = ([0u8; 4], [0u8; 4]);
         a.process(&mut x);
         b.process(&mut y);
-        assert_eq!(x, y, "processing an empty slice must not advance the keystream");
+        assert_eq!(
+            x, y,
+            "processing an empty slice must not advance the keystream"
+        );
     }
 
     /// A key longer than the 256-byte S-box is handled by the `key[i % len]`

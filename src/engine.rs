@@ -830,7 +830,7 @@ impl TorrentEngine {
             (incoming_rx, listener_handle, inbound_available)
         };
 
-        let layout = Layout::from_torrent(self.cfg.output_dir.clone(), &self.torrent);
+        let layout = Layout::from_torrent(&self.cfg.output_dir, &self.torrent)?;
 
         // Which files the plain-disk backend should preallocate. With no
         // selection this is `None` (allocate the full layout, unchanged

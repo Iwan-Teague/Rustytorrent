@@ -392,7 +392,7 @@ mod tests {
     async fn write_and_read_multi_file() {
         let tmp = tempdir();
         let t = make_torrent_multi(100, vec![(150, "a.txt"), (100, "b.txt"), (50, "c.txt")]);
-        let layout = Layout::from_torrent(tmp.clone(), &t);
+        let layout = Layout::from_torrent(&tmp, &t).unwrap();
 
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (ev_tx, mut ev_rx) = mpsc::channel(16);
@@ -448,7 +448,7 @@ mod tests {
 
         let tmp = tempdir();
         let t = make_torrent_multi(100, vec![(100, "a.txt")]);
-        let layout = Layout::from_torrent(tmp.clone(), &t);
+        let layout = Layout::from_torrent(&tmp, &t).unwrap();
 
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (ev_tx, mut ev_rx) = mpsc::channel(16);
@@ -494,7 +494,7 @@ mod tests {
         // already exists wide, which ensure_private_dir deliberately leaves
         // alone (created-only tightening policy).
         let t = make_torrent_multi(100, vec![(100, "sub/a.txt")]);
-        let layout = Layout::from_torrent(tmp.clone(), &t);
+        let layout = Layout::from_torrent(&tmp, &t).unwrap();
         let dir = layout.files[0].path.parent().unwrap().to_path_buf();
 
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
@@ -548,7 +548,7 @@ mod tests {
         let tmp = tempdir();
         // Three 100-byte files at piece_length 100 → one piece per file.
         let t = make_torrent_multi(100, vec![(100, "a.txt"), (100, "b.txt"), (100, "c.txt")]);
-        let layout = Layout::from_torrent(tmp.clone(), &t);
+        let layout = Layout::from_torrent(&tmp, &t).unwrap();
         let data: Vec<Vec<u8>> = (0u8..3).map(|i| vec![i + 1; 100]).collect();
         // Real per-piece hashes (piece i == file i, file-aligned).
         let hashes: Vec<[u8; 20]> = data

@@ -408,7 +408,13 @@ proptest! {
         match MagnetLink::parse(&uri) {
             Ok(m) => {
                 prop_assert_eq!(m.info_hash.len(), 20);
-                prop_assert_eq!(m.trackers.len(), trackers.len());
+                // The parser dedupes `tr=` params (first occurrence wins,
+                // order preserved — see `MagnetLink::parse`), so the count
+                // to expect is the number of *distinct* input trackers.
+                // (A duplicate pair like ["k","k"] is legal input and must
+                // yield one tracker, not two.)
+                let distinct: std::collections::HashSet<&String> = trackers.iter().collect();
+                prop_assert_eq!(m.trackers.len(), distinct.len());
                 if let Some(name) = dn {
                     prop_assert_eq!(m.display_name.as_deref(), Some(name.as_str()));
                 }
