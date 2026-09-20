@@ -49,6 +49,14 @@ pub enum Error {
     #[error("network error ({0}); if this is a dial/timeout, check connectivity and any --socks5 proxy or --bind-iface interface; if it names a flag conflict or unsupported platform, adjust your command-line options")]
     Network(String),
 
+    /// A remote peer broke the wire protocol in a way that is not a
+    /// plain parse failure — most notably exhausting a resource budget
+    /// we grant each connection (e.g. the magnet bootstrap's per-peer
+    /// frame budget). Fail closed: the connection is dropped and the
+    /// peer's attempt is over; the caller moves on to the next peer.
+    #[error("peer protocol violation ({0}); this peer broke the wire rules or overstayed its resource budget — the connection is dropped and other peers are tried")]
+    Protocol(String),
+
     /// A cryptographic or encrypted-spool operation failed: Argon2 key
     /// derivation, AES-GCM encrypt/decrypt, a spool header/magic/version
     /// mismatch, or a missing `--passphrase` in `--paranoid` mode. Returned

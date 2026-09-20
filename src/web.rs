@@ -288,6 +288,42 @@ async fn csrf_guard(req: Request, next: Next) -> Response {
 /// worst, so 64 KiB is generous for legitimate clients.
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
+/// Cap on the size of a `.torrent` file `POST /api/add` will read from
+/// disk (MED-2, wave3 B10). The handler previously ran an unbounded
+/// `tokio::fs::read` on the resolved path, so any loopback caller (or a
+/// symlink/special file that snuck inside the permitted dir) could pin
+/// unbounded daemon memory. Real `.torrent` files are KBs to a few MB;
+/// 16 MiB is far above any legitimate one.
+const MAX_TORRENT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read the resolved `.torrent` path with a size gate: `fs::metadata`
+/// first, failing closed on anything that isn't a regular file or that
+/// exceeds [`MAX_TORRENT_FILE_BYTES`], before buffering any bytes.
+/// (The stat→read window is a race, but the path is already
+/// canonicalized inside the permitted dir by `resolve_under`, and the
+/// gate is defense against bulk memory pinning, not a content check.)
+async fn read_torrent_capped(
+    path: &std::path::Path,
+) -> std::result::Result<Vec<u8>, (StatusCode, String)> {
+    let meta = match tokio::fs::metadata(path).await {
+        Ok(m) => m,
+        Err(e) => return Err((StatusCode::BAD_REQUEST, format!("stat: {e}"))),
+    };
+    if !meta.is_file() {
+        return Err((StatusCode::BAD_REQUEST, "not a regular file".into()));
+    }
+    let len = meta.len();
+    if len > MAX_TORRENT_FILE_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("{len} bytes exceeds the {MAX_TORRENT_FILE_BYTES}-byte torrent file limit"),
+        ));
+    }
+    tokio::fs::read(path)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("read: {e}")))
+}
+
 pub fn router(state: WebState) -> Router {
     Router::new()
         .route("/", get(index))
@@ -501,9 +537,9 @@ async fn daemon_add(State(st): State<DaemonState>, body: String) -> impl IntoRes
         Ok(p) => p,
         Err(e) => return (StatusCode::FORBIDDEN, e),
     };
-    let raw = match tokio::fs::read(&safe).await {
+    let raw = match read_torrent_capped(&safe).await {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("read {path}: {e}")),
+        Err((code, why)) => return (code, format!("{path}: {why}")),
     };
     let torrent = match crate::metainfo::TorrentFile::from_bytes(&raw) {
         Ok(t) => t,
@@ -1089,6 +1125,50 @@ mod tests {
         // A nonexistent path inside the dir fails to canonicalize → Err,
         // so we never hand a missing path to fs::read.
         assert!(resolve_under(&base, base.join("nope.torrent").to_str().unwrap()).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn read_torrent_capped_gates_size_and_type() {
+        // MED-2 gate: small regular files pass byte-for-byte; a
+        // directory is refused without a read; an over-cap file is
+        // refused (413) before any bytes are buffered; a file exactly
+        // at the cap is still allowed.
+        let base = std::env::temp_dir().join(format!("rt_addcap_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let ok_path = base.join("ok.torrent");
+        std::fs::write(&ok_path, b"d4:infod1:nli0eee").unwrap();
+        let raw = read_torrent_capped(&ok_path).await;
+        assert_eq!(raw.unwrap(), b"d4:infod1:nli0eee");
+
+        let dir = base.join("dir.torrent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (code, why) = read_torrent_capped(&dir).await.unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{why}");
+        assert!(why.contains("not a regular file"), "got: {why}");
+
+        let big = base.join("big.torrent");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_TORRENT_FILE_BYTES + 1)
+            .unwrap();
+        let (code, why) = read_torrent_capped(&big).await.unwrap_err();
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE, "{why}");
+        assert!(why.contains("exceeds"), "got: {why}");
+
+        let edge = base.join("edge.torrent");
+        std::fs::File::create(&edge)
+            .unwrap()
+            .set_len(MAX_TORRENT_FILE_BYTES)
+            .unwrap();
+        let res = read_torrent_capped(&edge).await;
+        assert!(
+            res.is_ok(),
+            "a file exactly at the cap must still read: {:?}",
+            res.err()
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

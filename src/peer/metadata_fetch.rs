@@ -118,6 +118,61 @@ const OVERALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// headroom for the dict.
 const FETCH_MAX_FRAME_LEN: u32 = (METADATA_PIECE_SIZE as u32) + 1024;
 
+/// Frame budgets for one bootstrap exchange (MED-1, wave3 B10). Each
+/// read is individually time-boxed by `EXT_STEP_TIMEOUT`, but the skip
+/// loops in `read_extension_handshake` / `read_metadata_response` had
+/// no bound on HOW MANY frames they would read, so a malicious peer
+/// could keep the attempt alive indefinitely (and hold its metadata
+/// budget reservation) by dribbling valid-but-irrelevant frames —
+/// keep-alives, stray Bitfields, re-sent handshakes — just under each
+/// step timeout. A real peer sends a handful of noise frames at most,
+/// and a legitimate exchange needs exactly `num_pieces` ut_metadata
+/// `Data` frames. We allow `EXT_HANDSHAKE_MAX_FRAMES` before the peer's
+/// extension handshake resolves, then widen the budget to cover
+/// `num_pieces` data frames plus `EXT_NOISE_FRAME_SLACK` noise. Each
+/// frame is additionally capped at `FETCH_MAX_FRAME_LEN`, so this
+/// bounds both the frame count and the total bytes a peer can make us
+/// read.
+const EXT_HANDSHAKE_MAX_FRAMES: usize = 64;
+const EXT_NOISE_FRAME_SLACK: usize = 64;
+
+/// Fail-closed counter behind the [`EXT_HANDSHAKE_MAX_FRAMES`] /
+/// [`EXT_NOISE_FRAME_SLACK`] budgets: every frame read during a
+/// bootstrap exchange is spent against this budget, and exhausting it
+/// aborts the attempt with [`Error::Protocol`].
+struct FrameBudget {
+    remaining: usize,
+}
+
+impl FrameBudget {
+    fn new(limit: usize) -> Self {
+        Self { remaining: limit }
+    }
+
+    /// Account one frame. Returns `Err` once the budget is exhausted;
+    /// the caller must treat that as the end of the attempt.
+    fn spend(&mut self) -> Result<()> {
+        if self.remaining == 0 {
+            return Err(Error::Protocol(
+                "ut_metadata bootstrap: peer frame budget exhausted \
+                 (too many non-advancing frames)"
+                    .into(),
+            ));
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
+
+    /// Widen the budget once `num_pieces` is known (see the constants'
+    /// docs): the exchange legitimately needs one `Data` frame per
+    /// piece, plus slack for noise frames.
+    fn widen(&mut self, data_frames: usize) {
+        self.remaining = self
+            .remaining
+            .saturating_add(data_frames + EXT_NOISE_FRAME_SLACK);
+    }
+}
+
 /// Fetch the info dict bytes for `info_hash` from any peer in
 /// `peer_pool`. Returns the raw bencoded info dict (which the caller
 /// is responsible for verifying — we already SHA1-checked it here,
@@ -328,7 +383,8 @@ where
         .await
         .map_err(|e| Error::Network(format!("ext handshake write: {e}")))?;
 
-    let peer_info = read_extension_handshake(stream).await?;
+    let mut budget = FrameBudget::new(EXT_HANDSHAKE_MAX_FRAMES);
+    let peer_info = read_extension_handshake(stream, &mut budget).await?;
     let their_id = peer_info.their_ut_metadata_id.ok_or_else(|| {
         Error::Network("peer doesn't advertise ut_metadata in extension handshake".into())
     })?;
@@ -347,6 +403,9 @@ where
 
     // Request pieces 0..ceil(total_size / METADATA_PIECE_SIZE), assemble.
     let num_pieces = (total_size as usize).div_ceil(METADATA_PIECE_SIZE);
+    // The exchange now legitimately needs one `Data` frame per piece;
+    // widen the budget accordingly (see `EXT_NOISE_FRAME_SLACK`).
+    budget.widen(num_pieces);
     let mut assembled = vec![0u8; total_size as usize];
     let mut received = vec![false; num_pieces];
 
@@ -363,7 +422,7 @@ where
             .await
             .map_err(|e| Error::Network(format!("ut_metadata request: {e}")))?;
 
-        let resp = read_metadata_response(stream).await?;
+        let resp = read_metadata_response(stream, &mut budget).await?;
         match resp {
             MetadataResponse::Data {
                 piece,
@@ -435,9 +494,12 @@ fn piece_expected_len(piece_idx: usize, num_pieces: usize, total_size: u32) -> u
 /// Read messages from the post-handshake stream until we get the
 /// peer's extension handshake (`Extended { ext_id: 0 }`). Bitfield /
 /// Have / KeepAlive / etc. are common before the ext handshake and
-/// must be skipped, not errored on.
+/// must be skipped, not errored on. Every frame read — including the
+/// skipped ones — is spent against `budget`; exhausting it fails
+/// closed so a dribbling peer can't hold the attempt open forever.
 async fn read_extension_handshake<S>(
     stream: &mut S,
+    budget: &mut FrameBudget,
 ) -> Result<crate::peer::extension::PeerExtensionInfo>
 where
     S: AsyncRead + Unpin,
@@ -447,6 +509,7 @@ where
             .await
             .map_err(|_| Error::Network("ext handshake read timeout".into()))?
             .map_err(|e| Error::Network(format!("ext handshake frame: {e}")))?;
+        budget.spend()?;
         if frame.is_empty() {
             continue; // keep-alive
         }
@@ -467,8 +530,12 @@ where
 
 /// Wait for the next ut_metadata response on the stream. Same
 /// filtering discipline as `read_extension_handshake` — non-Extended
-/// frames are skipped.
-async fn read_metadata_response<S>(stream: &mut S) -> Result<MetadataResponse>
+/// frames are skipped — and every frame read is spent against
+/// `budget` so a dribbling peer can't stall the piece loop.
+async fn read_metadata_response<S>(
+    stream: &mut S,
+    budget: &mut FrameBudget,
+) -> Result<MetadataResponse>
 where
     S: AsyncRead + Unpin,
 {
@@ -477,6 +544,7 @@ where
             .await
             .map_err(|_| Error::Network("ut_metadata read timeout".into()))?
             .map_err(|e| Error::Network(format!("ut_metadata frame: {e}")))?;
+        budget.spend()?;
         if frame.is_empty() {
             continue;
         }
@@ -702,5 +770,187 @@ mod tests {
             msg2.contains("connect peer:") && msg2.contains("Connection refused"),
             "loopback must pass the screen and fail at connect instead, got: {msg2}"
         );
+    }
+
+    // ---- MED-1 frame-budget tests (wave3 B10 / AQ-65) ----
+    //
+    // These drive `exchange_metadata` over an in-memory duplex stream so
+    // the peer side is fully attacker-controlled with no real sockets.
+    use tokio::io::AsyncWriteExt;
+
+    /// Write one `Extended { ext_id, payload }` wire frame to the peer
+    /// side via the production encoder (message id 20 + ext id + body).
+    async fn peer_write_extended<W>(w: &mut W, ext_id: u8, payload: Vec<u8>)
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        write_message(w, &Message::Extended { ext_id, payload })
+            .await
+            .unwrap();
+    }
+
+    /// A valid keep-alive frame is just a zero length prefix.
+    const KEEPALIVE: [u8; 4] = 0u32.to_be_bytes();
+
+    /// Bencoded extension handshake advertising `ut_metadata` under
+    /// `ext_id` and the given `metadata_size`.
+    fn peer_ext_handshake(metadata_size: u32, ext_id: u8) -> Vec<u8> {
+        use crate::metainfo::bencode::BencodeValue;
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(b"ut_metadata".to_vec(), BencodeValue::Int(ext_id as i64));
+        let mut root = std::collections::BTreeMap::new();
+        root.insert(b"m".to_vec(), BencodeValue::Dict(m));
+        root.insert(
+            b"metadata_size".to_vec(),
+            BencodeValue::Int(metadata_size as i64),
+        );
+        BencodeValue::Dict(root).to_bytes()
+    }
+
+    /// Bencoded ut_metadata `data` response for `piece` with `data`
+    /// appended verbatim after the dict (BEP 9 wire format).
+    fn peer_metadata_data(piece: u32, total_size: u32, data: &[u8]) -> Vec<u8> {
+        use crate::metainfo::bencode::BencodeValue;
+        let mut d = std::collections::BTreeMap::new();
+        d.insert(b"msg_type".to_vec(), BencodeValue::Int(1));
+        d.insert(b"piece".to_vec(), BencodeValue::Int(piece as i64));
+        d.insert(b"total_size".to_vec(), BencodeValue::Int(total_size as i64));
+        let mut payload = BencodeValue::Dict(d).to_bytes();
+        payload.extend_from_slice(data);
+        payload
+    }
+
+    #[test]
+    fn frame_budget_spends_and_fails_closed() {
+        let mut b = FrameBudget::new(2);
+        assert!(b.spend().is_ok());
+        assert!(b.spend().is_ok());
+        let err = b.spend().expect_err("exhausted budget must fail closed");
+        assert!(matches!(err, Error::Protocol(_)), "got: {err}");
+        // Widening revives it: 1 data frame + 64 slack.
+        b.widen(1);
+        assert!(b.spend().is_ok());
+        assert_eq!(b.remaining, 64);
+    }
+
+    #[tokio::test]
+    async fn frame_budget_rejects_dribbling_peer_before_ext_handshake() {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            // Dribble thousands of valid keep-alive frames — more than
+            // EXT_HANDSHAKE_MAX_FRAMES — never sending a real handshake.
+            for _ in 0..4096 {
+                if server.write_all(&KEEPALIVE).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // Bound the call so a regression (no budget → infinite skip
+        // loop, since instant frames never trip EXT_STEP_TIMEOUT) fails
+        // this test instead of hanging the suite.
+        let res = timeout(
+            Duration::from_secs(30),
+            exchange_metadata(
+                &mut client,
+                [7u8; 20],
+                "127.0.0.1:1".parse().unwrap(),
+                false,
+            ),
+        )
+        .await;
+        writer.abort();
+        let err = res
+            .expect("budget must end the attempt long before this bound")
+            .expect_err("dribbler before handshake must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            matches!(err, Error::Protocol(_)) && msg.contains("frame budget"),
+            "expected typed frame-budget error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_budget_rejects_dribbling_peer_during_metadata_phase() {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            // Honest handshake first (metadata_size = one piece), then
+            // endless keep-alives instead of the requested Data frame.
+            peer_write_extended(
+                &mut server,
+                2,
+                peer_ext_handshake(METADATA_PIECE_SIZE as u32, 2),
+            )
+            .await;
+            for _ in 0..4096 {
+                if server.write_all(&KEEPALIVE).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let res = timeout(
+            Duration::from_secs(30),
+            exchange_metadata(
+                &mut client,
+                [7u8; 20],
+                "127.0.0.1:1".parse().unwrap(),
+                false,
+            ),
+        )
+        .await;
+        writer.abort();
+        let err = res
+            .expect("budget must end the attempt long before this bound")
+            .expect_err("dribbler during exchange must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            matches!(err, Error::Protocol(_)) && msg.contains("frame budget"),
+            "expected typed frame-budget error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_metadata_succeeds_against_honest_peer() {
+        // Control for the two dribble tests: a peer that answers every
+        // request with the right Data frames must still complete, so
+        // the budget can't have been set tighter than legitimate use.
+        let payload: Vec<u8> = (0..48u32).map(|i| (i * 7 + 3) as u8).collect();
+        let mut hasher = Sha1::new();
+        hasher.update(&payload);
+        let info_hash: [u8; 20] = hasher.finalize().into();
+
+        let (mut client, mut server) = tokio::io::duplex(256 * 1024);
+        let peer_payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            peer_write_extended(
+                &mut server,
+                EXT_HANDSHAKE_ID,
+                peer_ext_handshake(peer_payload.len() as u32, 2),
+            )
+            .await;
+            // Responses ride OUR advertised ut_metadata id, not theirs.
+            peer_write_extended(
+                &mut server,
+                OUR_UT_METADATA_ID,
+                peer_metadata_data(0, peer_payload.len() as u32, &peer_payload),
+            )
+            .await;
+            // Park WITHOUT dropping our half: dropping it would discard
+            // any unread buffered frames and EOF the exchange.
+            std::future::pending::<()>().await;
+        });
+        let got = timeout(
+            Duration::from_secs(30),
+            exchange_metadata(
+                &mut client,
+                info_hash,
+                "127.0.0.1:1".parse().unwrap(),
+                false,
+            ),
+        )
+        .await
+        .expect("honest exchange must finish long before this bound")
+        .expect("honest peer must verify and assemble");
+        writer.abort();
+        assert_eq!(got, payload);
     }
 }
