@@ -173,6 +173,7 @@ fn if_nametoindex(iface: &str) -> io::Result<u32> {
     use std::ffi::CString;
     let c = CString::new(iface)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name contains NUL"))?;
+    #[allow(unsafe_code)]
     // SAFETY: if_nametoindex reads a null-terminated string and returns
     // an unsigned int. We pass a valid C string with a trailing NUL.
     let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };

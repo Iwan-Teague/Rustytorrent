@@ -314,6 +314,10 @@ mod linux_x86_64 {
         // to install a seccomp filter. Without it the kernel rejects
         // the install to prevent a sandboxed process from escalating
         // via setuid binaries discovered later. We bake this in.
+        #[allow(unsafe_code)]
+        // SAFETY: `prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)` takes only
+        // scalar arguments; no pointers are dereferenced and the call
+        // merely sets a per-thread kernel flag.
         let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
         if rc != 0 {
             return Err(Error::Network(format!(
@@ -326,6 +330,7 @@ mod linux_x86_64 {
             len: filter.len() as u16,
             filter: filter.as_ptr(),
         };
+        #[allow(unsafe_code)]
         // SAFETY: `prog.filter` points into `filter`, which lives
         // through the syscall return below. The kernel copies the
         // program out before returning, so it's safe to drop `filter`
@@ -492,6 +497,7 @@ mod macos {
     pub fn engage() -> Result<()> {
         let profile = CString::new(PROFILE).expect("profile literal contains no interior NUL");
         let mut errorbuf: *mut c_char = ptr::null_mut();
+        #[allow(unsafe_code)]
         // SAFETY: `profile.as_ptr()` is a valid null-terminated C
         // string for the duration of this call. `&mut errorbuf` is
         // a valid out-pointer. `sandbox_init` is the documented
@@ -501,14 +507,18 @@ mod macos {
             let msg = if errorbuf.is_null() {
                 "unknown sandbox_init failure".to_string()
             } else {
+                #[allow(unsafe_code)]
                 // SAFETY: `errorbuf` is a valid null-terminated C
                 // string written by `sandbox_init` on failure, owned
                 // by the sandbox library until we free it.
                 let s = unsafe { CStr::from_ptr(errorbuf).to_string_lossy().into_owned() };
+                #[allow(unsafe_code)]
                 // SAFETY: we received `errorbuf` from `sandbox_init`
                 // and have not freed it; it must be returned via
                 // `sandbox_free_error`.
-                unsafe { sandbox_free_error(errorbuf) };
+                unsafe {
+                    sandbox_free_error(errorbuf)
+                };
                 s
             };
             return Err(Error::Network(format!(

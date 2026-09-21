@@ -48,6 +48,10 @@ fn sigterm_exits_cleanly_not_killed() {
     std::thread::sleep(Duration::from_millis(1500));
 
     // Send SIGTERM.
+    #[allow(unsafe_code)]
+    // SAFETY: `child.id()` is the OS pid of a process we spawned and
+    // have not yet waited on, so it is a live, valid pid; `kill` only
+    // sends a signal and dereferences no memory.
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
     }

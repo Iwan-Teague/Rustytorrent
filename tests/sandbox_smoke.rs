@@ -41,6 +41,9 @@ fn engage_seccomp_then_whitelisted_syscalls_still_work() {
     use std::time::Instant;
 
     // Cheap pre-engage assertion that getpid works.
+    #[allow(unsafe_code)]
+    // SAFETY: `getpid` takes no arguments and cannot cause
+    // unsoundness; it only reads the caller's own pid.
     let pid_before = unsafe { libc::getpid() };
     assert!(pid_before > 0);
 
@@ -51,6 +54,9 @@ fn engage_seccomp_then_whitelisted_syscalls_still_work() {
     // be reachable. If the filter had mis-encoded a JEQ jump and
     // these landed on RET KILL_PROCESS, this test would die via
     // SIGSYS and never make it to the assert.
+    #[allow(unsafe_code)]
+    // SAFETY: `getpid` takes no arguments and cannot cause
+    // unsoundness; it only reads the caller's own pid.
     let pid_after = unsafe { libc::getpid() };
     assert_eq!(pid_before, pid_after);
     let _ = Instant::now();

@@ -47,3 +47,11 @@ tower        = { version = "0.5", features = ["util"] }  # oneshot requests agai
 # negligible for an IO/hash-bound workload (SHA-1 and disk dominate).
 [profile.release]
 overflow-checks = true
+
+[workspace]
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+unsafe_code = "deny"
