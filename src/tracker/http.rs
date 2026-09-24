@@ -1496,8 +1496,7 @@ mod tests {
         // error or stops with a policy error — but never Ok from the decoy.
         assert!(
             result.is_err(),
-            "announce succeeded after a cross-port redirect: {:?}",
-            result
+            "announce succeeded after a cross-port redirect: {result:?}"
         );
         assert_eq!(
             decoy_hits.load(Ordering::Relaxed),

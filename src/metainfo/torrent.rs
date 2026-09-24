@@ -105,8 +105,7 @@ impl TorrentFile {
         let recomputed = sha1_of(info_bytes);
         if recomputed != info_hash {
             return Err(Error::Bencode(format!(
-                "info dict sha1 {:x?} doesn't match magnet info_hash {:x?}",
-                recomputed, info_hash
+                "info dict sha1 {recomputed:x?} doesn't match magnet info_hash {info_hash:x?}"
             )));
         }
         let info_v = BencodeValue::parse_all(info_bytes)?;

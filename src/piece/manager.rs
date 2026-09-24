@@ -258,8 +258,7 @@ impl PieceManager {
         }
         if !begin.is_multiple_of(BLOCK_SIZE) {
             return Err(Error::Network(format!(
-                "block begin {} not multiple of {}",
-                begin, BLOCK_SIZE
+                "block begin {begin} not multiple of {BLOCK_SIZE}"
             )));
         }
         let block_index = (begin / BLOCK_SIZE) as usize;

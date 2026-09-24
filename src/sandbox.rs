@@ -410,8 +410,7 @@ mod linux_x86_64 {
             // intermediate ALLOW return.
             assert!(
                 allowed_syscalls().len() <= MAX_ALLOWED,
-                "whitelist exceeded MAX_ALLOWED ({}) — chain via intermediate ALLOW",
-                MAX_ALLOWED
+                "whitelist exceeded MAX_ALLOWED ({MAX_ALLOWED}) — chain via intermediate ALLOW"
             );
         }
 
