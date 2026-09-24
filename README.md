@@ -1,6 +1,7 @@
 # RustyTorrent
 
 ![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)
+![License](https://img.shields.io/badge/license-PolyForm--Noncommercial--1.0.0-blue)
 A fully-functional peer-to-peer file transfer client written from scratch
 in Rust. The protocol-specific bits — bencode, info-hash, the peer wire
 protocol, HTTP/UDP trackers, MSE/PE encryption, the BEP 5 DHT, the piece
@@ -188,4 +189,7 @@ CI runs the test matrix on Linux + macOS + Windows on every push.
 
 ## License
 
-MIT.
+RustyTorrent is licensed under the [PolyForm Noncommercial 1.0.0](LICENSE.md).
+You are free to use, study, modify, and redistribute it for noncommercial
+purposes. Commercial use requires a separate licence from the copyright
+holder.
