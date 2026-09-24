@@ -1149,6 +1149,7 @@ mod tests {
 
     #[tokio::test]
     async fn announce_follows_same_host_redirect() {
+        let _log_lock = announce_debug_log_lock().await;
         let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let addr = spawn_path_server("/redirect-me", "/announce".to_string(), hits.clone()).await;
         let url = format!("http://{addr}/redirect-me");
@@ -1164,6 +1165,7 @@ mod tests {
 
     #[tokio::test]
     async fn announce_cross_host_redirect_not_followed() {
+        let _log_lock = announce_debug_log_lock().await;
         let evil_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let evil_addr =
             spawn_path_server("/announce", "/stolen".to_string(), evil_hits.clone()).await;
@@ -1208,6 +1210,7 @@ mod tests {
 
     #[tokio::test]
     async fn anonymous_uses_libtorrent_ua() {
+        let _log_lock = announce_debug_log_lock().await;
         let (addr, rx) = spawn_ua_capture().await;
         let url = format!("http://{addr}/announce");
         let _ = announce_with_proxy_anon(&url, &dummy_req(), None, true, None)
@@ -1219,6 +1222,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_anonymous_uses_default_ua() {
+        let _log_lock = announce_debug_log_lock().await;
         let (addr, rx) = spawn_ua_capture().await;
         let url = format!("http://{addr}/announce");
         let _ = announce_with_proxy_anon(&url, &dummy_req(), None, false, None)
@@ -1236,6 +1240,7 @@ mod tests {
     #[tokio::test]
     async fn announce_response_huge_content_length_is_refused() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let _log_lock = announce_debug_log_lock().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1266,6 +1271,7 @@ mod tests {
     #[tokio::test]
     async fn announce_response_body_over_cap_without_length_is_refused() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let _log_lock = announce_debug_log_lock().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1292,6 +1298,29 @@ mod tests {
         );
     }
 
+    /// Serializes the announce e2e tests against the two sync log-capture
+    /// tests that assert on the `announcing` debug! callsite.
+    ///
+    /// WHY THIS EXISTS: tracing-core's per-callsite interest cache is global
+    /// and last-writer-wins. Every `Dispatch::new` — including the one
+    /// inside `tracing::subscriber::with_default` used by the capture tests
+    /// — rebuilds the cache from the *calling thread's* current dispatcher,
+    /// but a bare (subscriber-less) emit of a not-yet-registered callsite
+    /// lazily registers it as `Interest::never`, and whichever rebuild runs
+    /// last globally wins. Each e2e announce test drives the production
+    /// `announce()` path, which emits that same debug! callsite with no
+    /// subscriber, so a bare first-registration can poison the callsite to
+    /// `never` mid-run and silently drop a concurrent capture test's events
+    /// (same defect family as the bin-test refusal-log flake fixed in
+    /// src/main.rs). Guarding every emitter and every capture window with
+    /// one lock guarantees the with_default-entry rebuild is the last
+    /// writer. Test-infra only: production never enters a scoped dispatcher.
+    static ANNOUNCE_DEBUG_LOG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn announce_debug_log_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        ANNOUNCE_DEBUG_LOG_LOCK.lock().await
+    }
+
     /// Shared in-memory writer so a fmt subscriber can capture log lines.
     #[derive(Clone, Default)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
@@ -1307,6 +1336,9 @@ mod tests {
 
     #[test]
     fn announcing_debug_line_strips_passkey_query() {
+        // Hold for the whole capture window: see ANNOUNCE_DEBUG_LOG_LOCK.
+        // Plain (non-async) test thread, so blocking_lock is sound here.
+        let _log_lock = ANNOUNCE_DEBUG_LOG_LOCK.blocking_lock();
         // The configured announce URL may itself carry a passkey query
         // parameter (private trackers hand those out). The debug line must
         // render only the scheme://host/path part.
@@ -1334,6 +1366,9 @@ mod tests {
     /// address still cannot land it in the log verbatim.
     #[test]
     fn announcing_debug_line_hides_bind_iface_source_ip() {
+        // Hold for the whole capture window: see ANNOUNCE_DEBUG_LOG_LOCK.
+        // Plain (non-async) test thread, so blocking_lock is sound here.
+        let _log_lock = ANNOUNCE_DEBUG_LOG_LOCK.blocking_lock();
         let buf = SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
@@ -1407,6 +1442,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::AsyncWriteExt;
 
+        let _log_lock = announce_debug_log_lock().await;
         let req = AnnounceRequest {
             info_hash: [0x33; 20],
             peer_id: [0x44; 20],

@@ -31,6 +31,31 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
+/// Serializes the tests that touch the `magnet_bootstrap` log callsites
+/// (`web.rs` per-tracker failure lines and the "no peers from trackers"
+/// give-up warn) against the log-capture test that asserts on them.
+///
+/// WHY THIS EXISTS: tracing-core's per-callsite interest cache is global
+/// and last-writer-wins. Every `Dispatch::new` — including the one inside
+/// `tracing::subscriber::with_default` used by the capture test — rebuilds
+/// the cache from the *calling thread's* current dispatcher, but a bare
+/// (subscriber-less) emit of a not-yet-registered callsite lazily registers
+/// it as `Interest::never`, and whichever rebuild runs last globally wins.
+/// `magnet_bootstrap_gate_caps_concurrent_pipelines` spawns
+/// `web::magnet_bootstrap` with no subscriber, so its first bare emission
+/// can poison the shared callsite to `never` mid-run and silently drop the
+/// capture test's events (observed on Linux: `cargo test --release` loop
+/// rc=101, "expected the give-up warn to fire", ~17% of runs). Both tests
+/// hold this lock for their whole body, so a bare emission and a capture
+/// window can never overlap and the with_default-entry rebuild always runs
+/// after the last bare registration. Test-infra only: production never
+/// enters a scoped dispatcher, so there is no equivalent hazard at runtime.
+static MAGNET_BOOTSTRAP_LOG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn magnet_bootstrap_log_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    MAGNET_BOOTSTRAP_LOG_LOCK.lock().await
+}
+
 #[tokio::test]
 async fn daemon_hosts_lists_and_controls_torrents() {
     let mgr = SessionManager::new();
@@ -264,6 +289,14 @@ async fn magnet_bootstrap_gate_caps_concurrent_pipelines() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    // The spawned pipelines emit the shared magnet-bootstrap log callsites
+    // bare (no subscriber); hold the capture-serialization lock for the
+    // whole test so those registrations can't interleave with a capture
+    // window. All bare emissions happen before this test returns (the
+    // hanging tracker parks the pipelines mid-await, emitting nothing
+    // further), so lock release at test end is race-free.
+    let _log_lock = magnet_bootstrap_log_lock().await;
+
     let accepts = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -437,6 +470,11 @@ async fn saturated_magnet_gate_returns_429_instead_of_queueing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn magnet_bootstrap_logs_never_echo_info_hash_or_hostile_paths() {
     use std::sync::{Arc, Mutex};
+
+    // Hold for the whole test: see MAGNET_BOOTSTRAP_LOG_LOCK. The
+    // with_default-entry interest rebuild must be the last writer for the
+    // magnet-bootstrap callsites, i.e. no bare emitter may run concurrently.
+    let _log_lock = magnet_bootstrap_log_lock().await;
 
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
     impl std::io::Write for SharedBuf {

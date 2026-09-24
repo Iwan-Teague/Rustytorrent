@@ -1393,6 +1393,33 @@ mod tests {
         resolve_proxy_chain, validate_select_patterns, TrackerOutcome,
     };
 
+    /// Serializes every test that drives `announce_magnet_tracker`'s
+    /// refusal path (the `tracing::warn!` in its `Err` arm) against the
+    /// log-capture test that subscribes to that SAME callsite.
+    ///
+    /// Why this is required: tracing-core caches each callsite's
+    /// `Interest` in ONE process-global slot. The cached value is written
+    /// (a) lazily on the first `interest()` check of an unregistered
+    /// callsite — asking the CALLING THREAD's default dispatcher, which
+    /// for a plain test thread is `NoSubscriber` and caches
+    /// `Interest::never()` — and (b) by the full-cache rebuild that every
+    /// `Dispatch::new` performs, including the one inside
+    /// `tracing::subscriber::with_default`. Writes (a) and (b) are
+    /// unsynchronized last-writer-wins stores to the same atomic, so when
+    /// the subscriber-less test registers the callsite concurrently with
+    /// the capture test's rebuild, the capture test can be left with
+    /// `never` cached and its events silently dropped for the rest of the
+    /// run (empty log; measured 5/30 whole-bin `cargo test --release`
+    /// runs before this lock). Holding this mutex orders those two
+    /// writers against each other, which makes the captured-log
+    /// assertions deterministic. This is test-infrastructure fix only:
+    /// production never relies on `with_default`.
+    static ANNOUNCE_REFUSAL_LOG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn announce_refusal_log_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        ANNOUNCE_REFUSAL_LOG_LOCK.lock().await
+    }
+
     /// The magnet bootstrap must announce through the SCREENED wrapper:
     /// a hostile magnet's `tr=http://169.254.169.254/...` must be refused
     /// BEFORE any dial (no info-hash/peer-id GET to metadata ranges) and
@@ -1412,6 +1439,10 @@ mod tests {
             num_want: 50,
         };
         let mut pool = Vec::new();
+        // See ANNOUNCE_REFUSAL_LOG_LOCK: both announce calls below hit
+        // the refusal warn! callsite (the loopback dial also fails), so
+        // they must not race the log-capture test's interest rebuild.
+        let _log_lock = announce_refusal_log_lock().await;
 
         // Link-local metadata endpoint: refused before any socket work.
         let outcome = super::announce_magnet_tracker(
@@ -1447,6 +1478,11 @@ mod tests {
     /// (and up to 512 chars of attacker text) into our logs.
     #[tokio::test]
     async fn magnet_bootstrap_failure_log_hides_hostile_path() {
+        // Held for the whole test: the subscriber below is installed
+        // thread-locally and the global per-callsite interest cache must
+        // not be rewritten under it by the subscriber-less sibling test
+        // that shares this refusal callsite (ANNOUNCE_REFUSAL_LOG_LOCK).
+        let _log_lock = announce_refusal_log_lock().await;
         struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for SharedBuf {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
